@@ -5,37 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Flying Cloud METAR</title>
   <style>
-    /* Makes the widget look clean in Notion and on phones */
-    :root { color-scheme: dark; }
     html, body {
-      background:#000; margin:0; padding:0;
-      display:flex; align-items:center; justify-content:center;
-      min-height:100vh;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-    }
-    .wrap { width:100%; max-width:820px; padding:16px; box-sizing:border-box; }
-    .card {
-      margin:0 auto;
-      width:100%; max-width:500px;
-      border:1px solid #222; border-radius:12px;
-      padding:8px; box-sizing:border-box;
+      margin:0;
+      height:100%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
       background:#000;
     }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <!-- WIDTH/HEIGHT below control the widget’s own layout -->
-      <a href="https://metar-taf.com/metar/KFCM"
-         id="metartaf-eHhv7UYS"
-         style="font-size:18px; font-weight:500; color:#fff; width:500px; height:278px; display:block">
-         METAR Flying Cloud Airport
-      </a>
-      <script async defer crossorigin="anonymous"
-        src="https://metar-taf.com/embed-js/KFCM?bg_color=000000&temp=f&layout=landscape&visibility=mi&qnh=inHg&rh=dp&target=eHhv7UYS">
-      </script>
-    </div>
-  </div>
+  <a href="https://metar-taf.com/metar/KFCM"
+     id="metartaf-igsy5wKU"
+     style="font-size:18px; font-weight:500; color:#fff; width:500px; height:278px; display:block">
+     METAR Flying Cloud Airport
+  </a>
+  <script async defer crossorigin="anonymous"
+    src="https://metar-taf.com/embed-js/KFCM?bg_color=000000&temp=f&layout=landscape&visibility=mi&qnh=inHg&rh=dp&target=igsy5wKU">
+  </script>
 </body>
 </html>
