@@ -9,6 +9,28 @@ type ApiResponse = {
     error?: string;
 };
 
+type StationInfo = {
+    station: string;
+    displayName: string;
+    city: string | null;
+    state: string | null;
+    country: string | null;
+    name: string | null;
+    latitude: number | null;
+    longitude: number | null;
+    timeZone: string | null;
+};
+
+type StationInfoResponse = {
+    data?: StationInfo;
+    error?: string;
+};
+
+type RemarkBubble = {
+    code: string;
+    meaning: string;
+};
+
 type DecoderTab = "lookup" | "raw";
 
 const FLIGHT_CATEGORY_STYLES: Record<FlightCategory, string> = {
@@ -26,8 +48,10 @@ export default function Home() {
 
     const [metar, setMetar] = useState<NormalizedMetar | null>(null);
     const [rawMetar, setRawMetar] = useState<string | null>(null);
+    const [stationInfo, setStationInfo] = useState<StationInfo | null>(null);
     const [error, setError] = useState("");
     const [loading, setLoading] = useState(false);
+
 
     async function fetchLiveMetar(stationToFetch = station) {
         const cleanStation = stationToFetch.trim().toUpperCase();
@@ -46,8 +70,13 @@ export default function Home() {
                 throw new Error(data.error ?? "Unable to fetch live METAR.");
             }
 
-            setMetar(data.normalized ?? null);
+            const normalized = data.normalized ?? null;
+
+            setMetar(normalized);
             setRawMetar(data.raw ?? null);
+
+            await fetchStationInfo(normalized?.station ?? cleanStation);
+
         } catch (err) {
             setError(err instanceof Error ? err.message : "Unexpected error.");
         } finally {
@@ -76,12 +105,41 @@ export default function Home() {
                 throw new Error(data.error ?? "Unable to decode raw METAR.");
             }
 
-            setMetar(data.normalized ?? null);
+            const normalized = data.normalized ?? null;
+
+            setMetar(normalized);
             setRawMetar(data.raw ?? rawInput);
+
+            await fetchStationInfo(normalized?.station);
+
         } catch (err) {
             setError(err instanceof Error ? err.message : "Unexpected error.");
         } finally {
             setLoading(false);
+        }
+    }
+
+    async function fetchStationInfo(stationToLookup: string | null | undefined) {
+        if (!stationToLookup) {
+            setStationInfo(null);
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                `/api/station/info?station=${encodeURIComponent(stationToLookup)}`
+            );
+
+            const data: StationInfoResponse = await response.json();
+
+            if (!response.ok || data.error || !data.data) {
+                setStationInfo(null);
+                return;
+            }
+
+            setStationInfo(data.data);
+        } catch {
+            setStationInfo(null);
         }
     }
 
@@ -154,7 +212,7 @@ export default function Home() {
                                 <button
                                     onClick={() => fetchLiveMetar()}
                                     disabled={loading}
-                                    className="rounded-xl bg-[#d6b35a] px-6 py-3 font-bold text-black transition hover:bg-[#e6c76f] disabled:cursor-not-allowed disabled:opacity-50"
+                                    className="mt-3 rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20 disabled:cursor-not-allowed disabled:opacity-50"
                                 >
                                     {loading ? "Loading..." : "Fetch"}
                                 </button>
@@ -177,20 +235,24 @@ export default function Home() {
                                 Decode raw METAR
                             </h2>
 
-                            <textarea
-                                value={rawInput}
-                                onChange={(event) => setRawInput(event.target.value)}
-                                className="min-h-28 w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 font-mono text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus:border-[#d6b35a]"
-                                placeholder="KFCM 011753Z AUTO 35012KT 10SM FEW050 SCT250 22/15 A2992 RMK AO2"
-                            />
+                            <div className="flex flex-col gap-3 sm:flex-row">
 
-                            <button
-                                onClick={decodeRawMetar}
-                                disabled={loading}
-                                className="mt-3 rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                                {loading ? "Loading..." : "Decode"}
-                            </button>
+                                <textarea
+                                    value={rawInput}
+                                    onChange={(event) => setRawInput(event.target.value)}
+                                    className="min-h-20 w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 font-mono text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus:border-[#d6b35a]"
+                                    placeholder="KFCM 011753Z AUTO 35012KT 10SM FEW050 SCT250 22/15 A2992 RMK AO2"
+                                />
+
+                                <button
+                                    onClick={decodeRawMetar}
+                                    disabled={loading}
+                                    className="mt-3 rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                    {loading ? "Loading..." : "Decode"}
+                                </button>
+                            </div>
+
                         </div>
                     )}
                 </section>
@@ -202,10 +264,22 @@ export default function Home() {
                 )}
 
                 {metar ? (
-                    <MetarDashboard metar={metar} rawMetar={rawMetar ?? metar.raw} />
-                ) : (
+                    <MetarDashboard
+                        metar={metar}
+                        rawMetar={rawMetar ?? metar.raw}
+                        stationInfo={stationInfo}
+                    />
+                    ) : (
                     <EmptyState />
                 )}
+
+                <footer className="mt-10 border-t border-zinc-900 pt-5 text-center">
+                    <p className="text-[11px] leading-5 text-zinc-600">
+                        Created by Preston Vaughn for Inflight Aviation. METAR data provided by
+                        AviationWeather.gov.
+                    </p>
+                </footer>
+
             </div>
         </main>
     );
@@ -214,40 +288,56 @@ export default function Home() {
 function MetarDashboard({
     metar,
     rawMetar,
+    stationInfo,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
+    stationInfo: StationInfo | null;
 }) {
+    const [now, setNow] = useState(() => new Date());
     const categoryStyle = FLIGHT_CATEGORY_STYLES[metar.flightCategory];
+
+    useEffect(() => {
+        const timer = window.setInterval(() => {
+            setNow(new Date());
+        }, 60_000);
+
+        return () => window.clearInterval(timer);
+    }, []);
 
     return (
         <section className="mt-8 overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 shadow-2xl">
             <div className="border-b border-zinc-800 bg-gradient-to-r from-black via-zinc-950 to-[#171307] p-6">
-                <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+                <div className="flex flex-col gap-4">
                     <div>
                         <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#d6b35a]">
                             Decoded Airport Weather
                         </p>
 
-                        <h2 className="mt-2 text-4xl font-bold text-white">
-                            {metar.station ?? "Unknown Station"}
-                        </h2>
+                        <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                            <h2 className="text-3xl font-bold text-white md:text-4xl">
+                                {stationInfo?.displayName ?? metar.station ?? "Unknown Station"}                            </h2>
 
-                        <p className="mt-2 text-sm text-zinc-400">
-                            Observed on day {metar.observed.day ?? "--"} at{" "}
-                            {String(metar.observed.hourUtc ?? "--").padStart(2, "0")}
-                            {String(metar.observed.minuteUtc ?? "--").padStart(2, "0")}Z
-                        </p>
+                            <ObservationTimeBubble
+                                metar={metar}
+                                now={now}
+                                stationInfo={stationInfo}
+                            />
+                        </div>
                     </div>
 
                     <div
-                        className={`rounded-2xl border px-6 py-4 text-center ${categoryStyle}`}
+                        className={`rounded-2xl border px-5 py-3 text-center ${categoryStyle}`}
                     >
                         <p className="text-xs font-semibold uppercase tracking-[0.2em]">
                             Flight Category
                         </p>
-                        <p className="mt-1 text-4xl font-black">{metar.flightCategory}</p>
-                        <p className="mt-1 text-sm">{getFlightCategoryDescription(metar)}</p>
+                        <p className="mt-1 text-3xl font-black">
+                            {metar.flightCategory}
+                        </p>
+                        <p className="mt-1 text-sm">
+                            {getFlightCategoryDescription(metar)}
+                        </p>
                     </div>
                 </div>
             </div>
@@ -297,6 +387,8 @@ function MetarDashboard({
                     />
                 </div>
 
+                <RemarksSection remarks={metar.remarks} />
+
                 <div className="mt-6 rounded-2xl border border-[#d6b35a]/20 bg-[#d6b35a]/10 p-4">
                     <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#e6c76f]">
                         Raw METAR
@@ -308,6 +400,170 @@ function MetarDashboard({
             </div>
         </section>
     );
+}
+
+function ObservationTimeBubble({
+    metar,
+    now,
+    stationInfo,
+}: {
+    metar: NormalizedMetar;
+    now: Date;
+    stationInfo: StationInfo | null;
+}) {
+    const ageMinutes = getMetarAgeMinutes(metar, now);
+    const ageColor = getMetarAgeColor(ageMinutes);
+
+    return (
+        <div className="inline-flex w-fit flex-wrap items-center gap-2 rounded-2xl border border-zinc-700 bg-black/65 px-4 py-3 text-sm font-semibold text-zinc-200">
+            <span className={`inline-flex items-center gap-2 ${ageColor}`}>
+                <ClockIcon />
+                {formatMetarAge(ageMinutes)}
+            </span>
+
+            <span className="text-zinc-600">|</span>
+
+            <span>{formatZuluObservation(metar)}</span>
+
+            <span className="text-zinc-600">|</span>
+
+            <span>{formatLocalObservation(metar, stationInfo?.timeZone)}</span>
+        </div>
+    );
+}
+
+function ClockIcon() {
+    return (
+        <svg
+            className="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+        >
+            <circle
+                cx="12"
+                cy="12"
+                r="9"
+                stroke="currentColor"
+                strokeWidth="2"
+            />
+            <path
+                d="M12 7v5l3 2"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+            />
+        </svg>
+    );
+}
+
+function getObservationDateUtc(metar: NormalizedMetar): Date | null {
+    const { day, hourUtc, minuteUtc } = metar.observed;
+
+    if (day === null || hourUtc === null || minuteUtc === null) {
+        return null;
+    }
+
+    const now = new Date();
+
+    let observed = new Date(
+        Date.UTC(
+            now.getUTCFullYear(),
+            now.getUTCMonth(),
+            day,
+            hourUtc,
+            minuteUtc
+        )
+    );
+
+    const differenceDays =
+        (observed.getTime() - now.getTime()) / (1000 * 60 * 60 * 24);
+
+    if (differenceDays > 15) {
+        observed = new Date(
+            Date.UTC(
+                now.getUTCFullYear(),
+                now.getUTCMonth() - 1,
+                day,
+                hourUtc,
+                minuteUtc
+            )
+        );
+    }
+
+    if (differenceDays < -20) {
+        observed = new Date(
+            Date.UTC(
+                now.getUTCFullYear(),
+                now.getUTCMonth() + 1,
+                day,
+                hourUtc,
+                minuteUtc
+            )
+        );
+    }
+
+    return observed;
+}
+
+function getMetarAgeMinutes(
+    metar: NormalizedMetar,
+    now: Date
+): number | null {
+    const observed = getObservationDateUtc(metar);
+
+    if (!observed) return null;
+
+    return Math.max(
+        0,
+        Math.round((now.getTime() - observed.getTime()) / 60_000)
+    );
+}
+
+function getMetarAgeColor(ageMinutes: number | null): string {
+    if (ageMinutes === null) return "text-white";
+    if (ageMinutes >= 40) return "text-red-400";
+    if (ageMinutes >= 20) return "text-yellow-300";
+    return "text-white";
+}
+
+function formatMetarAge(ageMinutes: number | null): string {
+    if (ageMinutes === null) return "Age unavailable";
+    return `${ageMinutes} min ago`;
+}
+
+function formatZuluObservation(metar: NormalizedMetar): string {
+    const { hourUtc, minuteUtc } = metar.observed;
+
+    if (hourUtc === null || minuteUtc === null) {
+        return "Zulu unavailable";
+    }
+
+    return `${String(hourUtc).padStart(2, "0")}${String(minuteUtc).padStart(
+        2,
+        "0"
+    )}Z`;
+}
+
+function formatLocalObservation(
+    metar: NormalizedMetar,
+    timeZone: string | null | undefined
+): string {
+    const observed = getObservationDateUtc(metar);
+
+    if (!observed) return "LT unavailable";
+
+    if (!timeZone) {
+        return "LT unavailable";
+    }
+
+    return new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        hour: "numeric",
+        minute: "2-digit",
+        timeZoneName: "short",
+    }).format(observed);
 }
 
 function TabButton({
@@ -353,6 +609,41 @@ function WeatherCard({
             </p>
             <p className="mt-3 text-2xl font-bold text-white">{value}</p>
             <p className="mt-2 text-sm leading-6 text-zinc-400">{detail}</p>
+        </div>
+    );
+}
+
+function RemarksSection({ remarks }: { remarks: string | null }) {
+    const remarkBubbles = getRemarkBubbles(remarks);
+
+    if (remarkBubbles.length === 0) {
+        return null;
+    }
+
+    return (
+        <div className="mt-6 rounded-2xl border border-zinc-800 bg-black/55 p-5">
+            <div className="mb-4 flex items-center gap-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    Remarks
+                </p>
+                <div className="h-px flex-1 bg-zinc-800" />
+            </div>
+
+            <div className="space-y-3">
+                {remarkBubbles.map((remark) => (
+                    <div
+                        key={`${remark.code}-${remark.meaning}`}
+                        className="w-full rounded-xl border border-zinc-700 bg-zinc-950 px-4 py-3"
+                    >
+                        <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-zinc-400">
+                            {remark.code}
+                        </p>
+                        <p className="mt-1 text-xs leading-5 text-zinc-200">
+                            {remark.meaning}
+                        </p>
+                    </div>
+                ))}
+            </div>
         </div>
     );
 }
@@ -497,4 +788,179 @@ function getSpreadDescription(metar: NormalizedMetar): string {
     }
 
     return `Temp/dewpoint spread is ${spread} C.`;
+}
+
+function getRemarkBubbles(remarks: string | null): RemarkBubble[] {
+    if (!remarks) return [];
+
+    return remarks
+        .split(/\s+/)
+        .map((token) => token.trim())
+        .filter(Boolean)
+        .map(decodeRemarkToken);
+}
+
+function decodeRemarkToken(token: string): RemarkBubble {
+    if (token === "AO1") {
+        return {
+            code: token,
+            meaning: "Automated station without precipitation discriminator.",
+        };
+    }
+
+    if (token === "AO2") {
+        return {
+            code: token,
+            meaning: "Automated station with precipitation discriminator.",
+        };
+    }
+
+    if (token === "COR") {
+        return {
+            code: token,
+            meaning: "Corrected observation.",
+        };
+    }
+
+    if (token === "AUTO") {
+        return {
+            code: token,
+            meaning: "Fully automated observation.",
+        };
+    }
+
+    if (/^SLP\d{3}$/.test(token)) {
+        const pressure = decodeSeaLevelPressure(token);
+
+        return {
+            code: token,
+            meaning:
+                pressure === null
+                    ? "Sea-level pressure remark."
+                    : `Sea-level pressure ${pressure.toFixed(1)} hPa.`,
+        };
+    }
+
+    if (/^T[01]\d{3}[01]\d{3}$/.test(token)) {
+        const decoded = decodePreciseTempDewpoint(token);
+
+        return {
+            code: token,
+            meaning:
+                decoded ??
+                "Precise temperature/dewpoint in tenths of a degree Celsius.",
+        };
+    }
+
+    if (/^1[01]\d{3}$/.test(token)) {
+        const temp = decodeSignedTenthsTemperature(token.slice(1));
+
+        return {
+            code: token,
+            meaning:
+                temp === null
+                    ? "Six-hour maximum temperature remark."
+                    : `Six-hour maximum temperature ${temp.toFixed(1)} C.`,
+        };
+    }
+
+    if (/^2[01]\d{3}$/.test(token)) {
+        const temp = decodeSignedTenthsTemperature(token.slice(1));
+
+        return {
+            code: token,
+            meaning:
+                temp === null
+                    ? "Six-hour minimum temperature remark."
+                    : `Six-hour minimum temperature ${temp.toFixed(1)} C.`,
+        };
+    }
+
+    if (/^5\d{4}$/.test(token)) {
+        const tendencyCode = token[1];
+        const change = Number(token.slice(2)) / 10;
+
+        return {
+            code: token,
+            meaning: `Three-hour pressure tendency code ${tendencyCode}; pressure changed ${change.toFixed(
+                1
+            )} hPa.`,
+        };
+    }
+
+    if (/^P\d{4}$/.test(token)) {
+        const precip = Number(token.slice(1)) / 100;
+
+        return {
+            code: token,
+            meaning: `${precip.toFixed(2)} inches of precipitation reported.`,
+        };
+    }
+
+    if (token === "TSNO") {
+        return {
+            code: token,
+            meaning: "Thunderstorm information not available.",
+        };
+    }
+
+    if (token === "PNO") {
+        return {
+            code: token,
+            meaning: "Precipitation amount not available.",
+        };
+    }
+
+    if (token === "PRESFR") {
+        return {
+            code: token,
+            meaning: "Pressure falling rapidly.",
+        };
+    }
+
+    if (token === "PRESRR") {
+        return {
+            code: token,
+            meaning: "Pressure rising rapidly.",
+        };
+    }
+
+    return {
+        code: token,
+        meaning: "Remark code not decoded yet.",
+    };
+}
+
+function decodeSeaLevelPressure(token: string): number | null {
+    const value = Number(token.slice(3));
+
+    if (!Number.isFinite(value)) return null;
+
+    if (value < 500) {
+        return 1000 + value / 10;
+    }
+
+    return 900 + value / 10;
+}
+
+function decodeSignedTenthsTemperature(value: string): number | null {
+    if (!/^[01]\d{3}$/.test(value)) return null;
+
+    const sign = value[0] === "1" ? -1 : 1;
+    const magnitude = Number(value.slice(1)) / 10;
+
+    if (!Number.isFinite(magnitude)) return null;
+
+    return sign * magnitude;
+}
+
+function decodePreciseTempDewpoint(token: string): string | null {
+    const temperature = decodeSignedTenthsTemperature(token.slice(1, 5));
+    const dewpoint = decodeSignedTenthsTemperature(token.slice(5, 9));
+
+    if (temperature === null || dewpoint === null) return null;
+
+    return `Precise temp ${temperature.toFixed(1)} C; dewpoint ${dewpoint.toFixed(
+        1
+    )} C.`;
 }
