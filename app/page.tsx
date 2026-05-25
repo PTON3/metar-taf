@@ -274,7 +274,7 @@ export default function Home() {
                 )}
 
                 <footer className="mt-10 border-t border-zinc-900 pt-5 text-center">
-                    <p className="text-[11px] leading-5 text-zinc-600">
+                    <p className="text-[11px] leading-5 text-zinc-500">
                         Created by Preston Vaughn for Inflight Aviation. METAR data provided by
                         AviationWeather.gov.
                     </p>
