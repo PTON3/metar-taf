@@ -163,9 +163,6 @@ export default function Home() {
                         METAR Visual Decoder
                     </h1>
 
-                    <p className="mt-4 max-w-2xl text-base leading-7 text-zinc-300">
-                        Created by Preston Vaughn
-                    </p>
                 </header>
 
                 <section className="rounded-3xl border border-zinc-800 bg-zinc-950/80 p-5 shadow-2xl">
@@ -195,10 +192,6 @@ export default function Home() {
                                 Live airport lookup
                             </h2>
 
-                            <label className="mb-2 block text-sm font-medium text-zinc-300">
-                                Airport ICAO
-                            </label>
-
                             <div className="flex flex-col gap-3 sm:flex-row">
                                 <input
                                     value={station}
@@ -219,8 +212,7 @@ export default function Home() {
                             </div>
 
                             <p className="mt-3 text-sm text-zinc-500">
-                                Default station is KFCM. Try KMSP, KANE, KSTP, or any valid
-                                ICAO station.
+                                Valid for any airport with an ICAO code and reports METAR data to AviationWeather.gov
                             </p>
                         </div>
                     )}
