@@ -55,19 +55,37 @@ type AirportRunway = {
     widthFt: number | null;
     surface: string | null;
     status: string | null;
+    lighted: boolean | null;
     endA: {
         ident: string | null;
         headingDeg: number | null;
+        latitude: number | null;
+        longitude: number | null;
     };
     endB: {
         ident: string | null;
         headingDeg: number | null;
+        latitude: number | null;
+        longitude: number | null;
     };
 };
 
 type AirportRunwaysResponse = {
     data?: AirportRunway[];
     error?: string;
+};
+
+type RunwayEnd = {
+    runwayId: string;
+    pairName: string;
+    ident: string;
+    headingDeg: number;
+};
+
+type RunwayWindComponent = {
+    headwindKt: number;
+    crosswindKt: number;
+    crosswindFrom: "left" | "right" | "centerline";
 };
 
 type RemarkBubble = {
@@ -97,8 +115,18 @@ export default function Home() {
     const [airportDiagram, setAirportDiagram] = useState<AirportDiagramInfo | null>(null);
     const [runways, setRunways] = useState<AirportRunway[]>([]);
     const [error, setError] = useState("");
-    const [loading, setLoading] = useState(false);
 
+    const [loading, setLoading] = useState(false);
+    const latestStationRef = useRef(station);
+    const latestActiveTabRef = useRef(activeTab);
+
+    useEffect(() => {
+        latestStationRef.current = station;
+    }, [station]);
+
+    useEffect(() => {
+        latestActiveTabRef.current = activeTab;
+    }, [activeTab]);
 
     async function fetchLiveMetar(stationToFetch = station) {
         const cleanStation = stationToFetch.trim().toUpperCase();
@@ -246,16 +274,16 @@ export default function Home() {
         void fetchLiveMetar("KFCM");
 
         const refreshTimer = window.setInterval(() => {
-            if (activeTab === "lookup") {
-                void fetchLiveMetar(station);
+            if (latestActiveTabRef.current === "lookup") {
+                void fetchLiveMetar(latestStationRef.current);
             }
-        }, 2 * 60 * 1000);
+        }, 5 * 60 * 1000);
 
         return () => window.clearInterval(refreshTimer);
 
-        // Auto-refresh live ICAO lookup every 2 minutes.
+        // Run once on page load, then refresh the current live ICAO lookup every 5 minutes.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeTab, station]);
+    }, []);
 
     return (
         <main className="min-h-screen bg-[#050505] text-zinc-100">
@@ -494,7 +522,11 @@ function MetarDashboard({
 
             <div className="p-6">
                 {activeDashboardTab === "weather" && (
-                    <WeatherDashboardTab metar={metar} rawMetar={rawMetar} />
+                    <WeatherDashboardTab
+                        metar={metar}
+                        rawMetar={rawMetar}
+                        runways={runways}
+                    />
                 )}
 
                 {activeDashboardTab === "taf" && <TafDashboardTab />}
@@ -514,12 +546,17 @@ function MetarDashboard({
 function WeatherDashboardTab({
     metar,
     rawMetar,
+    runways,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
+    runways: AirportRunway[];
 }) {
     return (
         <>
+
+            <RunwayWindWidget metar={metar} runways={runways} />
+
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 <WeatherCard
                     label="Wind"
@@ -719,10 +756,8 @@ function AirportInfoDashboardTab({
 
             </div>
 
-            <AirportDiagramPreviewCard
-                stationInfo={stationInfo}
-                airportDiagram={airportDiagram}
-            />
+            <AirportDiagramPreviewCard airportDiagram={airportDiagram} />
+
         </div>
     );
 }
@@ -1200,6 +1235,625 @@ function WeatherCard({
     );
 }
 
+function RunwayWindWidget({
+    metar,
+    runways,
+}: {
+    metar: NormalizedMetar;
+    runways: AirportRunway[];
+}) {
+    const [selectedEnd, setSelectedEnd] = useState<RunwayEnd | null>(null);
+
+    if (runways.length === 0) {
+        return (
+            <div className="mb-6 rounded-2xl border border-zinc-800 bg-black/55 p-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    Runway Wind
+                </p>
+                <p className="mt-2 text-sm text-zinc-400">
+                    Runway data is unavailable for this airport.
+                </p>
+            </div>
+        );
+    }
+
+    if (
+        metar.wind.directionDeg === null ||
+        metar.wind.speedKt === null ||
+        metar.wind.variable
+    ) {
+        return (
+            <div className="mb-6 rounded-2xl border border-zinc-800 bg-black/55 p-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    Runway Wind
+                </p>
+                <p className="mt-2 text-sm text-zinc-400">
+                    Runway wind components are unavailable for variable or missing wind.
+                </p>
+            </div>
+        );
+    }
+
+    const runwayEnds = getRunwayEnds(runways);
+
+    const calculatedEnds = runwayEnds.map((runwayEnd) => ({
+        ...runwayEnd,
+        component: calculateRunwayWindComponent(
+            metar.wind.directionDeg ?? 0,
+            metar.wind.speedKt ?? 0,
+            runwayEnd.headingDeg
+        ),
+        gustComponent:
+            metar.wind.gustKt !== null
+                ? calculateRunwayWindComponent(
+                    metar.wind.directionDeg ?? 0,
+                    metar.wind.gustKt,
+                    runwayEnd.headingDeg
+                )
+                : null,
+    }));
+
+    const bestRunway = [...calculatedEnds].sort((a, b) => {
+        if (b.component.headwindKt !== a.component.headwindKt) {
+            return b.component.headwindKt - a.component.headwindKt;
+        }
+
+        return a.component.crosswindKt - b.component.crosswindKt;
+    })[0];
+
+    const activeRunway =
+        selectedEnd !== null
+            ? calculatedEnds.find((end) => end.ident === selectedEnd.ident) ??
+            bestRunway
+            : bestRunway;
+
+    const compassRotation = selectedEnd?.headingDeg ?? 0;
+    const isNorthUp = selectedEnd === null;
+
+    return (
+        <div className="mb-6 rounded-2xl border border-[#d6b35a]/25 bg-black/55 p-5">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                        Runway Wind
+                    </p>
+
+                    <h3 className="mt-2 text-2xl font-bold text-white">
+                        Visual Runway / Wind Compass
+                    </h3>
+
+                    <p className="mt-2 text-sm leading-6 text-zinc-400">
+                        North-up by default. Select a runway end to rotate the
+                        compass as if aligned for takeoff or landing.
+                    </p>
+                </div>
+
+                <div className="flex flex-col gap-2 sm:flex-row">
+                    <div className="rounded-xl border border-zinc-700 bg-zinc-950 px-4 py-3 text-sm text-zinc-300">
+                        Wind {metar.wind.directionDeg} deg at {metar.wind.speedKt} kt
+                        {metar.wind.gustKt !== null
+                            ? `, gust ${metar.wind.gustKt} kt`
+                            : ""}
+                    </div>
+
+                    {!isNorthUp && (
+                        <button
+                            onClick={() => setSelectedEnd(null)}
+                            className="rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-4 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
+                        >
+                            Reset N-Up
+                        </button>
+                    )}
+                </div>
+            </div>
+
+            <div className="mt-5 grid gap-5 lg:grid-cols-[1fr_0.75fr]">
+                <RunwayCompassSvg
+                    runways={runways}
+                    runwayEnds={calculatedEnds}
+                    selectedEnd={selectedEnd}
+                    bestRunwayIdent={bestRunway?.ident ?? null}
+                    windDirectionDeg={metar.wind.directionDeg}
+                    windSpeedKt={metar.wind.speedKt}
+                    compassRotation={compassRotation}
+                    onSelectEnd={setSelectedEnd}
+                />
+
+                <div className="space-y-4">
+                    <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                            {selectedEnd ? "Selected runway" : "Best aligned runway"}
+                        </p>
+
+                        {activeRunway ? (
+                            <>
+                                <p className="mt-2 text-3xl font-black text-white">
+                                    RWY {activeRunway.ident}
+                                </p>
+
+                                <p className="mt-1 text-sm text-zinc-500">
+                                    Heading {activeRunway.headingDeg} deg
+                                </p>
+
+                                <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+                                    <ComponentPill
+                                        label={
+                                            activeRunway.component.headwindKt >= 0
+                                                ? "Headwind"
+                                                : "Tailwind"
+                                        }
+                                        value={`${Math.abs(
+                                            activeRunway.component.headwindKt
+                                        )} kt`}
+                                        tone={
+                                            activeRunway.component.headwindKt >= 0
+                                                ? "good"
+                                                : "bad"
+                                        }
+                                    />
+
+                                    <ComponentPill
+                                        label={
+                                            activeRunway.component.crosswindFrom ===
+                                                "centerline"
+                                                ? "Crosswind"
+                                                : `Crosswind from ${activeRunway.component.crosswindFrom}`
+                                        }
+                                        value={`${activeRunway.component.crosswindKt} kt`}
+                                        tone={getCrosswindTone(
+                                            activeRunway.component.crosswindKt
+                                        )}
+                                    />
+                                </div>
+
+                                {activeRunway.gustComponent && (
+                                    <p className="mt-4 rounded-xl border border-zinc-800 bg-black/55 px-4 py-3 text-xs leading-5 text-zinc-400">
+                                        Gust component:{" "}
+                                        {formatComponentSummary(
+                                            activeRunway.gustComponent
+                                        )}
+                                    </p>
+                                )}
+                            </>
+                        ) : (
+                            <p className="mt-3 text-sm text-zinc-500">
+                                No runway end selected.
+                            </p>
+                        )}
+                    </div>
+
+                    <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                            Runway selector
+                        </p>
+
+                        <div className="mt-3 grid grid-cols-2 gap-2">
+                            {calculatedEnds.map((runwayEnd) => (
+                                <button
+                                    key={`${runwayEnd.runwayId}-${runwayEnd.ident}`}
+                                    onClick={() => setSelectedEnd(runwayEnd)}
+                                    className={`rounded-xl border px-3 py-2 text-left text-sm transition ${selectedEnd?.ident === runwayEnd.ident
+                                            ? "border-[#d6b35a] bg-[#d6b35a]/15 text-[#e6c76f]"
+                                            : "border-zinc-800 bg-black/55 text-zinc-300 hover:border-zinc-600"
+                                        }`}
+                                >
+                                    <span className="block font-bold">
+                                        RWY {runwayEnd.ident}
+                                    </span>
+                                    <span className="text-xs text-zinc-500">
+                                        {runwayEnd.headingDeg} deg
+                                    </span>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    <p className="text-xs leading-5 text-zinc-500">
+                        Runway bearings are calculated from FAA runway endpoint
+                        coordinates. Use for situational awareness only and verify
+                        with official FAA publications and ATC/ATIS information.
+                    </p>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function RunwayCompassSvg({
+    runways,
+    runwayEnds,
+    selectedEnd,
+    bestRunwayIdent,
+    windDirectionDeg,
+    windSpeedKt,
+    compassRotation,
+    onSelectEnd,
+}: {
+    runways: AirportRunway[];
+    runwayEnds: Array<RunwayEnd & {
+        component: RunwayWindComponent;
+        gustComponent: RunwayWindComponent | null;
+    }>;
+    selectedEnd: RunwayEnd | null;
+    bestRunwayIdent: string | null;
+    windDirectionDeg: number;
+    windSpeedKt: number;
+    compassRotation: number;
+    onSelectEnd: (runwayEnd: RunwayEnd) => void;
+}) {
+    const center = 200;
+    const radius = 158;
+
+    function displayAngle(angleDeg: number): number {
+        return normalizeAngle360(angleDeg - compassRotation);
+    }
+
+    const windDisplayAngle = displayAngle(windDirectionDeg);
+    const windFrom = polarPoint(center, center, radius - 10, windDisplayAngle);
+    const windTo = polarPoint(center, center, 40, windDisplayAngle);
+
+    return (
+        <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-4">
+            <div className="flex items-center justify-between gap-3">
+                <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                        Compass View
+                    </p>
+                    <p className="mt-1 text-sm text-zinc-400">
+                        {selectedEnd
+                            ? `RWY ${selectedEnd.ident} aligned up`
+                            : "North-up orientation"}
+                    </p>
+                </div>
+
+                <div className="rounded-full border border-zinc-700 bg-black px-3 py-1 text-xs font-semibold text-zinc-300">
+                    {windDirectionDeg} deg / {windSpeedKt} kt
+                </div>
+            </div>
+
+            <svg
+                viewBox="0 0 400 400"
+                className="mt-4 h-auto w-full rounded-2xl bg-black"
+                role="img"
+                aria-label="Runway and wind compass"
+            >
+                <defs>
+                    <marker
+                        id="wind-arrow"
+                        markerWidth="10"
+                        markerHeight="10"
+                        refX="8"
+                        refY="5"
+                        orient="auto"
+                        markerUnits="strokeWidth"
+                    >
+                        <path d="M 0 0 L 10 5 L 0 10 z" fill="#e6c76f" />
+                    </marker>
+                </defs>
+
+                <circle
+                    cx={center}
+                    cy={center}
+                    r={radius}
+                    fill="#050505"
+                    stroke="#3f3f46"
+                    strokeWidth="1"
+                />
+
+                {Array.from({ length: 72 }).map((_, index) => {
+                    const angle = index * 5;
+                    const isMajor = index % 6 === 0;
+                    const outer = polarPoint(center, center, radius, displayAngle(angle));
+                    const inner = polarPoint(
+                        center,
+                        center,
+                        radius - (isMajor ? 16 : 8),
+                        displayAngle(angle)
+                    );
+
+                    return (
+                        <line
+                            key={angle}
+                            x1={outer.x}
+                            y1={outer.y}
+                            x2={inner.x}
+                            y2={inner.y}
+                            stroke={isMajor ? "#a1a1aa" : "#52525b"}
+                            strokeWidth={isMajor ? 1.5 : 0.75}
+                        />
+                    );
+                })}
+
+                {[
+                    { label: "N", angle: 0 },
+                    { label: "E", angle: 90 },
+                    { label: "S", angle: 180 },
+                    { label: "W", angle: 270 },
+                ].map((point) => {
+                    const pos = polarPoint(
+                        center,
+                        center,
+                        radius - 34,
+                        displayAngle(point.angle)
+                    );
+
+                    return (
+                        <text
+                            key={point.label}
+                            x={pos.x}
+                            y={pos.y}
+                            textAnchor="middle"
+                            dominantBaseline="middle"
+                            fill="#d4d4d8"
+                            fontSize="22"
+                            fontWeight="700"
+                        >
+                            {point.label}
+                        </text>
+                    );
+                })}
+
+                {[
+                    { label: "03", angle: 30 },
+                    { label: "06", angle: 60 },
+                    { label: "12", angle: 120 },
+                    { label: "15", angle: 150 },
+                    { label: "21", angle: 210 },
+                    { label: "24", angle: 240 },
+                    { label: "30", angle: 300 },
+                    { label: "33", angle: 330 },
+                ].map((point) => {
+                    const pos = polarPoint(
+                        center,
+                        center,
+                        radius - 42,
+                        displayAngle(point.angle)
+                    );
+
+                    return (
+                        <text
+                            key={point.label}
+                            x={pos.x}
+                            y={pos.y}
+                            textAnchor="middle"
+                            dominantBaseline="middle"
+                            fill="#71717a"
+                            fontSize="16"
+                            fontWeight="600"
+                        >
+                            {point.label}
+                        </text>
+                    );
+                })}
+
+                {runways.map((runway) => (
+                    <CompassRunwayPair
+                        key={runway.id}
+                        runway={runway}
+                        runwayEnds={runwayEnds}
+                        center={center}
+                        angleDeg={
+                            runway.endA.headingDeg !== null
+                                ? displayAngle(runway.endA.headingDeg)
+                                : 0
+                        }
+                        selectedEnd={selectedEnd}
+                        bestRunwayIdent={bestRunwayIdent}
+                        onSelectEnd={onSelectEnd}
+                    />
+                ))}
+
+                <line
+                    x1={windFrom.x}
+                    y1={windFrom.y}
+                    x2={windTo.x}
+                    y2={windTo.y}
+                    stroke="#e6c76f"
+                    strokeWidth="3"
+                    markerEnd="url(#wind-arrow)"
+                />
+
+                <circle cx={center} cy={center} r="4" fill="#e6c76f" />
+
+                <g>
+                    <rect
+                        x="130"
+                        y="358"
+                        width="140"
+                        height="30"
+                        rx="15"
+                        fill="#050505"
+                        stroke="#d6b35a"
+                    />
+                    <text
+                        x="200"
+                        y="374"
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                        fill="#ffffff"
+                        fontSize="15"
+                        fontWeight="800"
+                    >
+                        {windDirectionDeg} deg  {windSpeedKt} kt
+                    </text>
+                </g>
+            </svg>
+        </div>
+    );
+}
+
+function CompassRunwayPair({
+    runway,
+    runwayEnds,
+    center,
+    angleDeg,
+    selectedEnd,
+    bestRunwayIdent,
+    onSelectEnd,
+}: {
+    runway: AirportRunway;
+    runwayEnds: RunwayEnd[];
+    center: number;
+    angleDeg: number;
+    selectedEnd: RunwayEnd | null;
+    bestRunwayIdent: string | null;
+    onSelectEnd: (runwayEnd: RunwayEnd) => void;
+}) {
+    const runwayLength = 170;
+    const runwayWidth = runway.widthFt !== null && runway.widthFt >= 100 ? 16 : 12;
+
+    const endA = runwayEnds.find(
+        (end) => end.runwayId === runway.id && end.ident === runway.endA.ident
+    );
+
+    const endB = runwayEnds.find(
+        (end) => end.runwayId === runway.id && end.ident === runway.endB.ident
+    );
+
+    const isSelected =
+        selectedEnd?.ident === runway.endA.ident ||
+        selectedEnd?.ident === runway.endB.ident;
+
+    const isBest =
+        bestRunwayIdent === runway.endA.ident || bestRunwayIdent === runway.endB.ident;
+
+    const runwayFill = isSelected
+        ? "#d6b35a"
+        : isBest
+            ? "#22c55e"
+            : "#18181b";
+
+    const runwayStroke = isSelected
+        ? "#f5d77e"
+        : isBest
+            ? "#86efac"
+            : "#a1a1aa";
+
+    return (
+        <g
+            transform={`translate(${center} ${center}) rotate(${angleDeg})`}
+            style={{ cursor: "pointer" }}
+        >
+            <rect
+                x={-runwayWidth / 2}
+                y={-runwayLength / 2}
+                width={runwayWidth}
+                height={runwayLength}
+                rx="4"
+                fill={runwayFill}
+                stroke={runwayStroke}
+                strokeWidth="1.5"
+                opacity={isSelected || isBest ? 0.95 : 0.8}
+            />
+
+            <line
+                x1="0"
+                y1={-runwayLength / 2 + 10}
+                x2="0"
+                y2={runwayLength / 2 - 10}
+                stroke="#ffffff"
+                strokeWidth="1"
+                strokeDasharray="8 6"
+                opacity="0.8"
+            />
+
+            {endA && (
+                <g
+                    onClick={(event) => {
+                        event.stopPropagation();
+                        onSelectEnd(endA);
+                    }}
+                >
+                    <rect
+                        x={-20}
+                        y={-runwayLength / 2 - 16}
+                        width="40"
+                        height="18"
+                        rx="5"
+                        fill="#050505"
+                        stroke={
+                            selectedEnd?.ident === endA.ident
+                                ? "#f5d77e"
+                                : "#71717a"
+                        }
+                    />
+                    <text
+                        x="0"
+                        y={-runwayLength / 2 - 7}
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                        fill="#ffffff"
+                        fontSize="10"
+                        fontWeight="800"
+                    >
+                        {endA.ident}
+                    </text>
+                </g>
+            )}
+
+            {endB && (
+                <g
+                    onClick={(event) => {
+                        event.stopPropagation();
+                        onSelectEnd(endB);
+                    }}
+                >
+                    <rect
+                        x={-20}
+                        y={runwayLength / 2 - 2}
+                        width="40"
+                        height="18"
+                        rx="5"
+                        fill="#050505"
+                        stroke={
+                            selectedEnd?.ident === endB.ident
+                                ? "#f5d77e"
+                                : "#71717a"
+                        }
+                    />
+                    <text
+                        x="0"
+                        y={runwayLength / 2 + 7}
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                        fill="#ffffff"
+                        fontSize="10"
+                        fontWeight="800"
+                    >
+                        {endB.ident}
+                    </text>
+                </g>
+            )}
+        </g>
+    );
+}
+
+function ComponentPill({
+    label,
+    value,
+    tone,
+}: {
+    label: string;
+    value: string;
+    tone: "good" | "caution" | "bad" | "neutral";
+}) {
+    const toneClass = {
+        good: "border-emerald-400/40 bg-emerald-400/10 text-emerald-200",
+        caution: "border-yellow-300/40 bg-yellow-300/10 text-yellow-200",
+        bad: "border-red-400/40 bg-red-400/10 text-red-200",
+        neutral: "border-zinc-700 bg-zinc-950 text-zinc-200",
+    }[tone];
+
+    return (
+        <div className={`rounded-xl border px-3 py-2 ${toneClass}`}>
+            <p className="text-[10px] font-bold uppercase tracking-[0.16em] opacity-80">
+                {label}
+            </p>
+            <p className="mt-1 text-lg font-black">{value}</p>
+        </div>
+    );
+}
+
 function RemarksSection({ remarks }: { remarks: string | null }) {
     const remarkBubbles = getRemarkBubbles(remarks);
 
@@ -1550,4 +2204,108 @@ function decodePreciseTempDewpoint(token: string): string | null {
     return `Precise temp ${temperature.toFixed(1)} C; dewpoint ${dewpoint.toFixed(
         1
     )} C.`;
+}
+
+function getRunwayEnds(runways: AirportRunway[]): RunwayEnd[] {
+    return runways.flatMap((runway) => {
+        const ends: RunwayEnd[] = [];
+
+        if (runway.endA.ident && runway.endA.headingDeg !== null) {
+            ends.push({
+                runwayId: runway.id,
+                pairName: runway.name,
+                ident: runway.endA.ident,
+                headingDeg: runway.endA.headingDeg,
+            });
+        }
+
+        if (runway.endB.ident && runway.endB.headingDeg !== null) {
+            ends.push({
+                runwayId: runway.id,
+                pairName: runway.name,
+                ident: runway.endB.ident,
+                headingDeg: runway.endB.headingDeg,
+            });
+        }
+
+        return ends;
+    });
+}
+
+function calculateRunwayWindComponent(
+    windDirectionDeg: number,
+    windSpeedKt: number,
+    runwayHeadingDeg: number
+): RunwayWindComponent {
+    const angleDeg = normalizeAngle180(windDirectionDeg - runwayHeadingDeg);
+    const angleRad = (angleDeg * Math.PI) / 180;
+
+    const headwind = windSpeedKt * Math.cos(angleRad);
+    const crosswind = windSpeedKt * Math.sin(angleRad);
+
+    return {
+        headwindKt: Math.round(headwind),
+        crosswindKt: Math.round(Math.abs(crosswind)),
+        crosswindFrom:
+            Math.abs(crosswind) < 0.5
+                ? "centerline"
+                : crosswind > 0
+                    ? "right"
+                    : "left",
+    };
+}
+
+function normalizeAngle180(angleDeg: number): number {
+    let angle = angleDeg;
+
+    while (angle > 180) angle -= 360;
+    while (angle < -180) angle += 360;
+
+    return angle;
+}
+
+function formatComponentSummary(component: RunwayWindComponent): string {
+    const headwindText =
+        component.headwindKt >= 0
+            ? `${component.headwindKt} kt headwind`
+            : `${Math.abs(component.headwindKt)} kt tailwind`;
+
+    const crosswindText =
+        component.crosswindFrom === "centerline"
+            ? `${component.crosswindKt} kt crosswind`
+            : `${component.crosswindKt} kt crosswind from ${component.crosswindFrom}`;
+
+    return `${headwindText} | ${crosswindText}`;
+}
+
+function getCrosswindTone(
+    crosswindKt: number
+): "good" | "caution" | "bad" | "neutral" {
+    if (crosswindKt >= 15) return "bad";
+    if (crosswindKt >= 8) return "caution";
+    return "neutral";
+}
+
+function normalizeAngle360(angleDeg: number): number {
+    let angle = angleDeg % 360;
+
+    if (angle < 0) {
+        angle += 360;
+    }
+
+    return angle;
+}
+
+function polarPoint(
+    centerX: number,
+    centerY: number,
+    radius: number,
+    angleDeg: number
+): { x: number; y: number } {
+    const angleRad = (angleDeg * Math.PI) / 180;
+
+    return {
+        x: centerX + radius * Math.sin(angleRad),
+        y: centerY - radius * Math.cos(angleRad),
+    };
 }
