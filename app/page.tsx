@@ -290,6 +290,9 @@ function MetarDashboard({
     stationInfo: StationInfo | null;
 }) {
     const [now, setNow] = useState(() => new Date());
+    const [activeDashboardTab, setActiveDashboardTab] =
+        useState<DashboardTab>("weather");
+
     const categoryStyle = FLIGHT_CATEGORY_STYLES[metar.flightCategory];
 
     useEffect(() => {
@@ -312,7 +315,9 @@ function MetarDashboard({
                         <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
                             <div>
                                 <h2 className="text-3xl font-bold text-white md:text-4xl">
-                                    {stationInfo?.displayName ?? metar.station ?? "Unknown Station"}
+                                    {stationInfo?.displayName ??
+                                        metar.station ??
+                                        "Unknown Station"}
                                 </h2>
 
                                 {stationInfo && (
@@ -321,7 +326,9 @@ function MetarDashboard({
                                         {stationInfo.elevationFt !== null
                                             ? ` | Elev. ${stationInfo.elevationFt.toLocaleString()} ft`
                                             : ""}
-                                        {stationInfo.timeZone ? ` | ${stationInfo.timeZone}` : ""}
+                                        {stationInfo.timeZone
+                                            ? ` | ${stationInfo.timeZone}`
+                                            : ""}
                                     </p>
                                 )}
                             </div>
@@ -347,66 +354,269 @@ function MetarDashboard({
                             {getFlightCategoryDescription(metar)}
                         </p>
                     </div>
+
+                    <div className="mt-2 flex rounded-2xl border border-zinc-800 bg-black p-1">
+                        <DashboardTabButton
+                            active={activeDashboardTab === "weather"}
+                            onClick={() => setActiveDashboardTab("weather")}
+                        >
+                            Weather
+                        </DashboardTabButton>
+
+                        <DashboardTabButton
+                            active={activeDashboardTab === "taf"}
+                            onClick={() => setActiveDashboardTab("taf")}
+                        >
+                            TAF
+                        </DashboardTabButton>
+
+                        <DashboardTabButton
+                            active={activeDashboardTab === "airport"}
+                            onClick={() => setActiveDashboardTab("airport")}
+                        >
+                            Airport Info
+                        </DashboardTabButton>
+                    </div>
                 </div>
             </div>
 
             <div className="p-6">
-                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                    <WeatherCard
-                        label="Wind"
-                        value={formatWind(metar)}
-                        detail={formatWindDetail(metar)}
-                        accent="gold"
-                    />
+                {activeDashboardTab === "weather" && (
+                    <WeatherDashboardTab metar={metar} rawMetar={rawMetar} />
+                )}
 
-                    <WeatherCard
-                        label="Visibility"
-                        value={formatVisibility(metar)}
-                        detail={getVisibilityDescription(metar)}
-                        accent="silver"
-                    />
+                {activeDashboardTab === "taf" && <TafDashboardTab />}
 
-                    <WeatherCard
-                        label="Ceiling"
-                        value={formatCeiling(metar)}
-                        detail={getCeilingDescription(metar)}
-                        accent="silver"
-                    />
-
-                    <WeatherCard
-                        label="Clouds"
-                        value={formatClouds(metar)}
-                        detail={getCloudDescription(metar)}
-                        accent="gold"
-                    />
-
-                    <WeatherCard
-                        label="Temp / Dewpoint"
-                        value={formatTemperature(metar)}
-                        detail={getSpreadDescription(metar)}
-                        accent="silver"
-                    />
-
-                    <WeatherCard
-                        label="Altimeter"
-                        value={formatAltimeter(metar)}
-                        detail="Pressure setting"
-                        accent="gold"
-                    />
-                </div>
-
-                <RemarksSection remarks={metar.remarks} />
-
-                <div className="mt-6 rounded-2xl border border-[#d6b35a]/20 bg-[#d6b35a]/10 p-4">
-                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#e6c76f]">
-                        Raw METAR
-                    </p>
-                    <p className="mt-3 break-words font-mono text-sm leading-6 text-zinc-200">
-                        {rawMetar}
-                    </p>
-                </div>
+                {activeDashboardTab === "airport" && (
+                    <AirportInfoDashboardTab stationInfo={stationInfo} />
+                )}
             </div>
         </section>
+    );
+}
+
+function WeatherDashboardTab({
+    metar,
+    rawMetar,
+}: {
+    metar: NormalizedMetar;
+    rawMetar: string;
+}) {
+    return (
+        <>
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                <WeatherCard
+                    label="Wind"
+                    value={formatWind(metar)}
+                    detail={formatWindDetail(metar)}
+                    accent="gold"
+                />
+
+                <WeatherCard
+                    label="Visibility"
+                    value={formatVisibility(metar)}
+                    detail={getVisibilityDescription(metar)}
+                    accent="silver"
+                />
+
+                <WeatherCard
+                    label="Ceiling"
+                    value={formatCeiling(metar)}
+                    detail={getCeilingDescription(metar)}
+                    accent="silver"
+                />
+
+                <WeatherCard
+                    label="Clouds"
+                    value={formatClouds(metar)}
+                    detail={getCloudDescription(metar)}
+                    accent="gold"
+                />
+
+                <WeatherCard
+                    label="Temp / Dewpoint"
+                    value={formatTemperature(metar)}
+                    detail={getSpreadDescription(metar)}
+                    accent="silver"
+                />
+
+                <WeatherCard
+                    label="Altimeter"
+                    value={formatAltimeter(metar)}
+                    detail="Pressure setting"
+                    accent="gold"
+                />
+            </div>
+
+            <RemarksSection remarks={metar.remarks} />
+
+            <div className="mt-6 rounded-2xl border border-[#d6b35a]/20 bg-[#d6b35a]/10 p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#e6c76f]">
+                    Raw METAR
+                </p>
+                <p className="mt-3 break-words font-mono text-sm leading-6 text-zinc-200">
+                    {rawMetar}
+                </p>
+            </div>
+        </>
+    );
+}
+
+function TafDashboardTab() {
+    return (
+        <div className="rounded-2xl border border-dashed border-zinc-800 bg-black/55 p-8 text-center">
+            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                TAF
+            </p>
+            <h3 className="mt-2 text-2xl font-bold text-white">
+                TAF Decoder Coming Soon
+            </h3>
+            <p className="mx-auto mt-3 max-w-2xl text-sm leading-6 text-zinc-400">
+                This tab will eventually show a decoded TAF timeline, forecast
+                flight category changes, forecast winds, ceiling and visibility
+                changes, and temporary/probability groups.
+            </p>
+        </div>
+    );
+}
+
+function AirportInfoDashboardTab({
+    stationInfo,
+}: {
+    stationInfo: StationInfo | null;
+}) {
+    if (!stationInfo) {
+        return (
+            <div className="rounded-2xl border border-zinc-800 bg-black/55 p-6">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    Airport Info
+                </p>
+                <p className="mt-3 text-sm text-zinc-400">
+                    Airport information is unavailable for this station.
+                </p>
+            </div>
+        );
+    }
+
+    return (
+        <div className="grid gap-5 lg:grid-cols-[0.9fr_1.1fr]">
+            <div className="rounded-2xl border border-zinc-800 bg-black/55 p-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    Airport Information
+                </p>
+
+                <h3 className="mt-3 text-2xl font-bold text-white">
+                    {stationInfo.displayName}
+                </h3>
+
+                <div className="mt-5 space-y-3 text-sm">
+                    <AirportInfoRow
+                        label="Location"
+                        value={stationInfo.displayLocation}
+                    />
+
+                    <AirportInfoRow
+                        label="Elevation"
+                        value={
+                            stationInfo.elevationFt !== null
+                                ? `${stationInfo.elevationFt.toLocaleString()} ft`
+                                : "Unavailable"
+                        }
+                    />
+
+                    <AirportInfoRow
+                        label="Timezone"
+                        value={stationInfo.timeZone ?? "Unavailable"}
+                    />
+
+                    <AirportInfoRow
+                        label="Latitude"
+                        value={
+                            stationInfo.latitude !== null
+                                ? stationInfo.latitude.toFixed(5)
+                                : "Unavailable"
+                        }
+                    />
+
+                    <AirportInfoRow
+                        label="Longitude"
+                        value={
+                            stationInfo.longitude !== null
+                                ? stationInfo.longitude.toFixed(5)
+                                : "Unavailable"
+                        }
+                    />
+                </div>
+            </div>
+
+            <div className="rounded-2xl border border-zinc-800 bg-black/55 p-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    FAA Airport Diagram
+                </p>
+
+                <div className="mt-4 flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-zinc-700 bg-zinc-950 p-6 text-center">
+                    <div>
+                        <p className="text-lg font-bold text-white">
+                            Diagram Preview Placeholder
+                        </p>
+                        <p className="mt-2 max-w-md text-sm leading-6 text-zinc-400">
+                            This panel will later show the FAA airport diagram
+                            PDF or image for the selected airport. The same
+                            airport data layer will also feed the runway and
+                            crosswind widget.
+                        </p>
+
+                        <a
+                            href="https://www.faa.gov/airports/runway_safety/diagrams"
+                            target="_blank"
+                            rel="noreferrer"
+                            className="mt-5 inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
+                        >
+                            Open FAA Diagram Search
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function AirportInfoRow({
+    label,
+    value,
+}: {
+    label: string;
+    value: string;
+}) {
+    return (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-3">
+            <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-zinc-500">
+                {label}
+            </p>
+            <p className="mt-1 text-zinc-200">{value}</p>
+        </div>
+    );
+}
+
+function DashboardTabButton({
+    active,
+    onClick,
+    children,
+}: {
+    active: boolean;
+    onClick: () => void;
+    children: ReactNode;
+}) {
+    return (
+        <button
+            onClick={onClick}
+            className={`w-full rounded-xl px-4 py-3 text-sm font-bold transition ${active
+                    ? "bg-[#d6b35a] text-black"
+                    : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
+                }`}
+        >
+            {children}
+        </button>
     );
 }
 
