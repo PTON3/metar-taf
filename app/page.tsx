@@ -755,10 +755,6 @@ function AirportDiagramPreviewCard({
                     <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
                         FAA Airport Diagram
                     </p>
-
-                    <h3 className="mt-2 text-2xl font-bold text-white">
-                        {airportDiagram?.chartName ?? "Airport Diagram"}
-                    </h3>
                 </div>
 
                 {airportDiagram?.cycle && (
