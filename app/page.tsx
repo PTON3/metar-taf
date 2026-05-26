@@ -23,6 +23,25 @@ type StationInfo = {
     timeZone: string | null;
 };
 
+type AirportDiagramInfo = {
+    station: string;
+    faaIdent: string;
+    faaSearchUrl: string;
+    faaSearchResultsUrl: string;
+    faaAirportDiagramPageUrl: string;
+    diagramPdfUrl: string | null;
+    chartName: string | null;
+    pdfName: string | null;
+    cycle: string | null;
+    note: string;
+};
+
+type AirportDiagramResponse =
+    | AirportDiagramInfo
+    | {
+        error: string;
+    };
+
 type StationInfoResponse = {
     data?: StationInfo;
     error?: string;
@@ -52,6 +71,7 @@ export default function Home() {
     const [metar, setMetar] = useState<NormalizedMetar | null>(null);
     const [rawMetar, setRawMetar] = useState<string | null>(null);
     const [stationInfo, setStationInfo] = useState<StationInfo | null>(null);
+    const [airportDiagram, setAirportDiagram] = useState<AirportDiagramInfo | null>(null);
     const [error, setError] = useState("");
     const [loading, setLoading] = useState(false);
 
@@ -79,6 +99,7 @@ export default function Home() {
             setRawMetar(data.raw ?? null);
 
             await fetchStationInfo(normalized?.station ?? cleanStation);
+            await fetchAirportDiagram(normalized?.station ?? cleanStation);
 
         } catch (err) {
             setError(err instanceof Error ? err.message : "Unexpected error.");
@@ -114,6 +135,7 @@ export default function Home() {
             setRawMetar(data.raw ?? rawInput);
 
             await fetchStationInfo(normalized?.station);
+            await fetchAirportDiagram(normalized?.station);
 
         } catch (err) {
             setError(err instanceof Error ? err.message : "Unexpected error.");
@@ -143,6 +165,30 @@ export default function Home() {
             setStationInfo(data.data);
         } catch {
             setStationInfo(null);
+        }
+    }
+
+    async function fetchAirportDiagram(stationToLookup: string | null | undefined) {
+        if (!stationToLookup) {
+            setAirportDiagram(null);
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                `/api/airport/diagram?station=${encodeURIComponent(stationToLookup)}`
+            );
+
+            const data: AirportDiagramResponse = await response.json();
+
+            if (!response.ok || "error" in data) {
+                setAirportDiagram(null);
+                return;
+            }
+
+            setAirportDiagram(data);
+        } catch {
+            setAirportDiagram(null);
         }
     }
 
@@ -263,6 +309,7 @@ export default function Home() {
                         metar={metar}
                         rawMetar={rawMetar ?? metar.raw}
                         stationInfo={stationInfo}
+                        airportDiagram={airportDiagram}
                     />
                     ) : (
                     <EmptyState />
@@ -284,10 +331,12 @@ function MetarDashboard({
     metar,
     rawMetar,
     stationInfo,
+    airportDiagram,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
     stationInfo: StationInfo | null;
+    airportDiagram: AirportDiagramInfo | null;
 }) {
     const [now, setNow] = useState(() => new Date());
     const [activeDashboardTab, setActiveDashboardTab] =
@@ -388,7 +437,10 @@ function MetarDashboard({
                 {activeDashboardTab === "taf" && <TafDashboardTab />}
 
                 {activeDashboardTab === "airport" && (
-                    <AirportInfoDashboardTab stationInfo={stationInfo} />
+                    <AirportInfoDashboardTab
+                        stationInfo={stationInfo}
+                        airportDiagram={airportDiagram}
+                    />
                 )}
             </div>
         </section>
@@ -482,8 +534,10 @@ function TafDashboardTab() {
 
 function AirportInfoDashboardTab({
     stationInfo,
+    airportDiagram,
 }: {
     stationInfo: StationInfo | null;
+    airportDiagram: AirportDiagramInfo | null;
 }) {
     if (!stationInfo) {
         return (
@@ -550,32 +604,98 @@ function AirportInfoDashboardTab({
             </div>
 
             <div className="rounded-2xl border border-zinc-800 bg-black/55 p-5">
-                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                    FAA Airport Diagram
-                </p>
-
-                <div className="mt-4 flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-zinc-700 bg-zinc-950 p-6 text-center">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
                     <div>
-                        <p className="text-lg font-bold text-white">
-                            Diagram Preview Placeholder
-                        </p>
-                        <p className="mt-2 max-w-md text-sm leading-6 text-zinc-400">
-                            This panel will later show the FAA airport diagram
-                            PDF or image for the selected airport. The same
-                            airport data layer will also feed the runway and
-                            crosswind widget.
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                            FAA Airport Diagram
                         </p>
 
-                        <a
-                            href="https://www.faa.gov/airports/runway_safety/diagrams"
-                            target="_blank"
-                            rel="noreferrer"
-                            className="mt-5 inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
-                        >
-                            Open FAA Diagram Search
-                        </a>
+                        <h3 className="mt-2 text-2xl font-bold text-white">
+                            {airportDiagram?.chartName ?? "Airport Diagram"}
+                        </h3>
                     </div>
+
+                    {airportDiagram?.cycle && (
+                        <p className="rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">
+                            Cycle {airportDiagram.cycle}
+                        </p>
+                    )}
                 </div>
+
+                {airportDiagram?.diagramPdfUrl ? (
+                    <>
+                        <div className="mt-4 h-[640px] overflow-hidden rounded-2xl border border-zinc-700 bg-white">
+                            <iframe
+                                src={airportDiagram.diagramPdfUrl}
+                                title={`${stationInfo.displayName} FAA Airport Diagram`}
+                                className="h-full w-full"
+                            />
+                        </div>
+
+                        <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+                            <a
+                                href={airportDiagram.diagramPdfUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
+                            >
+                                Open Diagram PDF
+                            </a>
+
+                            <a
+                                href={airportDiagram.faaSearchResultsUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex rounded-xl border border-zinc-700 bg-black px-5 py-3 text-sm font-bold text-zinc-200 transition hover:bg-zinc-900"
+                            >
+                                FAA Search Result
+                            </a>
+                        </div>
+                    </>
+                ) : (
+                    <div className="mt-4 flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-zinc-700 bg-zinc-950 p-6 text-center">
+                        <div>
+                            <p className="text-lg font-bold text-white">
+                                Diagram Preview Unavailable
+                            </p>
+
+                            <p className="mt-2 max-w-md text-sm leading-6 text-zinc-400">
+                                A direct FAA airport diagram PDF was not found for this
+                                airport. Use the official FAA links below as backup.
+                            </p>
+
+                            <div className="mt-5 flex flex-col items-center justify-center gap-3 sm:flex-row">
+                                {airportDiagram?.faaAirportDiagramPageUrl && (
+                                    <a
+                                        href={airportDiagram.faaAirportDiagramPageUrl}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
+                                    >
+                                        FAA Diagram Page
+                                    </a>
+                                )}
+
+                                {airportDiagram?.faaSearchUrl && (
+                                    <a
+                                        href={airportDiagram.faaSearchUrl}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="inline-flex rounded-xl border border-zinc-700 bg-black px-5 py-3 text-sm font-bold text-zinc-200 transition hover:bg-zinc-900"
+                                    >
+                                        FAA d-TPP Search
+                                    </a>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {airportDiagram?.note && (
+                    <p className="mt-4 text-xs leading-5 text-zinc-500">
+                        {airportDiagram.note}
+                    </p>
+                )}
             </div>
         </div>
     );
