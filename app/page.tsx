@@ -199,11 +199,11 @@ export default function Home() {
             if (activeTab === "lookup") {
                 void fetchLiveMetar(station);
             }
-        }, 5 * 60 * 1000);
+        }, 2 * 60 * 1000);
 
         return () => window.clearInterval(refreshTimer);
 
-        // Auto-refresh live ICAO lookup every 5 minutes.
+        // Auto-refresh live ICAO lookup every 2 minutes.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [activeTab, station]);
 
