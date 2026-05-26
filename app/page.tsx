@@ -12,10 +12,12 @@ type ApiResponse = {
 type StationInfo = {
     station: string;
     displayName: string;
+    displayLocation: string;
     city: string | null;
     state: string | null;
     country: string | null;
     name: string | null;
+    elevationFt: number | null;
     latitude: number | null;
     longitude: number | null;
     timeZone: string | null;
@@ -32,6 +34,7 @@ type RemarkBubble = {
 };
 
 type DecoderTab = "lookup" | "raw";
+type DashboardTab = "weather" | "taf" | "airport";
 
 const FLIGHT_CATEGORY_STYLES: Record<FlightCategory, string> = {
     VFR: "border-emerald-400/50 bg-emerald-400/15 text-emerald-200",
@@ -127,7 +130,7 @@ export default function Home() {
 
         try {
             const response = await fetch(
-                `/api/station/info?station=${encodeURIComponent(stationToLookup)}`
+                `/api/airport/info?station=${encodeURIComponent(stationToLookup)}`
             );
 
             const data: StationInfoResponse = await response.json();
@@ -307,8 +310,21 @@ function MetarDashboard({
                         </p>
 
                         <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                            <h2 className="text-3xl font-bold text-white md:text-4xl">
-                                {stationInfo?.displayName ?? metar.station ?? "Unknown Station"}                            </h2>
+                            <div>
+                                <h2 className="text-3xl font-bold text-white md:text-4xl">
+                                    {stationInfo?.displayName ?? metar.station ?? "Unknown Station"}
+                                </h2>
+
+                                {stationInfo && (
+                                    <p className="mt-2 text-sm text-zinc-400">
+                                        {stationInfo.displayLocation}
+                                        {stationInfo.elevationFt !== null
+                                            ? ` | Elev. ${stationInfo.elevationFt.toLocaleString()} ft`
+                                            : ""}
+                                        {stationInfo.timeZone ? ` | ${stationInfo.timeZone}` : ""}
+                                    </p>
+                                )}
+                            </div>
 
                             <ObservationTimeBubble
                                 metar={metar}

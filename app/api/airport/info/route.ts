@@ -5,13 +5,15 @@ export const runtime = "nodejs";
 const require = createRequire(import.meta.url);
 const tzLookup = require("tz-lookup") as (lat: number, lon: number) => string;
 
-type StationInfo = {
+type AirportInfo = {
     station: string;
     displayName: string;
+    displayLocation: string;
     city: string | null;
     state: string | null;
     country: string | null;
     name: string | null;
+    elevationFt: number | null;
     latitude: number | null;
     longitude: number | null;
     timeZone: string | null;
@@ -75,11 +77,15 @@ function getFirstRecord(data: unknown): Record<string, unknown> | null {
 
 function makeDisplayName(info: {
     station: string;
+    name: string | null;
     city: string | null;
     state: string | null;
     country: string | null;
-    name: string | null;
 }): string {
+    if (info.name) {
+        return `${info.station} - ${info.name}`;
+    }
+
     if (info.city && info.state) {
         return `${info.station} - ${info.city}, ${info.state}`;
     }
@@ -88,35 +94,61 @@ function makeDisplayName(info: {
         return `${info.station} - ${info.city}, ${info.country}`;
     }
 
-    if (info.name && info.state) {
-        return `${info.station} - ${info.name}, ${info.state}`;
-    }
-
-    if (info.name && info.country) {
-        return `${info.station} - ${info.name}, ${info.country}`;
-    }
-
-    if (info.name) {
-        return `${info.station} - ${info.name}`;
-    }
-
     return info.station;
 }
 
-function normalizeStationInfo(
+function makeDisplayLocation(info: {
+    city: string | null;
+    state: string | null;
+    country: string | null;
+}): string {
+    if (info.city && info.state) {
+        return `${info.city}, ${info.state}`;
+    }
+
+    if (info.city && info.country) {
+        return `${info.city}, ${info.country}`;
+    }
+
+    if (info.state && info.country) {
+        return `${info.state}, ${info.country}`;
+    }
+
+    if (info.city) return info.city;
+    if (info.state) return info.state;
+    if (info.country) return info.country;
+
+    return "Location unavailable";
+}
+
+function normalizeAirportInfo(
     requestedStation: string,
     record: Record<string, unknown>
-): StationInfo {
+): AirportInfo {
     const station =
         getString(record, ["icaoId", "icao", "id", "station"]) ?? requestedStation;
 
     const city = getString(record, ["city", "cityName", "municipality"]);
     const state = getString(record, ["state", "region", "province"]);
     const country = getString(record, ["country", "countryCode"]);
-    const name = getString(record, ["name", "site", "stationName"]);
+
+    const name = getString(record, [
+        "name",
+        "site",
+        "stationName",
+        "airportName",
+    ]);
 
     const latitude = getNumber(record, ["lat", "latitude"]);
     const longitude = getNumber(record, ["lon", "longitude"]);
+
+    const elevationFt = getNumber(record, [
+        "elev",
+        "elevation",
+        "elevationFt",
+        "elevFt",
+        "elev_ft",
+    ]);
 
     let timeZone: string | null = null;
 
@@ -132,15 +164,21 @@ function normalizeStationInfo(
         station,
         displayName: makeDisplayName({
             station,
+            name,
             city,
             state,
             country,
-            name,
+        }),
+        displayLocation: makeDisplayLocation({
+            city,
+            state,
+            country,
         }),
         city,
         state,
         country,
         name,
+        elevationFt,
         latitude,
         longitude,
         timeZone,
@@ -171,14 +209,14 @@ export async function GET(request: Request) {
 
         if (response.status === 204) {
             return Response.json(
-                { error: `No station info found for ${station}.` },
+                { error: `No airport info found for ${station}.` },
                 { status: 404 }
             );
         }
 
         if (!response.ok) {
             return Response.json(
-                { error: "Unable to fetch station info from AviationWeather.gov." },
+                { error: "Unable to fetch airport info from AviationWeather.gov." },
                 { status: 502 }
             );
         }
@@ -188,13 +226,13 @@ export async function GET(request: Request) {
 
         if (!record) {
             return Response.json(
-                { error: `No station info found for ${station}.` },
+                { error: `No airport info found for ${station}.` },
                 { status: 404 }
             );
         }
 
         return Response.json({
-            data: normalizeStationInfo(station, record),
+            data: normalizeAirportInfo(station, record),
         });
     } catch (error) {
         return Response.json(
@@ -202,7 +240,7 @@ export async function GET(request: Request) {
                 error:
                     error instanceof Error
                         ? error.message
-                        : "Unexpected error fetching station info.",
+                        : "Unexpected error fetching airport info.",
             },
             { status: 500 }
         );
