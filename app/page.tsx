@@ -194,9 +194,18 @@ export default function Home() {
 
     useEffect(() => {
         void fetchLiveMetar("KFCM");
-        // Run once on page load so the app defaults to KFCM.
+
+        const refreshTimer = window.setInterval(() => {
+            if (activeTab === "lookup") {
+                void fetchLiveMetar(station);
+            }
+        }, 5 * 60 * 1000);
+
+        return () => window.clearInterval(refreshTimer);
+
+        // Auto-refresh live ICAO lookup every 5 minutes.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    }, [activeTab, station]);
 
     return (
         <main className="min-h-screen bg-[#050505] text-zinc-100">
@@ -629,13 +638,13 @@ function AirportInfoRow({
 }
 
 function AirportDiagramPreviewCard({
-    stationInfo,
     airportDiagram,
 }: {
-    stationInfo: StationInfo;
     airportDiagram: AirportDiagramInfo | null;
 }) {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const renderTaskRef = useRef<{ cancel: () => void } | null>(null);
+
     const [loadingPreview, setLoadingPreview] = useState(false);
     const [previewError, setPreviewError] = useState("");
 
@@ -650,6 +659,12 @@ function AirportDiagramPreviewCard({
             setLoadingPreview(true);
             setPreviewError("");
 
+            // Cancel any previous render on this same canvas before starting a new one.
+            if (renderTaskRef.current) {
+                renderTaskRef.current.cancel();
+                renderTaskRef.current = null;
+            }
+
             try {
                 const pdfjs = await import("pdfjs-dist");
 
@@ -663,6 +678,10 @@ function AirportDiagramPreviewCard({
                 const pdf = await loadingTask.promise;
                 const page = await pdf.getPage(1);
 
+                if (cancelled || !canvasRef.current) {
+                    return;
+                }
+
                 const canvas = canvasRef.current;
                 const context = canvas.getContext("2d");
 
@@ -670,8 +689,7 @@ function AirportDiagramPreviewCard({
                     throw new Error("Canvas context unavailable.");
                 }
 
-                const containerWidth =
-                    canvas.parentElement?.clientWidth ?? 700;
+                const containerWidth = canvas.parentElement?.clientWidth ?? 700;
 
                 const initialViewport = page.getViewport({ scale: 1 });
                 const scale = containerWidth / initialViewport.width;
@@ -687,37 +705,46 @@ function AirportDiagramPreviewCard({
                 context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
                 context.clearRect(0, 0, canvas.width, canvas.height);
 
-                await page.render({
+                const renderTask = page.render({
                     canvasContext: context,
                     viewport,
-                }).promise;
+                });
+
+                renderTaskRef.current = renderTask;
+
+                await renderTask.promise;
 
                 if (!cancelled) {
+                    renderTaskRef.current = null;
                     setLoadingPreview(false);
                 }
             } catch (error) {
-                if (!cancelled) {
-                    setLoadingPreview(false);
-                    setPreviewError(
-                        error instanceof Error
-                            ? error.message
-                            : "Unable to render diagram preview."
-                    );
+                if (cancelled) {
+                    return;
                 }
+
+                const message =
+                    error instanceof Error ? error.message : "Unable to render diagram preview.";
+
+                // Ignore expected PDF.js cancellation messages.
+                if (message.toLowerCase().includes("cancel")) {
+                    return;
+                }
+
+                setLoadingPreview(false);
+                setPreviewError(message);
             }
         }
 
-        renderPreview();
-
-        const onResize = () => {
-            void renderPreview();
-        };
-
-        window.addEventListener("resize", onResize);
+        void renderPreview();
 
         return () => {
             cancelled = true;
-            window.removeEventListener("resize", onResize);
+
+            if (renderTaskRef.current) {
+                renderTaskRef.current.cancel();
+                renderTaskRef.current = null;
+            }
         };
     }, [airportDiagram?.diagramPdfUrl]);
 
@@ -758,7 +785,7 @@ function AirportDiagramPreviewCard({
 
                             <canvas
                                 ref={canvasRef}
-                                className="block w-full h-auto bg-white"
+                                className="block h-auto w-full bg-white"
                             />
                         </div>
                     </a>
@@ -770,7 +797,7 @@ function AirportDiagramPreviewCard({
                             rel="noreferrer"
                             className="inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
                         >
-                            Open Diagram PDF
+                            Open PDF
                         </a>
 
                         <a
@@ -779,7 +806,7 @@ function AirportDiagramPreviewCard({
                             rel="noreferrer"
                             className="inline-flex rounded-xl border border-zinc-700 bg-black px-5 py-3 text-sm font-bold text-zinc-200 transition hover:bg-zinc-900"
                         >
-                            FAA Search Result
+                            Open FAA Search Result
                         </a>
                     </div>
 
@@ -797,9 +824,8 @@ function AirportDiagramPreviewCard({
                         </p>
 
                         <p className="mt-2 max-w-md text-sm leading-6 text-zinc-400">
-                            A direct FAA airport diagram PDF was not found for
-                            this airport. Use the official FAA links below as
-                            backup.
+                            A direct FAA airport diagram PDF was not found for this airport.
+                            Use the official FAA links below as backup.
                         </p>
 
                         <div className="mt-5 flex flex-col items-center justify-center gap-3 sm:flex-row">
