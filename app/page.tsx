@@ -88,6 +88,17 @@ type RunwayWindComponent = {
     crosswindFrom: "left" | "right" | "centerline";
 };
 
+type SvgPoint = {
+    x: number;
+    y: number;
+};
+
+type RunwayLayout = {
+    runway: AirportRunway;
+    start: SvgPoint;
+    end: SvgPoint;
+};
+
 type RemarkBubble = {
     code: string;
     meaning: string;
@@ -1257,36 +1268,27 @@ function RunwayWindWidget({
         );
     }
 
-    if (
-        metar.wind.directionDeg === null ||
-        metar.wind.speedKt === null ||
-        metar.wind.variable
-    ) {
-        return (
-            <div className="mb-6 rounded-2xl border border-zinc-800 bg-black/55 p-5">
-                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                    Runway Wind
-                </p>
-                <p className="mt-2 text-sm text-zinc-400">
-                    Runway wind components are unavailable for variable or missing wind.
-                </p>
-            </div>
-        );
-    }
+    const windDirectionDeg =
+        metar.wind.variable || metar.wind.directionDeg === null
+            ? null
+            : metar.wind.directionDeg;
+
+    const windSpeedKt = metar.wind.speedKt ?? 0;
+    const hasWindDirection = windDirectionDeg !== null && windSpeedKt > 0;
 
     const runwayEnds = getRunwayEnds(runways);
 
     const calculatedEnds = runwayEnds.map((runwayEnd) => ({
         ...runwayEnd,
         component: calculateRunwayWindComponent(
-            metar.wind.directionDeg ?? 0,
-            metar.wind.speedKt ?? 0,
+            windDirectionDeg ?? 0,
+            windSpeedKt,
             runwayEnd.headingDeg
         ),
         gustComponent:
             metar.wind.gustKt !== null
                 ? calculateRunwayWindComponent(
-                    metar.wind.directionDeg ?? 0,
+                    windDirectionDeg ?? 0,
                     metar.wind.gustKt,
                     runwayEnd.headingDeg
                 )
@@ -1330,10 +1332,10 @@ function RunwayWindWidget({
 
                 <div className="flex flex-col gap-2 sm:flex-row">
                     <div className="rounded-xl border border-zinc-700 bg-zinc-950 px-4 py-3 text-sm text-zinc-300">
-                        Wind {metar.wind.directionDeg} deg at {metar.wind.speedKt} kt
-                        {metar.wind.gustKt !== null
-                            ? `, gust ${metar.wind.gustKt} kt`
-                            : ""}
+                        {hasWindDirection
+                            ? `Wind ${windDirectionDeg} deg at ${windSpeedKt} kt`
+                            : `Wind ${windSpeedKt} kt, direction unavailable`}
+                        {metar.wind.gustKt !== null ? `, gust ${metar.wind.gustKt} kt` : ""}
                     </div>
 
                     {!isNorthUp && (
@@ -1353,8 +1355,8 @@ function RunwayWindWidget({
                     runwayEnds={calculatedEnds}
                     selectedEnd={selectedEnd}
                     bestRunwayIdent={bestRunway?.ident ?? null}
-                    windDirectionDeg={metar.wind.directionDeg}
-                    windSpeedKt={metar.wind.speedKt}
+                    windDirectionDeg={windDirectionDeg}
+                    windSpeedKt={windSpeedKt}
                     compassRotation={compassRotation}
                     onSelectEnd={setSelectedEnd}
                 />
@@ -1470,13 +1472,15 @@ function RunwayCompassSvg({
     onSelectEnd,
 }: {
     runways: AirportRunway[];
-    runwayEnds: Array<RunwayEnd & {
-        component: RunwayWindComponent;
-        gustComponent: RunwayWindComponent | null;
-    }>;
+    runwayEnds: Array<
+        RunwayEnd & {
+            component: RunwayWindComponent;
+            gustComponent: RunwayWindComponent | null;
+        }
+    >;
     selectedEnd: RunwayEnd | null;
     bestRunwayIdent: string | null;
-    windDirectionDeg: number;
+    windDirectionDeg: number | null;
     windSpeedKt: number;
     compassRotation: number;
     onSelectEnd: (runwayEnd: RunwayEnd) => void;
@@ -1484,13 +1488,27 @@ function RunwayCompassSvg({
     const center = 200;
     const radius = 158;
 
+    const runwayLayout = buildRunwayLayout(runways, compassRotation, center);
+
     function displayAngle(angleDeg: number): number {
         return normalizeAngle360(angleDeg - compassRotation);
     }
 
-    const windDisplayAngle = displayAngle(windDirectionDeg);
-    const windFrom = polarPoint(center, center, radius - 10, windDisplayAngle);
-    const windTo = polarPoint(center, center, 40, windDisplayAngle);
+    const hasWindArrow = windDirectionDeg !== null && windSpeedKt > 0;
+
+    const windDisplayAngle = hasWindArrow
+        ? displayAngle(windDirectionDeg)
+        : null;
+
+    const windFrom =
+        windDisplayAngle !== null
+            ? polarPoint(center, center, radius - 10, windDisplayAngle)
+            : null;
+
+    const windTo =
+        windDisplayAngle !== null
+            ? polarPoint(center, center, 40, windDisplayAngle)
+            : null;
 
     return (
         <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-4">
@@ -1502,12 +1520,14 @@ function RunwayCompassSvg({
                     <p className="mt-1 text-sm text-zinc-400">
                         {selectedEnd
                             ? `RWY ${selectedEnd.ident} aligned up`
-                            : "North-up orientation"}
+                            : "North-up airport layout"}
                     </p>
                 </div>
 
                 <div className="rounded-full border border-zinc-700 bg-black px-3 py-1 text-xs font-semibold text-zinc-300">
-                    {windDirectionDeg} deg / {windSpeedKt} kt
+                    {windDirectionDeg !== null
+                        ? `${windDirectionDeg} deg / ${windSpeedKt} kt`
+                        : `${windSpeedKt} kt`}
                 </div>
             </div>
 
@@ -1543,7 +1563,14 @@ function RunwayCompassSvg({
                 {Array.from({ length: 72 }).map((_, index) => {
                     const angle = index * 5;
                     const isMajor = index % 6 === 0;
-                    const outer = polarPoint(center, center, radius, displayAngle(angle));
+
+                    const outer = polarPoint(
+                        center,
+                        center,
+                        radius,
+                        displayAngle(angle)
+                    );
+
                     const inner = polarPoint(
                         center,
                         center,
@@ -1570,12 +1597,14 @@ function RunwayCompassSvg({
                     { label: "S", angle: 180 },
                     { label: "W", angle: 270 },
                 ].map((point) => {
+                    const displayedAngle = displayAngle(point.angle);
                     const pos = polarPoint(
                         center,
                         center,
                         radius - 34,
-                        displayAngle(point.angle)
+                        displayedAngle
                     );
+                    const textRotation = getTangentTextRotation(displayedAngle);
 
                     return (
                         <text
@@ -1587,6 +1616,7 @@ function RunwayCompassSvg({
                             fill="#d4d4d8"
                             fontSize="22"
                             fontWeight="700"
+                            transform={`rotate(${textRotation} ${pos.x} ${pos.y})`}
                         >
                             {point.label}
                         </text>
@@ -1603,12 +1633,14 @@ function RunwayCompassSvg({
                     { label: "30", angle: 300 },
                     { label: "33", angle: 330 },
                 ].map((point) => {
+                    const displayedAngle = displayAngle(point.angle);
                     const pos = polarPoint(
                         center,
                         center,
                         radius - 42,
-                        displayAngle(point.angle)
+                        displayedAngle
                     );
+                    const textRotation = getTangentTextRotation(displayedAngle);
 
                     return (
                         <text
@@ -1620,38 +1652,35 @@ function RunwayCompassSvg({
                             fill="#71717a"
                             fontSize="16"
                             fontWeight="600"
+                            transform={`rotate(${textRotation} ${pos.x} ${pos.y})`}
                         >
                             {point.label}
                         </text>
                     );
                 })}
 
-                {runways.map((runway) => (
+                {runwayLayout.map((layout) => (
                     <CompassRunwayPair
-                        key={runway.id}
-                        runway={runway}
+                        key={layout.runway.id}
+                        layout={layout}
                         runwayEnds={runwayEnds}
-                        center={center}
-                        angleDeg={
-                            runway.endA.headingDeg !== null
-                                ? displayAngle(runway.endA.headingDeg)
-                                : 0
-                        }
                         selectedEnd={selectedEnd}
                         bestRunwayIdent={bestRunwayIdent}
                         onSelectEnd={onSelectEnd}
                     />
                 ))}
 
-                <line
-                    x1={windFrom.x}
-                    y1={windFrom.y}
-                    x2={windTo.x}
-                    y2={windTo.y}
-                    stroke="#e6c76f"
-                    strokeWidth="3"
-                    markerEnd="url(#wind-arrow)"
-                />
+                {windFrom && windTo && (
+                    <line
+                        x1={windFrom.x}
+                        y1={windFrom.y}
+                        x2={windTo.x}
+                        y2={windTo.y}
+                        stroke="#e6c76f"
+                        strokeWidth="3"
+                        markerEnd="url(#wind-arrow)"
+                    />
+                )}
 
                 <circle cx={center} cy={center} r="4" fill="#e6c76f" />
 
@@ -1674,7 +1703,9 @@ function RunwayCompassSvg({
                         fontSize="15"
                         fontWeight="800"
                     >
-                        {windDirectionDeg} deg  {windSpeedKt} kt
+                        {windDirectionDeg !== null
+                            ? `${windDirectionDeg} deg  ${windSpeedKt} kt`
+                            : `${windSpeedKt} kt`}
                     </text>
                 </g>
             </svg>
@@ -1683,31 +1714,41 @@ function RunwayCompassSvg({
 }
 
 function CompassRunwayPair({
-    runway,
+    layout,
     runwayEnds,
-    center,
-    angleDeg,
     selectedEnd,
     bestRunwayIdent,
     onSelectEnd,
 }: {
-    runway: AirportRunway;
+    layout: RunwayLayout;
     runwayEnds: RunwayEnd[];
-    center: number;
-    angleDeg: number;
     selectedEnd: RunwayEnd | null;
     bestRunwayIdent: string | null;
     onSelectEnd: (runwayEnd: RunwayEnd) => void;
 }) {
-    const runwayLength = 170;
-    const runwayWidth = runway.widthFt !== null && runway.widthFt >= 100 ? 16 : 12;
+    const { runway, start, end } = layout;
+
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const runwayLength = Math.sqrt(dx * dx + dy * dy);
+    const runwayAngleDeg = (Math.atan2(dy, dx) * 180) / Math.PI + 90;
+
+    const midpointX = (start.x + end.x) / 2;
+    const midpointY = (start.y + end.y) / 2;
+
+    const runwayWidth =
+        runway.widthFt !== null && runway.widthFt >= 100 ? 18 : 14;
 
     const endA = runwayEnds.find(
-        (end) => end.runwayId === runway.id && end.ident === runway.endA.ident
+        (runwayEnd) =>
+            runwayEnd.runwayId === runway.id &&
+            runwayEnd.ident === runway.endA.ident
     );
 
     const endB = runwayEnds.find(
-        (end) => end.runwayId === runway.id && end.ident === runway.endB.ident
+        (runwayEnd) =>
+            runwayEnd.runwayId === runway.id &&
+            runwayEnd.ident === runway.endB.ident
     );
 
     const isSelected =
@@ -1715,114 +1756,162 @@ function CompassRunwayPair({
         selectedEnd?.ident === runway.endB.ident;
 
     const isBest =
-        bestRunwayIdent === runway.endA.ident || bestRunwayIdent === runway.endB.ident;
+        bestRunwayIdent === runway.endA.ident ||
+        bestRunwayIdent === runway.endB.ident;
 
     const runwayFill = isSelected
-        ? "#d6b35a"
+        ? "#737373"
         : isBest
-            ? "#22c55e"
-            : "#18181b";
+            ? "#5a5a5a"
+            : "#606060";
 
     const runwayStroke = isSelected
         ? "#f5d77e"
         : isBest
-            ? "#86efac"
+            ? "#d4d4d8"
             : "#a1a1aa";
+
+    const thresholdStripeCount = 4;
+    const thresholdStripeWidth = 1.8;
+    const thresholdStripeGap = 1.5;
+    const thresholdStripeHeight = 10;
+
+    // Controls how close the threshold stripes are to each runway end.
+    const thresholdInset = 2;
+
+    const totalThresholdWidth =
+        thresholdStripeCount * thresholdStripeWidth +
+        (thresholdStripeCount - 1) * thresholdStripeGap;
+
+    const thresholdStartX = -totalThresholdWidth / 2;
+
+    const runwayNumberInset = 18; // or whatever you are using now
+    const numberClearance = 12;
+
+    // Centerline starts after the first runway number area
+    // and ends before the opposite runway number area.
+    const centerlineStartY = -runwayLength / 2 + runwayNumberInset + numberClearance;
+    const centerlineEndY = runwayLength / 2 - runwayNumberInset - numberClearance;
 
     return (
         <g
-            transform={`translate(${center} ${center}) rotate(${angleDeg})`}
+            transform={`translate(${midpointX} ${midpointY}) rotate(${runwayAngleDeg})`}
             style={{ cursor: "pointer" }}
+            onClick={() => {
+                if (endA) {
+                    onSelectEnd(endA);
+                }
+            }}
         >
+            {/* Runway body */}
             <rect
                 x={-runwayWidth / 2}
                 y={-runwayLength / 2}
                 width={runwayWidth}
                 height={runwayLength}
-                rx="4"
+                rx="3"
                 fill={runwayFill}
                 stroke={runwayStroke}
                 strokeWidth="1.5"
-                opacity={isSelected || isBest ? 0.95 : 0.8}
+                opacity="0.96"
             />
 
+            {/* Center dashed line, shortened so it does not overlap runway numbers */}
             <line
                 x1="0"
-                y1={-runwayLength / 2 + 10}
+                y1={centerlineStartY}
                 x2="0"
-                y2={runwayLength / 2 - 10}
-                stroke="#ffffff"
-                strokeWidth="1"
+                y2={centerlineEndY}
+                stroke="#f8fafc"
+                strokeWidth="1.2"
                 strokeDasharray="8 6"
-                opacity="0.8"
+                opacity="0.9"
             />
 
+            {/* Threshold stripes - top end */}
+            {Array.from({ length: thresholdStripeCount }).map((_, index) => (
+                <rect
+                    key={`top-threshold-${index}`}
+                    x={thresholdStartX + index * (thresholdStripeWidth + thresholdStripeGap)}
+                    y={-runwayLength / 2 + thresholdInset}
+                    width={thresholdStripeWidth}
+                    height={thresholdStripeHeight}
+                    fill="#ffffff"
+                    opacity="0.95"
+                />
+            ))}
+
+            {/* Threshold stripes - bottom end */}
+            {Array.from({ length: thresholdStripeCount }).map((_, index) => (
+                <rect
+                    key={`bottom-threshold-${index}`}
+                    x={thresholdStartX + index * (thresholdStripeWidth + thresholdStripeGap)}
+                    y={runwayLength / 2 - thresholdInset - thresholdStripeHeight}
+                    width={thresholdStripeWidth}
+                    height={thresholdStripeHeight}
+                    fill="#ffffff"
+                    opacity="0.95"
+                />
+            ))}
+
+            {/* Runway identifiers painted on runway */}
             {endA && (
-                <g
+                <text
+                    x="0"
+                    y={-runwayLength / 2 + runwayNumberInset}
+                    transform={`rotate(180 0 ${-runwayLength / 2 + runwayNumberInset})`}                    textAnchor="middle"
+                    dominantBaseline="middle"
+                    fill="#ffffff"
+                    fontSize="9"
+                    fontWeight="800"
+                    style={{ pointerEvents: "none" }}
+                >
+                    {endA.ident}
+                </text>
+            )}
+
+            {endB && (
+                <text
+                    x="0"
+                    y={runwayLength / 2 - runwayNumberInset}
+                    textAnchor="middle"
+                    dominantBaseline="middle"
+                    fill="#ffffff"
+                    fontSize="9"
+                    fontWeight="800"
+                    style={{ pointerEvents: "none" }}
+                >
+                    {endB.ident}
+                </text>
+            )}
+
+            {/* Invisible click targets near runway ends */}
+            {endA && (
+                <circle
+                    cx="0"
+                    cy={-runwayLength / 2 + 20}
+                    r="16"
+                    fill="transparent"
                     onClick={(event) => {
                         event.stopPropagation();
                         onSelectEnd(endA);
                     }}
-                >
-                    <rect
-                        x={-20}
-                        y={-runwayLength / 2 - 16}
-                        width="40"
-                        height="18"
-                        rx="5"
-                        fill="#050505"
-                        stroke={
-                            selectedEnd?.ident === endA.ident
-                                ? "#f5d77e"
-                                : "#71717a"
-                        }
-                    />
-                    <text
-                        x="0"
-                        y={-runwayLength / 2 - 7}
-                        textAnchor="middle"
-                        dominantBaseline="middle"
-                        fill="#ffffff"
-                        fontSize="10"
-                        fontWeight="800"
-                    >
-                        {endA.ident}
-                    </text>
-                </g>
+                />
             )}
 
             {endB && (
-                <g
+                <circle
+                    cx="0"
+                    cy={runwayLength / 2 - 20}
+                    r="16"
+                    fill="transparent"
                     onClick={(event) => {
                         event.stopPropagation();
-                        onSelectEnd(endB);
-                    }}
-                >
-                    <rect
-                        x={-20}
-                        y={runwayLength / 2 - 2}
-                        width="40"
-                        height="18"
-                        rx="5"
-                        fill="#050505"
-                        stroke={
-                            selectedEnd?.ident === endB.ident
-                                ? "#f5d77e"
-                                : "#71717a"
+                        if (endB) {
+                            onSelectEnd(endB);
                         }
-                    />
-                    <text
-                        x="0"
-                        y={runwayLength / 2 + 7}
-                        textAnchor="middle"
-                        dominantBaseline="middle"
-                        fill="#ffffff"
-                        fontSize="10"
-                        fontWeight="800"
-                    >
-                        {endB.ident}
-                    </text>
-                </g>
+                    }}
+                />
             )}
         </g>
     );
@@ -2308,4 +2397,116 @@ function polarPoint(
         x: centerX + radius * Math.sin(angleRad),
         y: centerY - radius * Math.cos(angleRad),
     };
+}
+
+function buildRunwayLayout(
+    runways: AirportRunway[],
+    rotationDeg: number,
+    center: number
+): RunwayLayout[] {
+    const endpoints = runways.flatMap((runway) => [
+        {
+            runway,
+            end: "A" as const,
+            latitude: runway.endA.latitude,
+            longitude: runway.endA.longitude,
+        },
+        {
+            runway,
+            end: "B" as const,
+            latitude: runway.endB.latitude,
+            longitude: runway.endB.longitude,
+        },
+    ]);
+
+    const validEndpoints = endpoints.filter(
+        (point) => point.latitude !== null && point.longitude !== null
+    );
+
+    if (validEndpoints.length === 0) {
+        return [];
+    }
+
+    const averageLatitude =
+        validEndpoints.reduce((sum, point) => sum + (point.latitude ?? 0), 0) /
+        validEndpoints.length;
+
+    const averageLongitude =
+        validEndpoints.reduce((sum, point) => sum + (point.longitude ?? 0), 0) /
+        validEndpoints.length;
+
+    const cosLatitude = Math.cos((averageLatitude * Math.PI) / 180);
+
+    const localPoints = validEndpoints.map((point) => {
+        const xEast = ((point.longitude ?? 0) - averageLongitude) * cosLatitude;
+        const yNorth = (point.latitude ?? 0) - averageLatitude;
+        const rotated = rotateLocalPoint(xEast, yNorth, rotationDeg);
+
+        return {
+            runway: point.runway,
+            end: point.end,
+            x: rotated.x,
+            y: rotated.y,
+        };
+    });
+
+    const maxExtent =
+        Math.max(
+            ...localPoints.map((point) => Math.abs(point.x)),
+            ...localPoints.map((point) => Math.abs(point.y)),
+            0.0001
+        ) * 1.25;
+
+    const scale = 150 / maxExtent;
+
+    function toSvgPoint(point: { x: number; y: number }): SvgPoint {
+        return {
+            x: center + point.x * scale,
+            y: center - point.y * scale,
+        };
+    }
+
+    return runways
+        .map((runway) => {
+            const startPoint = localPoints.find(
+                (point) => point.runway.id === runway.id && point.end === "A"
+            );
+
+            const endPoint = localPoints.find(
+                (point) => point.runway.id === runway.id && point.end === "B"
+            );
+
+            if (!startPoint || !endPoint) {
+                return null;
+            }
+
+            return {
+                runway,
+                start: toSvgPoint(startPoint),
+                end: toSvgPoint(endPoint),
+            };
+        })
+        .filter((layout): layout is RunwayLayout => layout !== null);
+}
+
+function rotateLocalPoint(
+    xEast: number,
+    yNorth: number,
+    rotationDeg: number
+): { x: number; y: number } {
+    const rotationRad = (rotationDeg * Math.PI) / 180;
+
+    return {
+        x: xEast * Math.cos(rotationRad) - yNorth * Math.sin(rotationRad),
+        y: xEast * Math.sin(rotationRad) + yNorth * Math.cos(rotationRad),
+    };
+}
+
+function getTangentTextRotation(angleDeg: number): number {
+    const normalized = normalizeAngle360(angleDeg);
+
+    // Keep left-side labels from appearing upside down
+    return normalized > 90 && normalized < 270
+        ? normalized + 180
+        : normalized;
 }
