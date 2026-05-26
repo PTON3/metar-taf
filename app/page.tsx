@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
 
 type ApiResponse = {
@@ -603,100 +603,10 @@ function AirportInfoDashboardTab({
                 </div>
             </div>
 
-            <div className="rounded-2xl border border-zinc-800 bg-black/55 p-5">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-                    <div>
-                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                            FAA Airport Diagram
-                        </p>
-
-                        <h3 className="mt-2 text-2xl font-bold text-white">
-                            {airportDiagram?.chartName ?? "Airport Diagram"}
-                        </h3>
-                    </div>
-
-                    {airportDiagram?.cycle && (
-                        <p className="rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">
-                            Cycle {airportDiagram.cycle}
-                        </p>
-                    )}
-                </div>
-
-                {airportDiagram?.diagramPdfUrl ? (
-                    <>
-                        <div className="mt-4 h-[640px] overflow-hidden rounded-2xl border border-zinc-700 bg-white">
-                            <iframe
-                                src={airportDiagram.diagramPdfUrl}
-                                title={`${stationInfo.displayName} FAA Airport Diagram`}
-                                className="h-full w-full"
-                            />
-                        </div>
-
-                        <div className="mt-4 flex flex-col gap-3 sm:flex-row">
-                            <a
-                                href={airportDiagram.diagramPdfUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
-                            >
-                                Open Diagram PDF
-                            </a>
-
-                            <a
-                                href={airportDiagram.faaSearchResultsUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex rounded-xl border border-zinc-700 bg-black px-5 py-3 text-sm font-bold text-zinc-200 transition hover:bg-zinc-900"
-                            >
-                                FAA Search Result
-                            </a>
-                        </div>
-                    </>
-                ) : (
-                    <div className="mt-4 flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-zinc-700 bg-zinc-950 p-6 text-center">
-                        <div>
-                            <p className="text-lg font-bold text-white">
-                                Diagram Preview Unavailable
-                            </p>
-
-                            <p className="mt-2 max-w-md text-sm leading-6 text-zinc-400">
-                                A direct FAA airport diagram PDF was not found for this
-                                airport. Use the official FAA links below as backup.
-                            </p>
-
-                            <div className="mt-5 flex flex-col items-center justify-center gap-3 sm:flex-row">
-                                {airportDiagram?.faaAirportDiagramPageUrl && (
-                                    <a
-                                        href={airportDiagram.faaAirportDiagramPageUrl}
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        className="inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
-                                    >
-                                        FAA Diagram Page
-                                    </a>
-                                )}
-
-                                {airportDiagram?.faaSearchUrl && (
-                                    <a
-                                        href={airportDiagram.faaSearchUrl}
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        className="inline-flex rounded-xl border border-zinc-700 bg-black px-5 py-3 text-sm font-bold text-zinc-200 transition hover:bg-zinc-900"
-                                    >
-                                        FAA d-TPP Search
-                                    </a>
-                                )}
-                            </div>
-                        </div>
-                    </div>
-                )}
-
-                {airportDiagram?.note && (
-                    <p className="mt-4 text-xs leading-5 text-zinc-500">
-                        {airportDiagram.note}
-                    </p>
-                )}
-            </div>
+            <AirportDiagramPreviewCard
+                stationInfo={stationInfo}
+                airportDiagram={airportDiagram}
+            />
         </div>
     );
 }
@@ -714,6 +624,216 @@ function AirportInfoRow({
                 {label}
             </p>
             <p className="mt-1 text-zinc-200">{value}</p>
+        </div>
+    );
+}
+
+function AirportDiagramPreviewCard({
+    stationInfo,
+    airportDiagram,
+}: {
+    stationInfo: StationInfo;
+    airportDiagram: AirportDiagramInfo | null;
+}) {
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const [loadingPreview, setLoadingPreview] = useState(false);
+    const [previewError, setPreviewError] = useState("");
+
+    useEffect(() => {
+        let cancelled = false;
+
+        async function renderPreview() {
+            if (!airportDiagram?.diagramPdfUrl || !canvasRef.current) {
+                return;
+            }
+
+            setLoadingPreview(true);
+            setPreviewError("");
+
+            try {
+                const pdfjs = await import("pdfjs-dist");
+
+                pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+
+                const proxyUrl = `/api/airport/diagram/file?url=${encodeURIComponent(
+                    airportDiagram.diagramPdfUrl
+                )}`;
+
+                const loadingTask = pdfjs.getDocument(proxyUrl);
+                const pdf = await loadingTask.promise;
+                const page = await pdf.getPage(1);
+
+                const canvas = canvasRef.current;
+                const context = canvas.getContext("2d");
+
+                if (!context) {
+                    throw new Error("Canvas context unavailable.");
+                }
+
+                const containerWidth =
+                    canvas.parentElement?.clientWidth ?? 700;
+
+                const initialViewport = page.getViewport({ scale: 1 });
+                const scale = containerWidth / initialViewport.width;
+                const viewport = page.getViewport({ scale });
+
+                const outputScale = window.devicePixelRatio || 1;
+
+                canvas.width = Math.floor(viewport.width * outputScale);
+                canvas.height = Math.floor(viewport.height * outputScale);
+                canvas.style.width = `${viewport.width}px`;
+                canvas.style.height = `${viewport.height}px`;
+
+                context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+                context.clearRect(0, 0, canvas.width, canvas.height);
+
+                await page.render({
+                    canvasContext: context,
+                    viewport,
+                }).promise;
+
+                if (!cancelled) {
+                    setLoadingPreview(false);
+                }
+            } catch (error) {
+                if (!cancelled) {
+                    setLoadingPreview(false);
+                    setPreviewError(
+                        error instanceof Error
+                            ? error.message
+                            : "Unable to render diagram preview."
+                    );
+                }
+            }
+        }
+
+        renderPreview();
+
+        const onResize = () => {
+            void renderPreview();
+        };
+
+        window.addEventListener("resize", onResize);
+
+        return () => {
+            cancelled = true;
+            window.removeEventListener("resize", onResize);
+        };
+    }, [airportDiagram?.diagramPdfUrl]);
+
+    return (
+        <div className="rounded-2xl border border-zinc-800 bg-black/55 p-5">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                        FAA Airport Diagram
+                    </p>
+
+                    <h3 className="mt-2 text-2xl font-bold text-white">
+                        {airportDiagram?.chartName ?? "Airport Diagram"}
+                    </h3>
+                </div>
+
+                {airportDiagram?.cycle && (
+                    <p className="rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">
+                        Cycle {airportDiagram.cycle}
+                    </p>
+                )}
+            </div>
+
+            {airportDiagram?.diagramPdfUrl ? (
+                <>
+                    <a
+                        href={airportDiagram.diagramPdfUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-4 block overflow-hidden rounded-2xl border border-zinc-700 bg-zinc-950 transition hover:border-[#d6b35a]/50"
+                    >
+                        <div className="relative">
+                            {loadingPreview && (
+                                <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/50 text-sm text-zinc-200">
+                                    Loading diagram preview...
+                                </div>
+                            )}
+
+                            <canvas
+                                ref={canvasRef}
+                                className="block w-full h-auto bg-white"
+                            />
+                        </div>
+                    </a>
+
+                    <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+                        <a
+                            href={airportDiagram.diagramPdfUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
+                        >
+                            Open Diagram PDF
+                        </a>
+
+                        <a
+                            href={airportDiagram.faaSearchResultsUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex rounded-xl border border-zinc-700 bg-black px-5 py-3 text-sm font-bold text-zinc-200 transition hover:bg-zinc-900"
+                        >
+                            FAA Search Result
+                        </a>
+                    </div>
+
+                    {previewError && (
+                        <p className="mt-4 text-xs leading-5 text-amber-300">
+                            Preview issue: {previewError}
+                        </p>
+                    )}
+                </>
+            ) : (
+                <div className="mt-4 flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-zinc-700 bg-zinc-950 p-6 text-center">
+                    <div>
+                        <p className="text-lg font-bold text-white">
+                            Diagram Preview Unavailable
+                        </p>
+
+                        <p className="mt-2 max-w-md text-sm leading-6 text-zinc-400">
+                            A direct FAA airport diagram PDF was not found for
+                            this airport. Use the official FAA links below as
+                            backup.
+                        </p>
+
+                        <div className="mt-5 flex flex-col items-center justify-center gap-3 sm:flex-row">
+                            {airportDiagram?.faaAirportDiagramPageUrl && (
+                                <a
+                                    href={airportDiagram.faaAirportDiagramPageUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="inline-flex rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 text-sm font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
+                                >
+                                    FAA Diagram Page
+                                </a>
+                            )}
+
+                            {airportDiagram?.faaSearchUrl && (
+                                <a
+                                    href={airportDiagram.faaSearchUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="inline-flex rounded-xl border border-zinc-700 bg-black px-5 py-3 text-sm font-bold text-zinc-200 transition hover:bg-zinc-900"
+                                >
+                                    FAA d-TPP Search
+                                </a>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {airportDiagram?.note && (
+                <p className="mt-4 text-xs leading-5 text-zinc-500">
+                    {airportDiagram.note}
+                </p>
+            )}
         </div>
     );
 }
