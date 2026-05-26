@@ -47,6 +47,29 @@ type StationInfoResponse = {
     error?: string;
 };
 
+type AirportRunway = {
+    id: string;
+    airportIdent: string;
+    name: string;
+    lengthFt: number | null;
+    widthFt: number | null;
+    surface: string | null;
+    status: string | null;
+    endA: {
+        ident: string | null;
+        headingDeg: number | null;
+    };
+    endB: {
+        ident: string | null;
+        headingDeg: number | null;
+    };
+};
+
+type AirportRunwaysResponse = {
+    data?: AirportRunway[];
+    error?: string;
+};
+
 type RemarkBubble = {
     code: string;
     meaning: string;
@@ -72,6 +95,7 @@ export default function Home() {
     const [rawMetar, setRawMetar] = useState<string | null>(null);
     const [stationInfo, setStationInfo] = useState<StationInfo | null>(null);
     const [airportDiagram, setAirportDiagram] = useState<AirportDiagramInfo | null>(null);
+    const [runways, setRunways] = useState<AirportRunway[]>([]);
     const [error, setError] = useState("");
     const [loading, setLoading] = useState(false);
 
@@ -100,6 +124,7 @@ export default function Home() {
 
             await fetchStationInfo(normalized?.station ?? cleanStation);
             await fetchAirportDiagram(normalized?.station ?? cleanStation);
+            await fetchAirportRunways(normalized?.station ?? cleanStation);
 
         } catch (err) {
             setError(err instanceof Error ? err.message : "Unexpected error.");
@@ -136,6 +161,7 @@ export default function Home() {
 
             await fetchStationInfo(normalized?.station);
             await fetchAirportDiagram(normalized?.station);
+            await fetchAirportRunways(normalized?.station);
 
         } catch (err) {
             setError(err instanceof Error ? err.message : "Unexpected error.");
@@ -189,6 +215,30 @@ export default function Home() {
             setAirportDiagram(data);
         } catch {
             setAirportDiagram(null);
+        }
+    }
+
+    async function fetchAirportRunways(stationToLookup: string | null | undefined) {
+        if (!stationToLookup) {
+            setRunways([]);
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                `/api/airport/runways?station=${encodeURIComponent(stationToLookup)}`
+            );
+
+            const data: AirportRunwaysResponse = await response.json();
+
+            if (!response.ok || data.error || !data.data) {
+                setRunways([]);
+                return;
+            }
+
+            setRunways(data.data);
+        } catch {
+            setRunways([]);
         }
     }
 
@@ -319,6 +369,7 @@ export default function Home() {
                         rawMetar={rawMetar ?? metar.raw}
                         stationInfo={stationInfo}
                         airportDiagram={airportDiagram}
+                        runways={runways}
                     />
                     ) : (
                     <EmptyState />
@@ -341,11 +392,14 @@ function MetarDashboard({
     rawMetar,
     stationInfo,
     airportDiagram,
+    runways,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
     stationInfo: StationInfo | null;
     airportDiagram: AirportDiagramInfo | null;
+    runways: AirportRunway[];
+
 }) {
     const [now, setNow] = useState(() => new Date());
     const [activeDashboardTab, setActiveDashboardTab] =
@@ -449,6 +503,7 @@ function MetarDashboard({
                     <AirportInfoDashboardTab
                         stationInfo={stationInfo}
                         airportDiagram={airportDiagram}
+                        runways={runways}
                     />
                 )}
             </div>
@@ -544,9 +599,11 @@ function TafDashboardTab() {
 function AirportInfoDashboardTab({
     stationInfo,
     airportDiagram,
+    runways,
 }: {
     stationInfo: StationInfo | null;
     airportDiagram: AirportDiagramInfo | null;
+    runways: AirportRunway[];
 }) {
     if (!stationInfo) {
         return (
@@ -610,6 +667,56 @@ function AirportInfoDashboardTab({
                         }
                     />
                 </div>
+
+                <div className="mt-5 border-t border-zinc-800 pt-5">
+                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                        Runways
+                    </p>
+
+                    {runways.length > 0 ? (
+                        <div className="mt-3 space-y-3">
+                            {runways.map((runway) => (
+                                <div
+                                    key={runway.id}
+                                    className="rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-3"
+                                >
+                                    <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                                        <p className="font-bold text-white">{runway.name}</p>
+                                        <p className="text-xs text-zinc-500">
+                                            {runway.lengthFt !== null
+                                                ? `${runway.lengthFt.toLocaleString()} ft`
+                                                : "Length unavailable"}
+                                            {runway.widthFt !== null
+                                                ? ` x ${runway.widthFt.toLocaleString()} ft`
+                                                : ""}
+                                        </p>
+                                    </div>
+
+                                    <p className="mt-2 text-xs leading-5 text-zinc-400">
+                                        {runway.surface ?? "Surface unavailable"}
+                                        {runway.status ? ` | ${runway.status}` : ""}
+                                    </p>
+
+                                    <p className="mt-1 text-xs leading-5 text-zinc-500">
+                                        {runway.endA.ident ?? "End A"}{" "}
+                                        {runway.endA.headingDeg !== null
+                                            ? `${runway.endA.headingDeg} deg`
+                                            : "heading unavailable"}{" "}
+                                        / {runway.endB.ident ?? "End B"}{" "}
+                                        {runway.endB.headingDeg !== null
+                                            ? `${runway.endB.headingDeg} deg`
+                                            : "heading unavailable"}
+                                    </p>
+                                </div>
+                            ))}
+                        </div>
+                    ) : (
+                        <p className="mt-3 text-sm text-zinc-500">
+                            Runway data unavailable.
+                        </p>
+                    )}
+                </div>
+
             </div>
 
             <AirportDiagramPreviewCard
