@@ -1793,6 +1793,21 @@ function CompassRunwayPair({
     const centerlineStartY = -runwayLength / 2 + runwayNumberInset + numberClearance;
     const centerlineEndY = runwayLength / 2 - runwayNumberInset - numberClearance;
 
+    const hasLetterSuffixA = endA?.ident ? /[LRC]$/.test(endA.ident) : false;
+    const hasLetterSuffixB = endB?.ident ? /[LRC]$/.test(endB.ident) : false;
+
+    const runwayNumberFontSizeA = hasLetterSuffixA ? 7 : 8;
+    const runwayNumberFontSizeB = hasLetterSuffixB ? 7 : 8;
+
+    // Do not stretch L/R/C runway identifiers as much.
+    const paintedTextWidthA = hasLetterSuffixA
+        ? Math.max(runwayWidth - 5, 7)
+        : Math.max(runwayWidth - 3, 8);
+
+    const paintedTextWidthB = hasLetterSuffixB
+        ? Math.max(runwayWidth - 5, 7)
+        : Math.max(runwayWidth - 3, 8);
+
     return (
         <g
             transform={`translate(${midpointX} ${midpointY}) rotate(${runwayAngleDeg})`}
@@ -1812,7 +1827,7 @@ function CompassRunwayPair({
                 rx="3"
                 fill={runwayFill}
                 stroke={runwayStroke}
-                strokeWidth="1.5"
+                strokeWidth="0.9"
                 opacity="0.96"
             />
 
@@ -1862,8 +1877,9 @@ function CompassRunwayPair({
                     transform={`rotate(180 0 ${-runwayLength / 2 + runwayNumberInset})`}                    textAnchor="middle"
                     dominantBaseline="middle"
                     fill="#ffffff"
-                    fontSize="9"
+                    fontSize={runwayNumberFontSizeA}
                     fontWeight="800"
+                    textLength={paintedTextWidthA}
                     style={{ pointerEvents: "none" }}
                 >
                     {endA.ident}
@@ -1877,8 +1893,9 @@ function CompassRunwayPair({
                     textAnchor="middle"
                     dominantBaseline="middle"
                     fill="#ffffff"
-                    fontSize="9"
+                    fontSize={runwayNumberFontSizeB}
                     fontWeight="800"
+                    textLength={paintedTextWidthB}
                     style={{ pointerEvents: "none" }}
                 >
                     {endB.ident}
@@ -1890,7 +1907,7 @@ function CompassRunwayPair({
                 <circle
                     cx="0"
                     cy={-runwayLength / 2 + 20}
-                    r="16"
+                    r="5"
                     fill="transparent"
                     onClick={(event) => {
                         event.stopPropagation();
@@ -1903,7 +1920,7 @@ function CompassRunwayPair({
                 <circle
                     cx="0"
                     cy={runwayLength / 2 - 20}
-                    r="16"
+                    r="5"
                     fill="transparent"
                     onClick={(event) => {
                         event.stopPropagation();
