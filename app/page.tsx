@@ -1397,21 +1397,11 @@ function RunwayCompassSvg({
         return normalizeAngle360(angleDeg - compassRotation);
     }
 
-    const hasWindArrow = windDirectionDeg !== null && windSpeedKt > 0;
+    const hasWindAnimation = windDirectionDeg !== null && windSpeedKt > 0;
 
-    const windDisplayAngle = hasWindArrow
+    const windDisplayAngle = hasWindAnimation
         ? displayAngle(windDirectionDeg)
         : null;
-
-    const windFrom =
-        windDisplayAngle !== null
-            ? polarPoint(center, center, radius - 10, windDisplayAngle)
-            : null;
-
-    const windTo =
-        windDisplayAngle !== null
-            ? polarPoint(center, center, 40, windDisplayAngle)
-            : null;
 
     const windLabel =
         windDirectionDeg !== null
@@ -1426,17 +1416,9 @@ function RunwayCompassSvg({
             aria-label="Runway and wind compass"
         >
             <defs>
-                <marker
-                    id="wind-arrow"
-                    markerWidth="8"
-                    markerHeight="8"
-                    refX="7"
-                    refY="4"
-                    orient="auto"
-                    markerUnits="strokeWidth"
-                >
-                    <path d="M 0 0 L 8 4 L 0 8 z" fill="#e6c76f" />
-                </marker>
+                <clipPath id="wind-field-clip">
+                    <circle cx={center} cy={center} r={radius - 6} />
+                </clipPath>
             </defs>
 
             <circle
@@ -1445,7 +1427,7 @@ function RunwayCompassSvg({
                 r={radius}
                 fill="#050505"
                 stroke="#3f3f46"
-                strokeWidth=""
+                strokeWidth="1"
             />
 
             {Array.from({ length: 72 }).map((_, index) => {
@@ -1548,19 +1530,12 @@ function RunwayCompassSvg({
                 />
             ))}
 
-            {windFrom && windTo && (
-                <line
-                    x1={windFrom.x}
-                    y1={windFrom.y}
-                    x2={windTo.x}
-                    y2={windTo.y}
-                    stroke="#e6c76f"
-                    strokeWidth="3"
-                    strokeDasharray="6 5"
-                    opacity="0.85"
-                    markerEnd="url(#wind-arrow)"
-                />
-            )}
+            <WindFieldAnimation
+                center={center}
+                radius={radius}
+                windDisplayAngle={windDisplayAngle}
+                windSpeedKt={windSpeedKt}
+            />
 
             <circle cx={center} cy={center} r="4" fill="#e6c76f" />
 
@@ -1635,6 +1610,171 @@ function RunwayCompassSvg({
                 />
             )}
         </svg>
+    );
+}
+
+function getWindSnakeFlowPath({
+    laneX,
+    spawnY,
+    exitY,
+    amplitude,
+    phase,
+    waveCount,
+}: {
+    laneX: number;
+    spawnY: number;
+    exitY: number;
+    amplitude: number;
+    phase: number;
+    waveCount: number;
+}): string {
+    const steps = 100;
+    const points = Array.from({ length: steps + 1 }, (_, index) => {
+        const t = index / steps;
+        const y = spawnY + (exitY - spawnY) * t;
+
+        const edgeFade = Math.sin(Math.PI * t);
+        const x =
+            laneX +
+            Math.sin(phase + t * waveCount * Math.PI * 2) *
+            amplitude *
+            edgeFade;
+
+        return `${x.toFixed(1)} ${y.toFixed(1)}`;
+    });
+
+    return `M ${points[0]} ` + points.slice(1).map((point) => `L ${point}`).join(" ");
+}
+
+function WindFieldAnimation({
+    center,
+    radius,
+    windDisplayAngle,
+    windSpeedKt,
+}: {
+    center: number;
+    radius: number;
+    windDisplayAngle: number | null;
+    windSpeedKt: number;
+}) {
+    if (windDisplayAngle === null || windSpeedKt <= 0) {
+        return null;
+    }
+
+    const windIntensity = Math.min(windSpeedKt / 30, 1);
+
+    const flowDuration = Math.max(1.1, 7.2 - windSpeedKt * 0.17);
+    const slitherDuration = Math.max(1.1, 3.4 - windIntensity * 1.3);
+
+    const streamAmplitude = 3.0 + windIntensity * 6.0;
+    const waveCount = 5.0 + windIntensity * 4.0;
+
+    const strokeWidth =
+        windSpeedKt >= 20 ? 2 : windSpeedKt >= 10 ? 1.65 : 1.35;
+
+    const spawnY = -radius - 115;
+    const exitY = radius + 115;
+
+    const pathMeasure = 1000;
+
+    function randomUnit(seed: number): number {
+        const x = Math.sin(seed * 9999) * 10000;
+        return x - Math.floor(x);
+    }
+
+    function randomRange(seed: number, min: number, max: number): number {
+        return min + randomUnit(seed) * (max - min);
+    }
+
+    const streamCount = Math.round(15 + windIntensity * 15);
+    const laneSpread = radius * 1.06;
+
+    const windStreams = Array.from({ length: streamCount }, (_, index) => {
+        const seed = index * 41.91 + windSpeedKt * 0.77;
+
+        const baseLaneX =
+            streamCount === 1
+                ? 0
+                : -laneSpread + (index / (streamCount - 1)) * laneSpread * 2;
+
+        return {
+            laneX: baseLaneX + randomRange(seed + 1, -8, 8),
+            phase: randomRange(seed + 2, 0, Math.PI * 2),
+            delay: Number((-randomRange(seed + 3, 0, flowDuration)).toFixed(2)),
+            opacity: Number(randomRange(seed + 4, 0.7, 0.3).toFixed(2)),
+            visibleLength: Math.round(randomRange(seed + 5, 50, 200)),
+            amplitudeScale: randomRange(seed + 6, 0.75, 1.25),
+        };
+    });
+
+    return (
+        <g clipPath="url(#wind-field-clip)" pointerEvents="none">
+            <g transform={`translate(${center} ${center}) rotate(${windDisplayAngle})`}>
+                {windStreams.map((stream, index) => {
+                    const amplitude = streamAmplitude * stream.amplitudeScale;
+
+                    const pathA = getWindSnakeFlowPath({
+                        laneX: stream.laneX,
+                        spawnY,
+                        exitY,
+                        amplitude,
+                        phase: stream.phase,
+                        waveCount,
+                    });
+
+                    const pathB = getWindSnakeFlowPath({
+                        laneX: stream.laneX,
+                        spawnY,
+                        exitY,
+                        amplitude: amplitude * 1.15,
+                        phase: stream.phase + Math.PI * 0.65,
+                        waveCount,
+                    });
+
+                    const pathC = getWindSnakeFlowPath({
+                        laneX: stream.laneX,
+                        spawnY,
+                        exitY,
+                        amplitude: amplitude * 0.85,
+                        phase: stream.phase + Math.PI * 1.25,
+                        waveCount,
+                    });
+
+                    return (
+                        <path
+                            key={index}
+                            d={pathA}
+                            fill="none"
+                            stroke="#e6c76f"
+                            strokeWidth={strokeWidth}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            opacity={stream.opacity}
+                            pathLength={pathMeasure}
+                            strokeDasharray={`${stream.visibleLength} ${pathMeasure}`}
+                            strokeDashoffset={pathMeasure}
+                        >
+                            <animate
+                                attributeName="stroke-dashoffset"
+                                from={pathMeasure}
+                                to={-stream.visibleLength}
+                                dur={`${flowDuration}s`}
+                                begin={`${stream.delay}s`}
+                                repeatCount="indefinite"
+                            />
+
+                            <animate
+                                attributeName="d"
+                                values={`${pathA}; ${pathB}; ${pathC}; ${pathA}`}
+                                dur={`${slitherDuration}s`}
+                                begin={`${stream.delay}s`}
+                                repeatCount="indefinite"
+                            />
+                        </path>
+                    );
+                })}
+            </g>
+        </g>
     );
 }
 
