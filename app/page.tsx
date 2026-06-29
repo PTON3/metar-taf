@@ -2166,11 +2166,31 @@ function WindComponentStack({
 
 function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
     const ceiling = metar.ceiling.feetAgl;
-    const cloudLayers = metar.clouds.slice(0, 3);
+
+    const cloudLayers = metar.clouds
+        .filter((cloud) => cloud.baseFeetAgl !== null)
+        .slice(0, 5);
+
+    const highestCloudBase = Math.max(
+        0,
+        ...cloudLayers.map((cloud) => cloud.baseFeetAgl ?? 0),
+        ceiling ?? 0
+    );
+
+    const scaleTopFeet = Math.max(
+        6000,
+        Math.ceil((highestCloudBase + 1200) / 3000) * 3000
+    );
+
+    const altitudeTicks = buildAltitudeTicks(scaleTopFeet);
+
+    const graphLeft = 42;
+    const graphRight = 320;
+    const textX = 390;
 
     function altitudeToY(feet: number): number {
-        const cappedFeet = Math.min(Math.max(feet, 0), 12000);
-        return 330 - (cappedFeet / 12000) * 240;
+        const cappedFeet = Math.min(Math.max(feet, 0), scaleTopFeet);
+        return 330 - (cappedFeet / scaleTopFeet) * 240;
     }
 
     return (
@@ -2182,20 +2202,21 @@ function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
         >
             <rect x="0" y="0" width="400" height="400" fill="#050505" />
 
-            {[0, 3000, 6000, 9000, 12000].map((altitude) => {
+            {altitudeTicks.map((altitude) => {
                 const y = altitudeToY(altitude);
 
                 return (
                     <g key={altitude}>
                         <line
-                            x1="42"
+                            x1={graphLeft}
                             y1={y}
-                            x2="370"
+                            x2={graphRight}
                             y2={y}
                             stroke="#27272a"
                             strokeWidth="1"
                             strokeDasharray="4 6"
                         />
+
                         <text
                             x="30"
                             y={y}
@@ -2205,83 +2226,89 @@ function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
                             fontSize="10"
                             fontWeight="600"
                         >
-                            {altitude === 0 ? "SFC" : `${altitude / 1000}k`}
+                            {altitude === 0 ? "SFC" : formatAltitudeTick(altitude)}
                         </text>
                     </g>
                 );
             })}
 
-            <rect x="42" y="330" width="328" height="10" rx="5" fill="#3f3f46" />
+            <rect
+                x={graphLeft}
+                y="330"
+                width={graphRight - graphLeft}
+                height="10"
+                rx="5"
+                fill="#3f3f46"
+            />
 
             {cloudLayers.length > 0 ? (
                 cloudLayers.map((cloud, index) => {
-                    const y =
-                        cloud.baseFeetAgl !== null
-                            ? altitudeToY(cloud.baseFeetAgl)
-                            : 150 + index * 42;
+                    const baseFeet = cloud.baseFeetAgl ?? 0;
+                    const y = altitudeToY(baseFeet);
+                    const cloudEighths = getCloudEighths(cloud.cover);
+                    const isCeilingLayer =
+                        ceiling !== null &&
+                        baseFeet === ceiling &&
+                        isCeilingCloudCover(cloud.cover);
 
                     return (
-                        <g key={`${cloud.cover}-${index}`}>
-                            <CloudIcon x={120 + index * 58} y={y} />
+                        <g key={`${cloud.cover}-${baseFeet}-${index}`}>
+                            <line
+                                x1={graphLeft}
+                                y1={y}
+                                x2={graphRight}
+                                y2={y}
+                                stroke={isCeilingLayer ? "#e6c76f" : "#ffffff"}
+                                strokeWidth={isCeilingLayer ? "3" : "1.5"}
+                                opacity={isCeilingLayer ? "1" : "0.7"}
+                                strokeLinecap="round"
+                            />
+
+                            <CloudCoverageIcons
+                                lineStartX={graphLeft}
+                                lineEndX={graphRight}
+                                y={y - 27}
+                                eighths={cloudEighths}
+                                layerIndex={index}
+                            />
+
                             <text
-                                x={200}
-                                y={y + 34}
-                                textAnchor="middle"
-                                fill="#d4d4d8"
-                                fontSize="12"
-                                fontWeight="700"
+                                x={textX}
+                                y={y}
+                                textAnchor="end"
+                                dominantBaseline="middle"
+                                fill={isCeilingLayer ? "#e6c76f" : "#ffffff"}
+                                opacity={isCeilingLayer ? "1" : "0.9"}
+                                fontSize="9.5"
+                                fontWeight="550"
                             >
-                                {cloud.cover}{" "}
-                                {cloud.baseFeetAgl !== null
-                                    ? `${cloud.baseFeetAgl.toLocaleString()} ft`
-                                    : ""}
+                                {cloud.cover} {baseFeet.toLocaleString()} ft
                             </text>
                         </g>
                     );
                 })
             ) : (
-                <text
-                    x="200"
-                    y="190"
-                    textAnchor="middle"
-                    dominantBaseline="middle"
-                    fill="#d4d4d8"
-                    fontSize="18"
-                    fontWeight="800"
-                >
-                    CLR
-                </text>
-            )}
-
-            {ceiling !== null && (
                 <g>
-                    <line
-                        x1="60"
-                        y1={altitudeToY(ceiling)}
-                        x2="350"
-                        y2={altitudeToY(ceiling)}
-                        stroke="#e6c76f"
-                        strokeWidth="3"
+                    <image
+                        href="/icons/cloud.png"
+                        x="172"
+                        y="138"
+                        width="56"
+                        height="56"
+                        preserveAspectRatio="xMidYMid meet"
+                        opacity="0.35"
                     />
-                    <rect
-                        x="110"
-                        y={altitudeToY(ceiling) - 34}
-                        width="180"
-                        height="26"
-                        rx="13"
-                        fill="#050505"
-                        stroke="#d6b35a"
-                    />
+
                     <text
                         x="200"
-                        y={altitudeToY(ceiling) - 20}
+                        y="210"
                         textAnchor="middle"
                         dominantBaseline="middle"
-                        fill="#ffffff"
-                        fontSize="12"
+                        fill="#d4d4d8"
+                        fontSize="18"
                         fontWeight="800"
                     >
-                        Ceiling {ceiling.toLocaleString()} ft
+                        CLR
                     </text>
                 </g>
             )}
@@ -2289,15 +2316,210 @@ function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
     );
 }
 
-function CloudIcon({ x, y }: { x: number; y: number }) {
+function CloudCoverageIcons({
+    lineStartX,
+    lineEndX,
+    y,
+    eighths,
+    layerIndex,
+}: {
+    lineStartX: number;
+    lineEndX: number;
+    y: number;
+    eighths: number;
+    layerIndex: number;
+}) {
+    if (eighths <= 0) {
+        return null;
+    }
+
+    const iconWidth = 50;
+    const iconHeight = 40;
+
+    const segmentCount = 8;
+    const lineLength = lineEndX - lineStartX;
+    const segmentWidth = lineLength / segmentCount;
+
+    const chosenSegments = getRandomCoverageSegments(eighths, layerIndex);
+
     return (
-        <g transform={`translate(${x} ${y})`}>
-            <circle cx="0" cy="0" r="14" fill="#d4d4d8" />
-            <circle cx="18" cy="-6" r="18" fill="#d4d4d8" />
-            <circle cx="38" cy="2" r="13" fill="#d4d4d8" />
-            <rect x="-2" y="0" width="48" height="15" rx="7" fill="#d4d4d8" />
+        <g pointerEvents="none">
+            {chosenSegments.flatMap((segmentIndex, segmentOrder) => {
+                const cloudCount = getCloudCountForSegment(segmentIndex, layerIndex);
+                const segmentStartX = lineStartX + segmentIndex * segmentWidth;
+
+                return Array.from({ length: cloudCount }).map((_, cloudIndex) => {
+                    const progress =
+                        cloudCount === 1
+                            ? 0.5
+                            : (cloudIndex + 1) / (cloudCount + 1);
+
+                    const baseX = segmentStartX + segmentWidth * progress;
+
+                    const jitterX =
+                        getSegmentCloudJitter(segmentIndex, layerIndex, cloudIndex) *
+                        (segmentWidth * 0.12);
+
+                    const jitterY =
+                        getVerticalCloudJitter(segmentIndex, layerIndex, cloudIndex);
+
+                    const variant = getCloudImageVariant(
+                        cloudIndex + segmentOrder,
+                        layerIndex + segmentIndex
+                    );
+
+                    const iconHref =
+                        variant === 1
+                            ? "/icons/cloud.png"
+                            : variant === 2
+                                ? "/icons/cloud_long.png"
+                                : "/icons/cloud_cirrus.png";
+
+                    const scale = getCloudScale(segmentIndex, layerIndex, cloudIndex);
+
+                    return (
+                        <image
+                            key={`${segmentIndex}-${cloudIndex}`}
+                            href={iconHref}
+                            x={baseX + jitterX - (iconWidth * scale) / 2}
+                            y={y + jitterY}
+                            width={iconWidth * scale}
+                            height={iconHeight * scale}
+                            preserveAspectRatio="xMidYMid meet"
+                            opacity="0.95"
+                        />
+                    );
+                });
+            })}
         </g>
     );
+}
+
+function getCloudCountForSegment(segmentIndex: number, layerIndex: number): number {
+    return pseudoRandom(segmentIndex * 13.17 + layerIndex * 27.41) > 0.5 ? 3 : 2;
+}
+
+function getSegmentCloudJitter(
+    segmentIndex: number,
+    layerIndex: number,
+    cloudIndex: number
+): number {
+    return (
+        pseudoRandom(segmentIndex * 19.31 + layerIndex * 11.73 + cloudIndex * 7.19) * 2 -
+        1
+    );
+}
+
+function getVerticalCloudJitter(
+    segmentIndex: number,
+    layerIndex: number,
+    cloudIndex: number
+): number {
+    return (
+        pseudoRandom(segmentIndex * 23.11 + layerIndex * 9.41 + cloudIndex * 5.03) * 6 -
+        3
+    );
+}
+
+function getCloudScale(
+    segmentIndex: number,
+    layerIndex: number,
+    cloudIndex: number
+): number {
+    return 0.9 + pseudoRandom(segmentIndex * 17.77 + layerIndex * 14.13 + cloudIndex * 3.91) * 0.35;
+}
+
+function getRandomCoverageSegments(
+    eighths: number,
+    layerIndex: number
+): number[] {
+    const segmentIndices = Array.from({ length: 8 }, (_, index) => index);
+
+    const shuffled = [...segmentIndices].sort((a, b) => {
+        return pseudoRandom(a + layerIndex * 10.37) - pseudoRandom(b + layerIndex * 10.37);
+    });
+
+    return shuffled.slice(0, Math.min(eighths, 8)).sort((a, b) => a - b);
+}
+
+function pseudoRandom(seed: number): number {
+    const x = Math.sin(seed * 91.345) * 10000;
+    return x - Math.floor(x);
+}
+
+function getCloudImageVariant(index: number, layerIndex: number): 1 | 2 | 3 {
+    const value = pseudoRandom((index + 1) * 17.21 + (layerIndex + 1) * 43.77);
+
+    if (value < 0.333) return 1;
+    if (value < 0.666) return 2;
+    return 3;
+}
+
+function getCloudEighths(cover: string): number {
+    const normalizedCover = cover.toUpperCase();
+
+    if (normalizedCover === "CLR" || normalizedCover === "SKC" || normalizedCover === "NSC") {
+        return 0;
+    }
+
+    if (normalizedCover === "FEW") {
+        return 1;
+    }
+
+    if (normalizedCover === "SCT") {
+        return 3;
+    }
+
+    if (normalizedCover === "BKN") {
+        return 6;
+    }
+
+    if (normalizedCover === "OVC" || normalizedCover === "VV") {
+        return 8;
+    }
+
+    return 1;
+}
+
+function isCeilingCloudCover(cover: string): boolean {
+    const normalizedCover = cover.toUpperCase();
+
+    return (
+        normalizedCover === "BKN" ||
+        normalizedCover === "OVC" ||
+        normalizedCover === "VV"
+    );
+}
+
+function buildAltitudeTicks(scaleTopFeet: number): number[] {
+    const step =
+        scaleTopFeet <= 6000
+            ? 2000
+            : scaleTopFeet <= 12000
+                ? 3000
+                : scaleTopFeet <= 24000
+                    ? 6000
+                    : 10000;
+
+    const ticks: number[] = [];
+
+    for (let altitude = 0; altitude <= scaleTopFeet; altitude += step) {
+        ticks.push(altitude);
+    }
+
+    if (ticks[ticks.length - 1] !== scaleTopFeet) {
+        ticks.push(scaleTopFeet);
+    }
+
+    return ticks;
+}
+
+function formatAltitudeTick(feet: number): string {
+    if (feet >= 10000) {
+        return `${Math.round(feet / 1000)}k`;
+    }
+
+    return `${feet / 1000}k`;
 }
 
 function CompassRunwayPair({
