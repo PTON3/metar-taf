@@ -109,6 +109,8 @@ type RemarkBubble = {
     meaning: string;
 };
 
+type WindDisplayMode = "animated" | "direction" | "hidden";
+
 type DecoderTab = "lookup" | "raw";
 type DashboardTab = "weather" | "taf" | "airport";
 
@@ -1391,6 +1393,9 @@ function RunwayCompassSvg({
     const center = 200;
     const radius = 158;
 
+    const [windDisplayMode, setWindDisplayMode] =
+        useState<WindDisplayMode>("animated");
+
     const runwayLayout = buildRunwayLayout(runways, compassRotation, center);
 
     function displayAngle(angleDeg: number): number {
@@ -1408,6 +1413,21 @@ function RunwayCompassSvg({
             ? `${windDirectionDeg}° ${windSpeedKt} kt`
             : `${windSpeedKt} kt`;
 
+    const windModeLabel =
+        windDisplayMode === "animated"
+            ? "Animated wind"
+            : windDisplayMode === "direction"
+                ? "Wind direction"
+                : "Wind hidden";
+
+    function cycleWindDisplayMode() {
+        setWindDisplayMode((currentMode) => {
+            if (currentMode === "animated") return "direction";
+            if (currentMode === "direction") return "hidden";
+            return "animated";
+        });
+    }
+
     return (
         <svg
             viewBox="0 0 400 400"
@@ -1419,6 +1439,7 @@ function RunwayCompassSvg({
                 <clipPath id="wind-field-clip">
                     <circle cx={center} cy={center} r={radius - 6} />
                 </clipPath>
+
             </defs>
 
             <circle
@@ -1530,12 +1551,22 @@ function RunwayCompassSvg({
                 />
             ))}
 
-            <WindFieldAnimation
-                center={center}
-                radius={radius}
-                windDisplayAngle={windDisplayAngle}
-                windSpeedKt={windSpeedKt}
-            />
+            {windDisplayMode === "animated" && (
+                <WindFieldAnimation
+                    center={center}
+                    radius={radius}
+                    windDisplayAngle={windDisplayAngle}
+                    windSpeedKt={windSpeedKt}
+                />
+            )}
+
+            {windDisplayMode === "direction" && (
+                <WindDirectionArrow
+                    center={center}
+                    radius={radius}
+                    windDisplayAngle={windDisplayAngle}
+                />
+            )}
 
             <circle cx={center} cy={center} r="4" fill="#e6c76f" />
 
@@ -1602,6 +1633,24 @@ function RunwayCompassSvg({
                 </text>
             </g>
 
+            <g
+                onClick={cycleWindDisplayMode}
+                onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        cycleWindDisplayMode();
+                    }
+                }}
+                style={{ cursor: "pointer" }}
+                role="button"
+                tabIndex={0}
+                aria-label={`Wind display mode: ${windModeLabel}. Click to change.`}
+            >
+                <title>{`Wind display: ${windModeLabel}`}</title>
+
+                <WindModeIcon mode={windDisplayMode} x={37} y={367} />
+            </g>
+
             {activeRunway && (
                 <WindComponentStack
                     component={activeRunway.component}
@@ -1610,6 +1659,87 @@ function RunwayCompassSvg({
                 />
             )}
         </svg>
+    );
+}
+
+function WindDirectionArrow({
+    center,
+    radius,
+    windDisplayAngle,
+}: {
+    center: number;
+    radius: number;
+    windDisplayAngle: number | null;
+}) {
+    if (windDisplayAngle === null) {
+        return null;
+    }
+
+    const startY = center - radius + 25;
+    const endY = center + radius - 22;
+
+    return (
+        <g
+            clipPath="url(#wind-field-clip)"
+            pointerEvents="none"
+            opacity="0.88"
+            transform={`rotate(${windDisplayAngle} ${center} ${center})`}
+        >
+            {/* Bigger arrowhead at the wind source/start */}
+            <path
+                d={`
+                    M ${center} ${startY}
+                    L ${center - 12} ${startY - 18}
+                    M ${center} ${startY}
+                    L ${center + 12} ${startY - 18}
+                `}
+                fill="none"
+                stroke="#e6c76f"
+                strokeWidth="6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+            />
+
+            {/* Dashed wind direction line across the compass */}
+            <line
+                x1={center}
+                y1={startY + 12}
+                x2={center}
+                y2={endY}
+                stroke="#e6c76f"
+                strokeWidth="2.4"
+                strokeLinecap="round"
+                strokeDasharray="7 9"
+            />
+        </g>
+    );
+}
+
+function WindModeIcon({
+    mode,
+    x,
+    y,
+}: {
+    mode: WindDisplayMode;
+    x: number;
+    y: number;
+}) {
+    const iconHref =
+        mode === "animated"
+            ? "/icons/wind_icon.png"
+            : mode === "direction"
+                ? "/icons/wind_arrow_icon.png"
+                : "/icons/wind_hidden_icon.png";
+
+    return (
+        <image
+            href={iconHref}
+            x={x - 15}
+            y={y - 15}
+            width="30"
+            height="30"
+            preserveAspectRatio="xMidYMid meet"
+        />
     );
 }
 
@@ -1701,7 +1831,7 @@ function WindFieldAnimation({
             laneX: baseLaneX + randomRange(seed + 1, -8, 8),
             phase: randomRange(seed + 2, 0, Math.PI * 2),
             delay: Number((-randomRange(seed + 3, 0, flowDuration)).toFixed(2)),
-            opacity: Number(randomRange(seed + 4, 0.7, 0.3).toFixed(2)),
+            opacity: Number(randomRange(seed + 4, 0.3, 0.7).toFixed(2)),
             visibleLength: Math.round(randomRange(seed + 5, 50, 200)),
             amplitudeScale: randomRange(seed + 6, 0.75, 1.25),
         };
@@ -2245,32 +2375,6 @@ function CompassRunwayPair({
     );
 }
 
-function ComponentPill({
-    label,
-    value,
-    tone,
-}: {
-    label: string;
-    value: string;
-    tone: "good" | "caution" | "bad" | "neutral";
-}) {
-    const toneClass = {
-        good: "border-emerald-400/40 bg-emerald-400/10 text-emerald-200",
-        caution: "border-yellow-300/40 bg-yellow-300/10 text-yellow-200",
-        bad: "border-red-400/40 bg-red-400/10 text-red-200",
-        neutral: "border-zinc-700 bg-zinc-950 text-zinc-200",
-    }[tone];
-
-    return (
-        <div className={`rounded-xl border px-3 py-2 ${toneClass}`}>
-            <p className="text-[10px] font-bold uppercase tracking-[0.16em] opacity-80">
-                {label}
-            </p>
-            <p className="mt-1 text-lg font-black">{value}</p>
-        </div>
-    );
-}
-
 function RemarksSection({ remarks }: { remarks: string | null }) {
     const remarkBubbles = getRemarkBubbles(remarks);
 
@@ -2681,28 +2785,6 @@ function normalizeAngle180(angleDeg: number): number {
     return angle;
 }
 
-function formatComponentSummary(component: RunwayWindComponent): string {
-    const headwindText =
-        component.headwindKt >= 0
-            ? `${component.headwindKt} kt headwind`
-            : `${Math.abs(component.headwindKt)} kt tailwind`;
-
-    const crosswindText =
-        component.crosswindFrom === "centerline"
-            ? `${component.crosswindKt} kt crosswind`
-            : `${component.crosswindKt} kt crosswind from ${component.crosswindFrom}`;
-
-    return `${headwindText} | ${crosswindText}`;
-}
-
-function getCrosswindTone(
-    crosswindKt: number
-): "good" | "caution" | "bad" | "neutral" {
-    if (crosswindKt >= 15) return "bad";
-    if (crosswindKt >= 8) return "caution";
-    return "neutral";
-}
-
 function normalizeAngle360(angleDeg: number): number {
     let angle = angleDeg % 360;
 
@@ -2837,18 +2919,4 @@ function getTangentTextRotation(angleDeg: number): number {
     return normalized > 90 && normalized < 270
         ? normalized + 180
         : normalized;
-}
-
-function formatCompactComponentSummary(component: RunwayWindComponent): string {
-    const headwindText =
-        component.headwindKt >= 0
-            ? `${component.headwindKt}H`
-            : `${Math.abs(component.headwindKt)}T`;
-
-    const crosswindDirection =
-        component.crosswindFrom === "centerline"
-            ? ""
-            : ` ${component.crosswindFrom[0].toUpperCase()}`;
-
-    return `${headwindText} | ${component.crosswindKt}X${crosswindDirection}`;
 }
