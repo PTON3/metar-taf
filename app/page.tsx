@@ -1396,7 +1396,12 @@ function RunwayCompassSvg({
     const [windDisplayMode, setWindDisplayMode] =
         useState<WindDisplayMode>("animated");
 
-    const runwayLayout = buildRunwayLayout(runways, compassRotation, center);
+    const runwayLayout = buildRunwayLayout(
+        runways,
+        compassRotation,
+        center,
+        selectedEnd
+    );
 
     function displayAngle(angleDeg: number): number {
         return normalizeAngle360(angleDeg - compassRotation);
@@ -1436,10 +1441,13 @@ function RunwayCompassSvg({
             aria-label="Runway and wind compass"
         >
             <defs>
+                <clipPath id="compass-face-clip">
+                    <circle cx={center} cy={center} r={radius - 2} />
+                </clipPath>
+
                 <clipPath id="wind-field-clip">
                     <circle cx={center} cy={center} r={radius - 6} />
                 </clipPath>
-
             </defs>
 
             <circle
@@ -1540,33 +1548,45 @@ function RunwayCompassSvg({
                 );
             })}
 
-            {runwayLayout.map((layout) => (
-                <CompassRunwayPair
-                    key={layout.runway.id}
-                    layout={layout}
-                    runwayEnds={runwayEnds}
-                    selectedEnd={selectedEnd}
-                    bestRunwayIdent={bestRunwayIdent}
-                    onSelectEnd={onSelectEnd}
-                />
-            ))}
+            <g clipPath="url(#compass-face-clip)">
+                {runwayLayout.map((layout) => (
+                    <CompassRunwayPair
+                        key={layout.runway.id}
+                        layout={layout}
+                        runwayEnds={runwayEnds}
+                        selectedEnd={selectedEnd}
+                        bestRunwayIdent={bestRunwayIdent}
+                        onSelectEnd={onSelectEnd}
+                    />
+                ))}
 
-            {windDisplayMode === "animated" && (
-                <WindFieldAnimation
-                    center={center}
-                    radius={radius}
-                    windDisplayAngle={windDisplayAngle}
-                    windSpeedKt={windSpeedKt}
-                />
-            )}
+                {windDisplayMode === "animated" && (
+                    <WindFieldAnimation
+                        center={center}
+                        radius={radius}
+                        windDisplayAngle={windDisplayAngle}
+                        windSpeedKt={windSpeedKt}
+                    />
+                )}
 
-            {windDisplayMode === "direction" && (
-                <WindDirectionArrow
-                    center={center}
-                    radius={radius}
-                    windDisplayAngle={windDisplayAngle}
-                />
-            )}
+                {windDisplayMode === "direction" && (
+                    <WindDirectionArrow
+                        center={center}
+                        radius={radius}
+                        windDisplayAngle={windDisplayAngle}
+                    />
+                )}
+            </g>
+
+            <circle
+                cx={center}
+                cy={center}
+                r={radius}
+                fill="none"
+                stroke="#3f3f46"
+                strokeWidth="1.5"
+                pointerEvents="none"
+            />
 
             <circle cx={center} cy={center} r="4" fill="#e6c76f" />
 
@@ -1991,7 +2011,7 @@ function WindComponentStack({
             <g transform="translate(0 24)">
                 {component.crosswindFrom === "left" && (
                     <path
-                        d="M 9 0 L -10 0 M -5 -5 L -10 0 L -5 5"
+                        d="M -9 0 L 10 0 M 5 -5 L 10 0 L 5 5"
                         fill="none"
                         stroke="#e6c76f"
                         strokeWidth="2.4"
@@ -2002,7 +2022,7 @@ function WindComponentStack({
 
                 {component.crosswindFrom === "right" && (
                     <path
-                        d="M -9 0 L 10 0 M 5 -5 L 10 0 L 5 5"
+                        d="M 9 0 L -10 0 M -5 -5 L -10 0 L -5 5"
                         fill="none"
                         stroke="#e6c76f"
                         strokeWidth="2.4"
@@ -2812,7 +2832,8 @@ function polarPoint(
 function buildRunwayLayout(
     runways: AirportRunway[],
     rotationDeg: number,
-    center: number
+    center: number,
+    selectedEnd: RunwayEnd | null = null
 ): RunwayLayout[] {
     const endpoints = runways.flatMap((runway) => [
         {
@@ -2837,19 +2858,63 @@ function buildRunwayLayout(
         return [];
     }
 
-    const averageLatitude =
+    const airportAverageLatitude =
         validEndpoints.reduce((sum, point) => sum + (point.latitude ?? 0), 0) /
         validEndpoints.length;
 
-    const averageLongitude =
+    const airportAverageLongitude =
         validEndpoints.reduce((sum, point) => sum + (point.longitude ?? 0), 0) /
         validEndpoints.length;
 
-    const cosLatitude = Math.cos((averageLatitude * Math.PI) / 180);
+    const selectedRunway = selectedEnd
+        ? runways.find((runway) => runway.id === selectedEnd.runwayId)
+        : null;
+
+    const selectedRunwayHasCoordinates =
+        selectedRunway?.endA.latitude !== null &&
+        selectedRunway?.endA.longitude !== null &&
+        selectedRunway?.endB.latitude !== null &&
+        selectedRunway?.endB.longitude !== null;
+
+    const originLatitude =
+        selectedRunway && selectedRunwayHasCoordinates
+            ? ((selectedRunway.endA.latitude ?? 0) +
+                (selectedRunway.endB.latitude ?? 0)) /
+            2
+            : airportAverageLatitude;
+
+    const originLongitude =
+        selectedRunway && selectedRunwayHasCoordinates
+            ? ((selectedRunway.endA.longitude ?? 0) +
+                (selectedRunway.endB.longitude ?? 0)) /
+            2
+            : airportAverageLongitude;
+
+    const cosLatitude = Math.cos((airportAverageLatitude * Math.PI) / 180);
+
+    const referencePoints = validEndpoints.map((point) => {
+        const xEast =
+            ((point.longitude ?? 0) - airportAverageLongitude) * cosLatitude;
+        const yNorth = (point.latitude ?? 0) - airportAverageLatitude;
+
+        return {
+            x: xEast,
+            y: yNorth,
+        };
+    });
+
+    const maxExtent =
+        Math.max(
+            ...referencePoints.map((point) => Math.abs(point.x)),
+            ...referencePoints.map((point) => Math.abs(point.y)),
+            0.0001
+        ) * 1.25;
+
+    const scale = 150 / maxExtent;
 
     const localPoints = validEndpoints.map((point) => {
-        const xEast = ((point.longitude ?? 0) - averageLongitude) * cosLatitude;
-        const yNorth = (point.latitude ?? 0) - averageLatitude;
+        const xEast = ((point.longitude ?? 0) - originLongitude) * cosLatitude;
+        const yNorth = (point.latitude ?? 0) - originLatitude;
         const rotated = rotateLocalPoint(xEast, yNorth, rotationDeg);
 
         return {
@@ -2859,15 +2924,6 @@ function buildRunwayLayout(
             y: rotated.y,
         };
     });
-
-    const maxExtent =
-        Math.max(
-            ...localPoints.map((point) => Math.abs(point.x)),
-            ...localPoints.map((point) => Math.abs(point.y)),
-            0.0001
-        ) * 1.25;
-
-    const scale = 150 / maxExtent;
 
     function toSvgPoint(point: { x: number; y: number }): SvgPoint {
         return {
