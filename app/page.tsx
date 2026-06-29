@@ -331,7 +331,7 @@ export default function Home() {
         <main className="min-h-screen bg-[#050505] text-zinc-100">
             <div className="absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top_left,_rgba(214,179,90,0.16),_transparent_35%),radial-gradient(circle_at_top_right,_rgba(255,255,255,0.08),_transparent_30%)]" />
 
-            <div className="mx-auto max-w-7xl px-6 py-8">
+            <div className="mx-auto max-w-[90vw] px-6 py-8">
                 <header className="mb-8 border-b border-[#d6b35a]/20 pb-8">
                     <div className="mb-4 inline-flex items-center gap-3 rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.22em] text-[#e6c76f]">
                         Inflight Aviation
@@ -1368,22 +1368,26 @@ function RunwayWindWidget({
                 </div>
             </div>
 
-            <div className="mt-5 grid gap-5 xl:grid-cols-2">
-                <RunwayCompassSvg
-                    runways={runways}
-                    runwayEnds={calculatedEnds}
-                    selectedEnd={selectedEnd}
-                    bestRunwayIdent={bestRunway?.ident ?? null}
-                    activeRunway={activeRunway}
-                    windDirectionDeg={windDirectionDeg}
-                    windSpeedKt={windSpeedKt}
-                    compassRotation={compassRotation}
-                    showResetButton={selectedEnd !== null}
-                    onResetNorthUp={() => setSelectedEnd(null)}
-                    onSelectEnd={setSelectedEnd}
-                />
+            <div className="mt-5 grid grid-cols-1 gap-5 min-[1200px]:grid-cols-2">
+                <div className="min-w-0">
+                    <RunwayCompassSvg
+                        runways={runways}
+                        runwayEnds={calculatedEnds}
+                        selectedEnd={selectedEnd}
+                        bestRunwayIdent={bestRunway?.ident ?? null}
+                        activeRunway={activeRunway}
+                        windDirectionDeg={windDirectionDeg}
+                        windSpeedKt={windSpeedKt}
+                        compassRotation={compassRotation}
+                        showResetButton={selectedEnd !== null}
+                        onResetNorthUp={() => setSelectedEnd(null)}
+                        onSelectEnd={setSelectedEnd}
+                    />
+                </div>
 
-                <CloudCeilingPreviewSvg metar={metar} />
+                <div className="min-w-0">
+                    <CloudCeilingPreviewSvg metar={metar} />
+                </div>
             </div>
         </div>
     );
@@ -1468,10 +1472,11 @@ function RunwayCompassSvg({
     return (
         <svg
             viewBox="0 0 400 400"
-            className="h-auto w-full rounded-2xl bg-black"
+            className="h-auto w-full rounded-2xl bg-transparent"
             role="img"
             aria-label="Runway and wind compass"
         >
+
             <defs>
                 <clipPath id="compass-face-clip">
                     <circle cx={center} cy={center} r={radius - 2} />
@@ -1486,7 +1491,7 @@ function RunwayCompassSvg({
                 cx={center}
                 cy={center}
                 r={radius}
-                fill="#050505"
+                fill="transparent"
                 stroke="#3f3f46"
                 strokeWidth="1"
             />
@@ -2184,23 +2189,26 @@ function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
 
     const altitudeTicks = buildAltitudeTicks(scaleTopFeet);
 
-    const graphLeft = 42;
-    const graphRight = 320;
-    const textX = 390;
+    const graphTop = 35;
+    const graphBottom = 365;
+    const graphHeight = graphBottom - graphTop;
 
     function altitudeToY(feet: number): number {
         const cappedFeet = Math.min(Math.max(feet, 0), scaleTopFeet);
-        return 330 - (cappedFeet / scaleTopFeet) * 240;
+        return graphBottom - (cappedFeet / scaleTopFeet) * graphHeight;
     }
+
+    const graphLeft = 42;
+    const graphRight = 300;
+    const textX = 372;
 
     return (
         <svg
             viewBox="0 0 400 400"
-            className="h-auto w-full rounded-2xl bg-black"
+            className="h-auto w-full rounded-2xl bg-transparent"
             role="img"
             aria-label="Cloud and ceiling visualization"
         >
-            <rect x="0" y="0" width="400" height="400" fill="#050505" />
 
             {altitudeTicks.map((altitude) => {
                 const y = altitudeToY(altitude);
@@ -2234,7 +2242,7 @@ function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
 
             <rect
                 x={graphLeft}
-                y="330"
+                y={graphBottom}
                 width={graphRight - graphLeft}
                 height="10"
                 rx="5"
