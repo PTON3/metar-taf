@@ -19,6 +19,8 @@ type AirportInfo = {
     timeZone: string | null;
 };
 
+
+
 function cleanStation(input: string | null): string {
     return (input ?? "").trim().toUpperCase();
 }
@@ -57,6 +59,36 @@ function getNumber(record: Record<string, unknown>, keys: string[]): number | nu
     }
 
     return null;
+}
+
+const METERS_TO_FEET = 3.280839895;
+
+function metersToFeet(valueMeters: number | null): number | null {
+    return valueMeters === null ? null : Math.round(valueMeters * METERS_TO_FEET);
+}
+
+function getElevationFt(record: Record<string, unknown>): number | null {
+    const explicitFeet = getNumber(record, [
+        "elevationFt",
+        "elevFt",
+        "elev_ft",
+        "elevation_ft",
+    ]);
+
+    if (explicitFeet !== null) {
+        return Math.round(explicitFeet);
+    }
+
+    const elevationMeters = getNumber(record, [
+        "elev",
+        "elevation",
+        "elevationM",
+        "elevM",
+        "elevation_m",
+        "elev_m",
+    ]);
+
+    return metersToFeet(elevationMeters);
 }
 
 function getFirstRecord(data: unknown): Record<string, unknown> | null {
@@ -142,13 +174,7 @@ function normalizeAirportInfo(
     const latitude = getNumber(record, ["lat", "latitude"]);
     const longitude = getNumber(record, ["lon", "longitude"]);
 
-    const elevationFt = getNumber(record, [
-        "elev",
-        "elevation",
-        "elevationFt",
-        "elevFt",
-        "elev_ft",
-    ]);
+    const elevationFt = getElevationFt(record);
 
     let timeZone: string | null = null;
 
