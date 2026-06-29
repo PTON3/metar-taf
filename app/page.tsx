@@ -1937,7 +1937,7 @@ function RunwayStatusBadge({
 }) {
     const label = selectedEnd
         ? `RWY ${activeRunway.ident}`
-        : `BEST RWY ${activeRunway.pairName}`;
+        : `BEST RWY ${activeRunway.ident}`;
 
     return (
         <g>
