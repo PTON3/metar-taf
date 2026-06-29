@@ -88,6 +88,23 @@ type RunwayWindComponent = {
     crosswindFrom: "left" | "right" | "centerline";
 };
 
+type AirportMapFeature = {
+    id: string;
+    label: string;
+    latitude: number;
+    longitude: number;
+};
+
+type AirportMapFeatureLayout = {
+    feature: AirportMapFeature;
+    point: SvgPoint;
+};
+
+type AirportMapLayout = {
+    runwayLayout: RunwayLayout[];
+    featureLayout: AirportMapFeatureLayout[];
+};
+
 type SvgPoint = {
     x: number;
     y: number;
@@ -113,6 +130,13 @@ type WindDisplayMode = "animated" | "direction" | "hidden";
 
 type DecoderTab = "lookup" | "raw";
 type DashboardTab = "weather" | "taf" | "airport";
+
+const KFCM_INFLIGHT_FEATURE: AirportMapFeature = {
+    id: "inflight-aviation",
+    label: "Inflight",
+    latitude: 44.829983,
+    longitude: -93.451894,
+};
 
 const FLIGHT_CATEGORY_STYLES: Record<FlightCategory, string> = {
     VFR: "border-emerald-400/50 bg-emerald-400/15 text-emerald-200",
@@ -1396,11 +1420,19 @@ function RunwayCompassSvg({
     const [windDisplayMode, setWindDisplayMode] =
         useState<WindDisplayMode>("animated");
 
-    const runwayLayout = buildRunwayLayout(
+    const airportIdent = runways[0]?.airportIdent?.toUpperCase() ?? "";
+
+    const airportFeatures =
+        airportIdent === "KFCM" || airportIdent === "FCM"
+            ? [KFCM_INFLIGHT_FEATURE]
+            : [];
+
+    const { runwayLayout, featureLayout } = buildAirportMapLayout(
         runways,
         compassRotation,
         center,
-        selectedEnd
+        selectedEnd,
+        airportFeatures
     );
 
     function displayAngle(angleDeg: number): number {
@@ -1576,6 +1608,14 @@ function RunwayCompassSvg({
                         windDisplayAngle={windDisplayAngle}
                     />
                 )}
+
+                {featureLayout.map((layout) => (
+                    <CompassFeatureMarker
+                        key={layout.feature.id}
+                        layout={layout}
+                        labelSide={getInflightLabelSide(selectedEnd)}
+                    />
+                ))}
             </g>
 
             <circle
@@ -1679,6 +1719,73 @@ function RunwayCompassSvg({
                 />
             )}
         </svg>
+    );
+}
+
+function getInflightLabelSide(selectedEnd: RunwayEnd | null): "left" | "right" {
+    if (!selectedEnd) {
+        return "right";
+    }
+
+    if (selectedEnd.ident === "36") {
+        return "right";
+    }
+
+    if (selectedEnd.ident === "18") {
+        return "left";
+    }
+
+    return "right";
+}
+
+function CompassFeatureMarker({
+    layout,
+    labelSide,
+}: {
+    layout: AirportMapFeatureLayout;
+    labelSide: "left" | "right";
+}) {
+    const { point } = layout;
+
+    const labelX = labelSide === "left" ? -22 : 22;
+
+    return (
+        <g transform={`translate(${point.x} ${point.y})`} pointerEvents="none">
+            <image
+                href="/icons/ping_icon.png"
+                x="-11"
+                y="-22"
+                width="22"
+                height="22"
+                preserveAspectRatio="xMidYMid meet"
+            />
+
+            <text
+                x={labelX}
+                y="-13"
+                textAnchor="middle"
+                dominantBaseline="middle"
+                fill="#e6c76f"
+                fontSize="6.5"
+                fontWeight="750"
+                letterSpacing="0.25"
+            >
+                Inflight
+            </text>
+
+            <text
+                x={labelX}
+                y="-6"
+                textAnchor="middle"
+                dominantBaseline="middle"
+                fill="#e6c76f"
+                fontSize="6.5"
+                fontWeight="750"
+                letterSpacing="0.25"
+            >
+                Aviation
+            </text>
+        </g>
     );
 }
 
@@ -2829,12 +2936,13 @@ function polarPoint(
     };
 }
 
-function buildRunwayLayout(
+function buildAirportMapLayout(
     runways: AirportRunway[],
     rotationDeg: number,
     center: number,
-    selectedEnd: RunwayEnd | null = null
-): RunwayLayout[] {
+    selectedEnd: RunwayEnd | null = null,
+    features: AirportMapFeature[] = []
+): AirportMapLayout {
     const endpoints = runways.flatMap((runway) => [
         {
             runway,
@@ -2855,7 +2963,10 @@ function buildRunwayLayout(
     );
 
     if (validEndpoints.length === 0) {
-        return [];
+        return {
+            runwayLayout: [],
+            featureLayout: [],
+        };
     }
 
     const airportAverageLatitude =
@@ -2912,27 +3023,25 @@ function buildRunwayLayout(
 
     const scale = 150 / maxExtent;
 
-    const localPoints = validEndpoints.map((point) => {
-        const xEast = ((point.longitude ?? 0) - originLongitude) * cosLatitude;
-        const yNorth = (point.latitude ?? 0) - originLatitude;
+    function projectPoint(latitude: number, longitude: number): SvgPoint {
+        const xEast = (longitude - originLongitude) * cosLatitude;
+        const yNorth = latitude - originLatitude;
+
         const rotated = rotateLocalPoint(xEast, yNorth, rotationDeg);
 
         return {
-            runway: point.runway,
-            end: point.end,
-            x: rotated.x,
-            y: rotated.y,
-        };
-    });
-
-    function toSvgPoint(point: { x: number; y: number }): SvgPoint {
-        return {
-            x: center + point.x * scale,
-            y: center - point.y * scale,
+            x: center + rotated.x * scale,
+            y: center - rotated.y * scale,
         };
     }
 
-    return runways
+    const localPoints = validEndpoints.map((point) => ({
+        runway: point.runway,
+        end: point.end,
+        point: projectPoint(point.latitude ?? 0, point.longitude ?? 0),
+    }));
+
+    const runwayLayout = runways
         .map((runway) => {
             const startPoint = localPoints.find(
                 (point) => point.runway.id === runway.id && point.end === "A"
@@ -2948,11 +3057,21 @@ function buildRunwayLayout(
 
             return {
                 runway,
-                start: toSvgPoint(startPoint),
-                end: toSvgPoint(endPoint),
+                start: startPoint.point,
+                end: endPoint.point,
             };
         })
         .filter((layout): layout is RunwayLayout => layout !== null);
+
+    const featureLayout = features.map((feature) => ({
+        feature,
+        point: projectPoint(feature.latitude, feature.longitude),
+    }));
+
+    return {
+        runwayLayout,
+        featureLayout,
+    };
 }
 
 function rotateLocalPoint(
