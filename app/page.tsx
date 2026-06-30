@@ -363,7 +363,7 @@ export default function Home() {
         <main className="min-h-screen bg-[#050505] text-zinc-100">
             <div className="absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top_left,_rgba(214,179,90,0.16),_transparent_35%),radial-gradient(circle_at_top_right,_rgba(255,255,255,0.08),_transparent_30%)]" />
 
-            <div className="mx-auto max-w-[90vw] px-6 py-8">
+            <div className="mx-auto w-full max-w-[2400px] px-3 py-6 sm:px-4 md:w-[95vw] md:py-8 lg:px-8">
                 <header className="mb-8 border-b border-[#d6b35a]/20 pb-8">
                     <div className="mb-4 inline-flex items-center gap-3 rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.22em] text-[#e6c76f]">
                         Inflight Aviation
@@ -479,8 +479,8 @@ export default function Home() {
 
                 <footer className="mt-10 border-t border-zinc-900 pt-5 text-center">
                     <p className="text-[11px] leading-5 text-zinc-500">
-                        Created by Preston Vaughn for Inflight Aviation. METAR data provided by
-                        AviationWeather.gov.
+                        Created by Preston Vaughn for Inflight Aviation. METAR and TAF data provided by
+                        AviationWeather.gov. Airport information provided by FAA.gov.
                     </p>
                 </footer>
 
@@ -1625,7 +1625,7 @@ function RunwayWindWidget({
                 </div>
             </div>
 
-            <div className="mt-5 grid grid-cols-1 gap-5 min-[1200px]:grid-cols-2">
+            <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-2">
                 <div className="min-w-0">
                     <RunwayCompassSvg
                         runways={runways}
