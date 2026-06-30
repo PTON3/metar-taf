@@ -178,6 +178,59 @@ const FLIGHT_CATEGORY_STYLES: Record<FlightCategory, string> = {
     UNKNOWN: "border-zinc-500/50 bg-zinc-500/15 text-zinc-200",
 };
 
+type TafIconKey =
+    | "clearDay"
+    | "clearNight"
+    | "fewDay"
+    | "fewNight"
+    | "sctDay"
+    | "sctNight"
+    | "bknDay"
+    | "bknNight"
+    | "ovcDay"
+    | "ovcNight"
+    | "rain"
+    | "thunderstorm"
+    | "fog"
+    | "snow"
+    | "freezing";
+
+const TAF_ICON_SRC: Record<TafIconKey, string> = {
+    clearDay: "/icons/taf/sun.png",
+    clearNight: "/icons/taf/moon.png",
+
+    fewDay: "/icons/taf/few_day.png",
+    fewNight: "/icons/taf/few_night.png",
+
+    sctDay: "/icons/taf/sct_day.png",
+    sctNight: "/icons/taf/sct_night.png",
+
+    bknDay: "/icons/taf/bkn_day.png",
+    bknNight: "/icons/taf/bkn_night.png",
+
+    ovcDay: "/icons/taf/clouds_day.png",
+    ovcNight: "/icons/taf/clouds_night.png",
+
+    rain: "/icons/taf/rain.png",
+    thunderstorm: "/icons/taf/thunderstorm.png",
+    fog: "/icons/taf/fog.png",
+    snow: "/icons/taf/snow.png",
+    freezing: "/icons/taf/snow.png",
+};
+
+type TafHourSlot = {
+    startsAt: Date;
+    block: TafForecastBlock;
+    iconKey: TafIconKey;
+    weatherLabel: string;
+    flightCategory: FlightCategory;
+    visibility: string;
+    ceiling: string;
+    wind: string;
+    gusts: string;
+    change: string;
+};
+
 export default function Home() {
     const [activeTab, setActiveTab] = useState<DecoderTab>("lookup");
     const [station, setStation] = useState("KFCM");
@@ -603,7 +656,12 @@ function MetarDashboard({
                     />
                 )}
 
-                {activeDashboardTab === "taf" && <TafDashboardTab station={metar.station} />}
+                {activeDashboardTab === "taf" && (
+                    <TafDashboardTab
+                        station={metar.station}
+                        timeZone={stationInfo?.timeZone}
+                    />
+                )}
 
                 {activeDashboardTab === "airport" && (
                     <AirportInfoDashboardTab
@@ -739,8 +797,538 @@ function formatSky(sky?: TafSkyCondition[]) {
         .join(", ");
 }
 
-function TafDashboardTab({ station = "KFCM" }: { station?: string }) {
-    const [taf, setTaf] = useState<TafResponse | null>(null);
+function TafHourlyForecast({
+    taf,
+    timeZone,
+}: {
+    taf: TafResponse;
+    timeZone?: string | null;
+}) {
+    const slots = buildTafHourlySlots(taf, timeZone).slice(0, 24);
+    const scrollRef = useRef<HTMLDivElement | null>(null);
+    const [isDragging, setIsDragging] = useState(false);
+    const [startX, setStartX] = useState(0);
+    const [scrollLeft, setScrollLeft] = useState(0);
+
+    if (slots.length === 0) {
+        return null;
+    }
+
+    function handleMouseDown(event: React.MouseEvent<HTMLDivElement>) {
+        const slider = scrollRef.current;
+        if (!slider) return;
+
+        setIsDragging(true);
+        setStartX(event.pageX - slider.offsetLeft);
+        setScrollLeft(slider.scrollLeft);
+    }
+
+    function handleMouseMove(event: React.MouseEvent<HTMLDivElement>) {
+        if (!isDragging) return;
+
+        const slider = scrollRef.current;
+        if (!slider) return;
+
+        event.preventDefault();
+
+        const x = event.pageX - slider.offsetLeft;
+        const walk = x - startX;
+
+        slider.scrollLeft = scrollLeft - walk;
+    }
+
+    function stopDragging() {
+        setIsDragging(false);
+    }
+
+    function isCurrentTafHour(date: Date) {
+        const now = new Date();
+        const start = roundDownToUtcHour(now);
+        const end = new Date(start.getTime() + 60 * 60 * 1000);
+
+        return date >= start && date < end;
+    }
+
+    return (
+        <div
+            ref={scrollRef}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={stopDragging}
+            onMouseLeave={stopDragging}
+            className={`scrollbar-hide mt-2 overflow-x-auto pb-2 select-none ${isDragging ? "cursor-grabbing" : "cursor-grab"
+                }`}
+        >
+            <div className="flex min-w-max gap-3">
+                {slots.map((slot, index) => {
+                    const { dayLabel, hourLabel } = formatTafHourLabel(
+                        slot.startsAt,
+                        timeZone
+                    );
+
+                    const displayHourLabel =
+                        index === 0 && isCurrentTafHour(slot.startsAt)
+                            ? "Now"
+                            : hourLabel;
+
+                    return (
+                        <article
+                            key={slot.startsAt.toISOString()}
+                            className="w-[175px] shrink-0 rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
+                        >
+                            <div className="flex items-start justify-between gap-2">
+                                <div>
+                                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+                                        {dayLabel}
+                                    </p>
+                                    <p className="mt-1 text-lg font-black text-white">
+                                        {displayHourLabel}
+                                    </p>
+                                </div>
+
+                                <span
+                                    className={`rounded-full border px-2 py-1 text-[10px] font-black ${FLIGHT_CATEGORY_STYLES[slot.flightCategory]}`}
+                                >
+                                    {slot.flightCategory}
+                                </span>
+                            </div>
+
+                            <div className="mt-3 flex h-25 items-center justify-center">
+                                <img
+                                    src={TAF_ICON_SRC[slot.iconKey]}
+                                    alt={slot.weatherLabel}
+                                    draggable={false}
+                                    onDragStart={(event) => event.preventDefault()}
+                                    className="pointer-events-none h-50 w-50 select-none object-contain drop-shadow-2xl"
+                                />
+                            </div>
+
+                            <p className="mt-3 min-h-[40px] text-center text-sm font-semibold leading-5 text-white">
+                                {slot.weatherLabel}
+                            </p>
+
+                            {slot.change !== "BASE" && (
+                                <p className="mt-2 rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-2 py-1 text-center text-[10px] font-bold uppercase tracking-[0.12em] text-[#e6c76f]">
+                                    {slot.change}
+                                </p>
+                            )}
+
+                            <div className="mt-4 space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs">
+                                <TafHourRow label="Vis" value={slot.visibility} />
+                                <TafHourRow label="Ceil" value={slot.ceiling} />
+                                <TafHourRow label="Wind" value={slot.wind} />
+                                <TafHourRow label="Gust" value={slot.gusts} />
+                            </div>
+                        </article>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+function TafHourRow({ label, value }: { label: string; value: string }) {
+    return (
+        <div className="flex items-center justify-between gap-3">
+            <span className="text-zinc-500">{label}</span>
+            <span className="text-right font-semibold text-zinc-200">{value}</span>
+        </div>
+    );
+}
+
+function buildTafHourlySlots(
+    taf: TafResponse,
+    timeZone?: string | null
+): TafHourSlot[] {
+    const forecastBlocks = taf.forecast ?? [];
+
+    if (forecastBlocks.length === 0) {
+        return [];
+    }
+
+    const startDate = parseTafDate(
+        taf.validFrom ?? forecastBlocks[0]?.from ?? null
+    );
+
+    const endDate = parseTafDate(
+        taf.validTo ?? forecastBlocks[forecastBlocks.length - 1]?.to ?? null
+    );
+
+    if (!startDate || !endDate) {
+        return [];
+    }
+
+    const now = new Date();
+
+    if (now >= endDate) {
+        return [];
+    }
+
+    const effectiveStart = now > startDate ? now : startDate;
+    const firstHour = roundDownToUtcHour(effectiveStart);
+
+    const slots: TafHourSlot[] = [];
+
+    let cursor = new Date(firstHour);
+    let guard = 0;
+
+    while (cursor < endDate && guard < 36) {
+        const activeBlock =
+            getActiveTafBlock(forecastBlocks, cursor) ?? forecastBlocks[0];
+
+        const isDay = isTafDaylight(cursor, timeZone);
+        const iconInfo = getTafIconInfo(activeBlock, isDay);
+
+        slots.push({
+            startsAt: new Date(cursor),
+            block: activeBlock,
+            iconKey: iconInfo.iconKey,
+            weatherLabel: iconInfo.label,
+            flightCategory: getTafFlightCategory(activeBlock),
+            visibility: formatTafVisibility(activeBlock.visibilitySm),
+            ceiling: formatTafCeiling(activeBlock.sky),
+            wind: formatTafWindShort(activeBlock),
+            gusts: activeBlock.windGustKt ? `${activeBlock.windGustKt} kt` : "—",
+            change: activeBlock.change ?? "BASE",
+        });
+
+        cursor = new Date(cursor.getTime() + 60 * 60 * 1000);
+        guard += 1;
+    }
+
+    return slots;
+}
+
+function getActiveTafBlock(
+    blocks: TafForecastBlock[],
+    hour: Date
+): TafForecastBlock | null {
+    const matchingBlocks = blocks.filter((block) => {
+        const from = parseTafDate(block.from ?? null);
+        const to = parseTafDate(block.to ?? null);
+
+        if (!from || !to) return false;
+
+        return from <= hour && hour < to;
+    });
+
+    if (matchingBlocks.length === 0) {
+        return null;
+    }
+
+    return matchingBlocks.sort(
+        (a, b) => getTafChangePriority(b.change) - getTafChangePriority(a.change)
+    )[0];
+}
+
+function getTafChangePriority(change?: string | null) {
+    const code = (change ?? "BASE").toUpperCase();
+
+    if (code.includes("TEMPO")) return 5;
+    if (code.includes("PROB")) return 4;
+    if (code.includes("BECMG")) return 3;
+    if (code.includes("FM")) return 2;
+
+    return 1;
+}
+
+function getTafIconInfo(
+    block: TafForecastBlock,
+    isDay: boolean
+): {
+    iconKey: TafIconKey;
+    label: string;
+} {
+    const weather = (block.weather ?? "").toUpperCase();
+    const skyCovers = (block.sky ?? [])
+        .map((layer) => layer.cover?.toUpperCase())
+        .filter(Boolean);
+
+    if (weather.includes("TS") || weather.includes("VCTS")) {
+        return {
+            iconKey: "thunderstorm",
+            label: weather.includes("RA") ? "Thunderstorms / rain" : "Thunderstorms",
+        };
+    }
+
+    if (
+        weather.includes("FZRA") ||
+        weather.includes("FZDZ") ||
+        weather.includes("PL") ||
+        weather.includes("IC")
+    ) {
+        return {
+            iconKey: "freezing",
+            label: "Freezing precip",
+        };
+    }
+
+    if (
+        weather.includes("SN") ||
+        weather.includes("SG") ||
+        weather.includes("BLSN") ||
+        weather.includes("SHSN")
+    ) {
+        return {
+            iconKey: "snow",
+            label: "Snow",
+        };
+    }
+
+    if (
+        weather.includes("RA") ||
+        weather.includes("DZ") ||
+        weather.includes("SHRA") ||
+        weather.includes("VCSH")
+    ) {
+        return {
+            iconKey: "rain",
+            label: weather.includes("SH") ? "Rain showers" : "Rain",
+        };
+    }
+
+    if (
+        weather.includes("FG") ||
+        weather.includes("BR") ||
+        weather.includes("HZ") ||
+        weather.includes("FU") ||
+        weather.includes("DU") ||
+        weather.includes("SA")
+    ) {
+        return {
+            iconKey: "fog",
+            label: weather.includes("BR") ? "Mist" : "Fog / haze",
+        };
+    }
+
+    if (skyCovers.includes("OVC")) {
+        return {
+            iconKey: isDay ? "ovcDay" : "ovcNight",
+            label: "Overcast",
+        };
+    }
+
+    if (skyCovers.includes("BKN")) {
+        return {
+            iconKey: isDay ? "bknDay" : "bknNight",
+            label: "Broken clouds",
+        };
+    }
+
+    if (skyCovers.includes("SCT")) {
+        return {
+            iconKey: isDay ? "sctDay" : "sctNight",
+            label: "Scattered clouds",
+        };
+    }
+
+    if (skyCovers.includes("FEW")) {
+        return {
+            iconKey: isDay ? "fewDay" : "fewNight",
+            label: "Few clouds",
+        };
+    }
+
+    return {
+        iconKey: isDay ? "clearDay" : "clearNight",
+        label: "Clear",
+    };
+}
+
+function getTafFlightCategory(block: TafForecastBlock): FlightCategory {
+    const visibilitySm = parseTafVisibilitySm(block.visibilitySm);
+    const ceilingFt = getTafCeilingFt(block.sky);
+
+    if (
+        (visibilitySm !== null && visibilitySm < 1) ||
+        (ceilingFt !== null && ceilingFt < 500)
+    ) {
+        return "LIFR";
+    }
+
+    if (
+        (visibilitySm !== null && visibilitySm < 3) ||
+        (ceilingFt !== null && ceilingFt < 1000)
+    ) {
+        return "IFR";
+    }
+
+    if (
+        (visibilitySm !== null && visibilitySm <= 5) ||
+        (ceilingFt !== null && ceilingFt <= 3000)
+    ) {
+        return "MVFR";
+    }
+
+    return "VFR";
+}
+
+function getTafCeilingFt(sky?: TafSkyCondition[]) {
+    const ceilingLayers = (sky ?? [])
+        .filter((layer) => {
+            const cover = layer.cover?.toUpperCase();
+
+            return cover === "BKN" || cover === "OVC" || cover === "VV";
+        })
+        .map((layer) => layer.baseFtAgl)
+        .filter((base): base is number => typeof base === "number");
+
+    if (ceilingLayers.length === 0) {
+        return null;
+    }
+
+    return Math.min(...ceilingLayers);
+}
+
+function formatTafCeiling(sky?: TafSkyCondition[]) {
+    const ceiling = getTafCeilingFt(sky);
+
+    if (ceiling === null) return "—";
+
+    return `${ceiling.toLocaleString()} ft`;
+}
+
+function parseTafVisibilitySm(value?: string | number | null) {
+    if (value === null || value === undefined || value === "") {
+        return null;
+    }
+
+    if (typeof value === "number") {
+        return value;
+    }
+
+    const clean = value
+        .toUpperCase()
+        .replace("SM", "")
+        .replace("P", "")
+        .replace("+", "")
+        .trim();
+
+    const mixedFraction = clean.match(/^(\d+)\s+(\d+)\/(\d+)$/);
+
+    if (mixedFraction) {
+        const whole = Number(mixedFraction[1]);
+        const numerator = Number(mixedFraction[2]);
+        const denominator = Number(mixedFraction[3]);
+
+        return whole + numerator / denominator;
+    }
+
+    const fraction = clean.match(/^(\d+)\/(\d+)$/);
+
+    if (fraction) {
+        const numerator = Number(fraction[1]);
+        const denominator = Number(fraction[2]);
+
+        return numerator / denominator;
+    }
+
+    const numberValue = Number(clean);
+
+    return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function formatTafVisibility(value?: string | number | null) {
+    const visibility = parseTafVisibilitySm(value);
+
+    if (visibility === null) return "—";
+
+    if (visibility >= 6) return "6+ SM";
+
+    return `${visibility} SM`;
+}
+
+function formatTafWindShort(block: TafForecastBlock) {
+    if (!block.windSpeedKt) {
+        return "—";
+    }
+
+    const direction =
+        block.windDirection === "VRB"
+            ? "VRB"
+            : block.windDirection !== null && block.windDirection !== undefined
+                ? `${String(block.windDirection).padStart(3, "0")}°`
+                : "VRB";
+
+    return `${direction} ${block.windSpeedKt} kt`;
+}
+
+function parseTafDate(value: string | null) {
+    if (!value) return null;
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) return null;
+
+    return date;
+}
+
+function roundDownToUtcHour(date: Date) {
+    const rounded = new Date(date);
+
+    rounded.setUTCMinutes(0, 0, 0);
+
+    return rounded;
+}
+
+function isTafDaylight(date: Date, timeZone?: string | null) {
+    const hour = getHourInTimeZone(date, timeZone);
+
+    // Simple dashboard rule. Later we can replace this with actual sunrise/sunset.
+    return hour >= 6 && hour < 19;
+}
+
+function getHourInTimeZone(date: Date, timeZone?: string | null) {
+    try {
+        const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone: timeZone ?? undefined,
+            hour: "2-digit",
+            hourCycle: "h23",
+        }).formatToParts(date);
+
+        const hourPart = parts.find((part) => part.type === "hour");
+
+        return Number(hourPart?.value ?? date.getHours());
+    } catch {
+        return date.getHours();
+    }
+}
+
+function formatTafHourLabel(date: Date, timeZone?: string | null) {
+    try {
+        return {
+            dayLabel: new Intl.DateTimeFormat("en-US", {
+                timeZone: timeZone ?? undefined,
+                weekday: "short",
+            }).format(date),
+            hourLabel: new Intl.DateTimeFormat("en-US", {
+                timeZone: timeZone ?? undefined,
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+            }).format(date),
+        };
+    } catch {
+        return {
+            dayLabel: new Intl.DateTimeFormat("en-US", {
+                weekday: "short",
+            }).format(date),
+            hourLabel: new Intl.DateTimeFormat("en-US", {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+            }).format(date),
+        };
+    }
+}
+
+function TafDashboardTab({
+    station = "KFCM",
+    timeZone,
+}: {
+    station?: string;
+    timeZone?: string | null;
+}) {    const [taf, setTaf] = useState<TafResponse | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
 
@@ -846,16 +1434,7 @@ function TafDashboardTab({ station = "KFCM" }: { station?: string }) {
                 </div>
             </div>
 
-            {!taf.tafIsSameStation && (
-                <div className="rounded-xl border border-[#d6b35a]/40 bg-[#d6b35a]/10 p-4 text-sm text-[#f0d98a]">
-                    No TAF found for {taf.requestedStation}. Showing nearest
-                    available TAF from {taf.tafStation}
-                    {taf.distanceNm !== undefined
-                        ? `, ${taf.distanceNm} NM away`
-                        : ""}
-                    .
-                </div>
-            )}
+            <TafHourlyForecast taf={taf} timeZone={timeZone} />
 
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4">
                 <div className="mb-2 flex items-center justify-between gap-3">
@@ -872,56 +1451,6 @@ function TafDashboardTab({ station = "KFCM" }: { station?: string }) {
                     {taf.rawText}
                 </pre>
             </div>
-
-            {taf.forecast && taf.forecast.length > 0 && (
-                <div className="grid gap-3 md:grid-cols-2">
-                    {taf.forecast.map((block, index) => (
-                        <div
-                            key={`${block.change ?? "BASE"}-${block.from ?? index}`}
-                            className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4"
-                        >
-                            <div className="flex items-center justify-between gap-3">
-                                <h4 className="text-sm font-bold text-white">
-                                    {block.change ?? "BASE"}
-                                </h4>
-
-                                <p className="text-xs text-zinc-500">
-                                    {formatTafTime(block.from)} →{" "}
-                                    {formatTafTime(block.to)}
-                                </p>
-                            </div>
-
-                            <div className="mt-4 space-y-2 text-sm">
-                                <p className="text-zinc-300">
-                                    <span className="text-zinc-500">Wind:</span>{" "}
-                                    {formatTafWind(block)}
-                                </p>
-
-                                <p className="text-zinc-300">
-                                    <span className="text-zinc-500">
-                                        Visibility:
-                                    </span>{" "}
-                                    {block.visibilitySm ?? "Not reported"} SM
-                                </p>
-
-                                <p className="text-zinc-300">
-                                    <span className="text-zinc-500">
-                                        Weather:
-                                    </span>{" "}
-                                    {block.weather || "None reported"}
-                                </p>
-
-                                <p className="text-zinc-300">
-                                    <span className="text-zinc-500">
-                                        Clouds:
-                                    </span>{" "}
-                                    {formatSky(block.sky)}
-                                </p>
-                            </div>
-                        </div>
-                    ))}
-                </div>
-            )}
 
             <p className="text-xs leading-5 text-zinc-500">
                 TAFs are terminal forecasts for the reporting airport. When the
@@ -2554,19 +3083,9 @@ function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
                 })
             ) : (
                 <g>
-                    <image
-                        href="/icons/cloud.png"
-                        x="172"
-                        y="138"
-                        width="56"
-                        height="56"
-                        preserveAspectRatio="xMidYMid meet"
-                        opacity="0.35"
-                    />
-
                     <text
-                        x="200"
-                        y="210"
+                        x="170"
+                        y="200"
                         textAnchor="middle"
                         dominantBaseline="middle"
                         fill="#d4d4d8"
