@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
+import * as SunCalc from "suncalc";
 
 type ApiResponse = {
     raw?: string;
@@ -218,6 +219,17 @@ const TAF_ICON_SRC: Record<TafIconKey, string> = {
     freezing: "/icons/taf/snow.png",
 };
 
+type TafTimelineMarker = {
+    type: "sunrise" | "sunset" | "currencyStart" | "currencyEnd";
+    label: string;
+    time: Date;
+};
+
+type NightCurrencyWindow = {
+    start: Date;
+    end: Date;
+};
+
 type TafHourSlot = {
     startsAt: Date;
     block: TafForecastBlock;
@@ -229,6 +241,8 @@ type TafHourSlot = {
     wind: string;
     gusts: string;
     change: string;
+    markers: TafTimelineMarker[];
+    isNightCurrency: boolean;
 };
 
 export default function Home() {
@@ -660,6 +674,8 @@ function MetarDashboard({
                     <TafDashboardTab
                         station={metar.station}
                         timeZone={stationInfo?.timeZone}
+                        latitude={stationInfo?.latitude}
+                        longitude={stationInfo?.longitude}
                     />
                 )}
 
@@ -800,11 +816,21 @@ function formatSky(sky?: TafSkyCondition[]) {
 function TafHourlyForecast({
     taf,
     timeZone,
+    latitude,
+    longitude,
 }: {
     taf: TafResponse;
     timeZone?: string | null;
+    latitude?: number | null;
+    longitude?: number | null;
 }) {
-    const slots = buildTafHourlySlots(taf, timeZone).slice(0, 24);
+    const slots = buildTafHourlySlots(
+        taf,
+        timeZone,
+        latitude,
+        longitude
+    ).slice(0, 24);
+
     const scrollRef = useRef<HTMLDivElement | null>(null);
     const [isDragging, setIsDragging] = useState(false);
     const [startX, setStartX] = useState(0);
@@ -843,10 +869,10 @@ function TafHourlyForecast({
 
     function isCurrentTafHour(date: Date) {
         const now = new Date();
-        const start = roundDownToUtcHour(now);
-        const end = new Date(start.getTime() + 60 * 60 * 1000);
+        const currentHour = roundDownToUtcHour(now);
+        const nextHour = new Date(currentHour.getTime() + 60 * 60 * 1000);
 
-        return date >= start && date < end;
+        return date >= currentHour && date < nextHour;
     }
 
     return (
@@ -872,58 +898,92 @@ function TafHourlyForecast({
                             : hourLabel;
 
                     return (
-                        <article
+                        <div
                             key={slot.startsAt.toISOString()}
-                            className="w-[175px] shrink-0 rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
+                            className="flex h-[525px] w-[200px] shrink-0 flex-col"
                         >
-                            <div className="flex items-start justify-between gap-2">
-                                <div>
-                                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
-                                        {dayLabel}
-                                    </p>
-                                    <p className="mt-1 text-lg font-black text-white">
-                                        {displayHourLabel}
-                                    </p>
+                            <article className="flex h-[445px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg">
+                                <div className="flex items-start justify-between gap-2">
+                                    <div>
+                                        <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+                                            {dayLabel}
+                                        </p>
+                                        <p className="mt-1 text-lg font-black text-white">
+                                            {displayHourLabel}
+                                        </p>
+                                    </div>
+
+                                    <span
+                                        className={`rounded-full border px-2 py-1 text-[10px] font-black ${FLIGHT_CATEGORY_STYLES[slot.flightCategory]}`}
+                                    >
+                                        {slot.flightCategory}
+                                    </span>
                                 </div>
 
-                                <span
-                                    className={`rounded-full border px-2 py-1 text-[10px] font-black ${FLIGHT_CATEGORY_STYLES[slot.flightCategory]}`}
-                                >
-                                    {slot.flightCategory}
-                                </span>
-                            </div>
+                                <div className="mt-3 flex h-32 items-center justify-center">
+                                    <img
+                                        src={TAF_ICON_SRC[slot.iconKey]}
+                                        alt={slot.weatherLabel}
+                                        draggable={false}
+                                        onDragStart={(event) => event.preventDefault()}
+                                        className="pointer-events-none h-32 w-32 select-none object-contain drop-shadow-2xl"
+                                    />
+                                </div>
 
-                            <div className="mt-3 flex h-25 items-center justify-center">
-                                <img
-                                    src={TAF_ICON_SRC[slot.iconKey]}
-                                    alt={slot.weatherLabel}
-                                    draggable={false}
-                                    onDragStart={(event) => event.preventDefault()}
-                                    className="pointer-events-none h-50 w-50 select-none object-contain drop-shadow-2xl"
-                                />
-                            </div>
-
-                            <p className="mt-3 min-h-[40px] text-center text-sm font-semibold leading-5 text-white">
-                                {slot.weatherLabel}
-                            </p>
-
-                            {slot.change !== "BASE" && (
-                                <p className="mt-2 rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-2 py-1 text-center text-[10px] font-bold uppercase tracking-[0.12em] text-[#e6c76f]">
-                                    {slot.change}
+                                <p className="mt-3 min-h-[40px] text-center text-sm font-semibold leading-5 text-white">
+                                    {slot.weatherLabel}
                                 </p>
-                            )}
 
-                            <div className="mt-4 space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs">
-                                <TafHourRow label="Vis" value={slot.visibility} />
-                                <TafHourRow label="Ceil" value={slot.ceiling} />
-                                <TafHourRow label="Wind" value={slot.wind} />
-                                <TafHourRow label="Gust" value={slot.gusts} />
+                                <div className="mt-2 min-h-[26px]">
+                                    {slot.change !== "BASE" && (
+                                        <p className="rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-2 py-1 text-center text-[10px] font-bold uppercase tracking-[0.12em] text-[#e6c76f]">
+                                            {slot.change}
+                                        </p>
+                                    )}
+                                </div>
+
+                                <div className="mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs">                                    <TafHourRow label="Vis" value={slot.visibility} />
+                                    <TafHourRow label="Ceil" value={slot.ceiling} />
+                                    <TafHourRow label="Wind" value={slot.wind} />
+                                    <TafHourRow label="Gust" value={slot.gusts} />
+                                </div>
+                            </article>
+
+                            <div className="pointer-events-none mt-2 h-[72px] flex-none space-y-1 overflow-hidden">
+                                {slot.markers.map((marker) => (
+                                    <div
+                                        key={`${marker.type}-${marker.time.toISOString()}`}
+                                        className={`flex w-full items-center justify-between rounded-full border px-2 py-1 text-[10px] font-bold uppercase tracking-[0.1em] ${marker.type === "sunrise"
+                                                ? "border-amber-300/40 bg-amber-300/10 text-amber-200"
+                                                : marker.type === "sunset"
+                                                    ? "border-orange-400/40 bg-orange-400/10 text-orange-200"
+                                                    : "border-[#d6b35a]/40 bg-[#d6b35a]/10 text-[#e6c76f]"
+                                            }`}
+                                    >
+                                        <span>{marker.label}</span>
+                                        <span>{formatTafMarkerTime(marker.time, timeZone)}</span>
+                                    </div>
+                                ))}
+
+                                {slot.isNightCurrency && !hasNightCurrencyEdgeMarker(slot.markers) && (
+                                    <div className="w-full rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-2 py-1 text-center text-[10px] font-black uppercase tracking-[0.12em] text-[#e6c76f]">
+                                        Night Currency
+                                    </div>
+                                )}
                             </div>
-                        </article>
+                        </div>
                     );
                 })}
             </div>
         </div>
+    );
+}
+
+function hasNightCurrencyEdgeMarker(markers: TafTimelineMarker[]) {
+    return markers.some(
+        (marker) =>
+            marker.type === "currencyStart" ||
+            marker.type === "currencyEnd"
     );
 }
 
@@ -936,10 +996,139 @@ function TafHourRow({ label, value }: { label: string; value: string }) {
     );
 }
 
+function buildSunCurrencyData(
+    slots: TafHourSlot[],
+    latitude: number,
+    longitude: number
+): {
+    markers: TafTimelineMarker[];
+    windows: NightCurrencyWindow[];
+} {
+    if (slots.length === 0) {
+        return {
+            markers: [],
+            windows: [],
+        };
+    }
+
+    const timelineStart = slots[0].startsAt;
+    const timelineEnd = new Date(
+        slots[slots.length - 1].startsAt.getTime() + 60 * 60 * 1000
+    );
+
+    const markers: TafTimelineMarker[] = [];
+    const windows: NightCurrencyWindow[] = [];
+
+    const firstDay = new Date(
+        Date.UTC(
+            timelineStart.getUTCFullYear(),
+            timelineStart.getUTCMonth(),
+            timelineStart.getUTCDate() - 1,
+            12
+        )
+    );
+
+    for (let dayOffset = 0; dayOffset < 5; dayOffset += 1) {
+        const day = new Date(firstDay.getTime() + dayOffset * 24 * 60 * 60 * 1000);
+        const nextDay = new Date(day.getTime() + 24 * 60 * 60 * 1000);
+
+        const todayTimes = SunCalc.getTimes(day, latitude, longitude);
+        const tomorrowTimes = SunCalc.getTimes(nextDay, latitude, longitude);
+
+        const sunrise = todayTimes.sunrise;
+        const sunset = todayTimes.sunset;
+
+        if (isValidDate(sunrise)) {
+            markers.push({
+                type: "sunrise",
+                label: "Sun Up",
+                time: sunrise,
+            });
+        }
+
+        if (isValidDate(sunset)) {
+            markers.push({
+                type: "sunset",
+                label: "Sun Down",
+                time: sunset,
+            });
+        }
+
+        if (isValidDate(sunset) && isValidDate(tomorrowTimes.sunrise)) {
+            const currencyStart = new Date(sunset.getTime() + 60 * 60 * 1000);
+            const currencyEnd = new Date(
+                tomorrowTimes.sunrise.getTime() - 60 * 60 * 1000
+            );
+
+            windows.push({
+                start: currencyStart,
+                end: currencyEnd,
+            });
+
+            markers.push({
+                type: "currencyStart",
+                label: "Begin Night Currency",
+                time: currencyStart,
+            });
+
+            markers.push({
+                type: "currencyEnd",
+                label: "End Night Currency",
+                time: currencyEnd,
+            });
+        }
+    }
+
+    const uniqueMarkers = markers
+        .filter((marker) => marker.time >= timelineStart && marker.time < timelineEnd)
+        .filter(
+            (marker, index, array) =>
+                array.findIndex(
+                    (other) =>
+                        other.type === marker.type &&
+                        other.time.getTime() === marker.time.getTime()
+                ) === index
+        )
+        .sort((a, b) => a.time.getTime() - b.time.getTime());
+
+    const visibleWindows = windows.filter(
+        (window) => window.start < timelineEnd && window.end > timelineStart
+    );
+
+    return {
+        markers: uniqueMarkers,
+        windows: visibleWindows,
+    };
+}
+
+function isValidDate(value: Date) {
+    return value instanceof Date && !Number.isNaN(value.getTime());
+}
+
+function formatTafMarkerTime(date: Date, timeZone?: string | null) {
+    try {
+        return new Intl.DateTimeFormat("en-US", {
+            timeZone: timeZone ?? undefined,
+            hour: "numeric",
+            minute: "2-digit",
+            hour12: false,
+        }).format(date);
+    } catch {
+        return new Intl.DateTimeFormat("en-US", {
+            hour: "numeric",
+            minute: "2-digit",
+            hour12: false,
+        }).format(date);
+    }
+}
+
 function buildTafHourlySlots(
     taf: TafResponse,
-    timeZone?: string | null
+    timeZone?: string | null,
+    latitude?: number | null,
+    longitude?: number | null
 ): TafHourSlot[] {
+
     const forecastBlocks = taf.forecast ?? [];
 
     if (forecastBlocks.length === 0) {
@@ -964,8 +1153,10 @@ function buildTafHourlySlots(
         return [];
     }
 
-    const effectiveStart = now > startDate ? now : startDate;
-    const firstHour = roundDownToUtcHour(effectiveStart);
+    const currentHour = roundDownToUtcHour(now);
+    const tafStartHour = roundDownToUtcHour(startDate);
+
+    const firstHour = currentHour > tafStartHour ? currentHour : tafStartHour;
 
     const slots: TafHourSlot[] = [];
 
@@ -976,7 +1167,7 @@ function buildTafHourlySlots(
         const activeBlock =
             getActiveTafBlock(forecastBlocks, cursor) ?? forecastBlocks[0];
 
-        const isDay = isTafDaylight(cursor, timeZone);
+        const isDay = isTafDaylight(cursor, timeZone, latitude, longitude);
         const iconInfo = getTafIconInfo(activeBlock, isDay);
 
         slots.push({
@@ -990,13 +1181,36 @@ function buildTafHourlySlots(
             wind: formatTafWindShort(activeBlock),
             gusts: activeBlock.windGustKt ? `${activeBlock.windGustKt} kt` : "—",
             change: activeBlock.change ?? "BASE",
+            markers: [],
+            isNightCurrency: false,
         });
 
         cursor = new Date(cursor.getTime() + 60 * 60 * 1000);
         guard += 1;
     }
 
-    return slots;
+    const sunData =
+        typeof latitude === "number" && typeof longitude === "number"
+            ? buildSunCurrencyData(slots, latitude, longitude)
+            : null;
+
+    if (!sunData) {
+        return slots;
+    }
+
+    return slots.map((slot) => {
+        const slotEnd = new Date(slot.startsAt.getTime() + 60 * 60 * 1000);
+
+        return {
+            ...slot,
+            markers: sunData.markers.filter(
+                (marker) => marker.time >= slot.startsAt && marker.time < slotEnd
+            ),
+            isNightCurrency: sunData.windows.some(
+                (window) => slot.startsAt < window.end && slotEnd > window.start
+            ),
+        };
+    });
 }
 
 function getActiveTafBlock(
@@ -1271,13 +1485,24 @@ function roundDownToUtcHour(date: Date) {
     return rounded;
 }
 
-function isTafDaylight(date: Date, timeZone?: string | null) {
+function isTafDaylight(
+    date: Date,
+    timeZone?: string | null,
+    latitude?: number | null,
+    longitude?: number | null
+) {
+    if (typeof latitude === "number" && typeof longitude === "number") {
+        const times = SunCalc.getTimes(date, latitude, longitude);
+
+        if (isValidDate(times.sunrise) && isValidDate(times.sunset)) {
+            return date >= times.sunrise && date < times.sunset;
+        }
+    }
+
     const hour = getHourInTimeZone(date, timeZone);
 
-    // Simple dashboard rule. Later we can replace this with actual sunrise/sunset.
     return hour >= 6 && hour < 19;
 }
-
 function getHourInTimeZone(date: Date, timeZone?: string | null) {
     try {
         const parts = new Intl.DateTimeFormat("en-US", {
@@ -1325,10 +1550,15 @@ function formatTafHourLabel(date: Date, timeZone?: string | null) {
 function TafDashboardTab({
     station = "KFCM",
     timeZone,
+    latitude,
+    longitude,
 }: {
     station?: string;
     timeZone?: string | null;
-}) {    const [taf, setTaf] = useState<TafResponse | null>(null);
+    latitude?: number | null;
+    longitude?: number | null;
+}) {
+    const [taf, setTaf] = useState<TafResponse | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
 
@@ -1422,19 +1652,14 @@ function TafDashboardTab({
                             : ""}
                     </p>
                 </div>
-
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-4 py-3 text-sm">
-                    <p className="text-zinc-500">Valid Period</p>
-                    <p className="mt-1 font-semibold text-white">
-                        {formatTafTime(taf.validFrom)}
-                    </p>
-                    <p className="text-zinc-400">
-                        to {formatTafTime(taf.validTo)}
-                    </p>
-                </div>
             </div>
 
-            <TafHourlyForecast taf={taf} timeZone={timeZone} />
+            <TafHourlyForecast
+                taf={taf}
+                timeZone={timeZone}
+                latitude={latitude}
+                longitude={longitude}
+            />
 
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4">
                 <div className="mb-2 flex items-center justify-between gap-3">
