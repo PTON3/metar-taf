@@ -131,6 +131,38 @@ type WindDisplayMode = "animated" | "direction" | "hidden";
 type DecoderTab = "lookup" | "raw";
 type DashboardTab = "weather" | "taf" | "airport";
 
+type TafSkyCondition = {
+    cover?: string | null;
+    baseFtAgl?: number | null;
+};
+
+type TafForecastBlock = {
+    change?: string | null;
+    from?: string | null;
+    to?: string | null;
+    windDirection?: string | number | null;
+    windSpeedKt?: string | number | null;
+    windGustKt?: string | number | null;
+    visibilitySm?: string | number | null;
+    weather?: string | null;
+    sky?: TafSkyCondition[];
+};
+
+type TafResponse = {
+    requestedStation: string;
+    requestedAirport?: string;
+    tafStation: string;
+    tafIsSameStation: boolean;
+    distanceNm?: number;
+    distanceSm?: number;
+    issueTime?: string;
+    validFrom?: string;
+    validTo?: string;
+    rawText: string;
+    forecast?: TafForecastBlock[];
+};
+
+
 const KFCM_INFLIGHT_FEATURE: AirportMapFeature = {
     id: "inflight-aviation",
     label: "Inflight",
@@ -571,7 +603,7 @@ function MetarDashboard({
                     />
                 )}
 
-                {activeDashboardTab === "taf" && <TafDashboardTab />}
+                {activeDashboardTab === "taf" && <TafDashboardTab station={metar.station} />}
 
                 {activeDashboardTab === "airport" && (
                     <AirportInfoDashboardTab
@@ -657,19 +689,244 @@ function WeatherDashboardTab({
     );
 }
 
-function TafDashboardTab() {
+function formatTafTime(value?: string | null) {
+    if (!value) return "Not reported";
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) return value;
+
+    return new Intl.DateTimeFormat("en-US", {
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZoneName: "short",
+    }).format(date);
+}
+
+function formatTafWind(block: TafForecastBlock) {
+    const speed = block.windSpeedKt;
+
+    if (speed === null || speed === undefined || speed === "") {
+        return "Not reported";
+    }
+
+    const direction =
+        block.windDirection === "VRB"
+            ? "VRB"
+            : block.windDirection !== null && block.windDirection !== undefined
+                ? `${String(block.windDirection).padStart(3, "0")}°`
+                : "Variable";
+
+    const gust = block.windGustKt ? ` G${block.windGustKt}` : "";
+
+    return `${direction} at ${speed}${gust} kt`;
+}
+
+function formatSky(sky?: TafSkyCondition[]) {
+    if (!sky || sky.length === 0) return "Not reported";
+
+    return sky
+        .map((layer) => {
+            if (!layer.cover) return null;
+
+            if (!layer.baseFtAgl) return layer.cover;
+
+            return `${layer.cover}${layer.baseFtAgl} ft AGL`;
+        })
+        .filter(Boolean)
+        .join(", ");
+}
+
+function TafDashboardTab({ station = "KFCM" }: { station?: string }) {
+    const [taf, setTaf] = useState<TafResponse | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        const controller = new AbortController();
+
+        async function loadTaf() {
+            try {
+                setLoading(true);
+                setError(null);
+
+                const response = await fetch(
+                    `/api/taf?station=${encodeURIComponent(station)}`,
+                    { signal: controller.signal }
+                );
+
+                if (!response.ok) {
+                    throw new Error("Unable to load TAF data.");
+                }
+
+                const data = await response.json();
+                setTaf(data);
+            } catch (err) {
+                if (err instanceof DOMException && err.name === "AbortError") {
+                    return;
+                }
+
+                setError(
+                    err instanceof Error
+                        ? err.message
+                        : "Something went wrong loading the TAF."
+                );
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        loadTaf();
+
+        return () => controller.abort();
+    }, [station]);
+
+    if (loading) {
+        return (
+            <div className="rounded-2xl border border-zinc-800 bg-black/55 p-8 text-center">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    TAF
+                </p>
+                <h3 className="mt-2 text-2xl font-bold text-white">
+                    Loading Forecast
+                </h3>
+                <p className="mx-auto mt-3 max-w-2xl text-sm leading-6 text-zinc-400">
+                    Finding the closest available TAF station for {station}.
+                </p>
+            </div>
+        );
+    }
+
+    if (error || !taf) {
+        return (
+            <div className="rounded-2xl border border-red-900/60 bg-red-950/20 p-8 text-center">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-red-300">
+                    TAF
+                </p>
+                <h3 className="mt-2 text-2xl font-bold text-white">
+                    TAF Unavailable
+                </h3>
+                <p className="mx-auto mt-3 max-w-2xl text-sm leading-6 text-red-200">
+                    {error ?? "No TAF data was returned."}
+                </p>
+            </div>
+        );
+    }
+
     return (
-        <div className="rounded-2xl border border-dashed border-zinc-800 bg-black/55 p-8 text-center">
-            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                TAF
-            </p>
-            <h3 className="mt-2 text-2xl font-bold text-white">
-                TAF Decoder Coming Soon
-            </h3>
-            <p className="mx-auto mt-3 max-w-2xl text-sm leading-6 text-zinc-400">
-                This tab will eventually show a decoded TAF timeline, forecast
-                flight category changes, forecast winds, ceiling and visibility
-                changes, and temporary/probability groups.
+        <div className="space-y-4 rounded-2xl border border-zinc-800 bg-black/55 p-6">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                        TAF
+                    </p>
+
+                    <h3 className="mt-2 text-2xl font-bold text-white">
+                        {taf.tafStation} Forecast
+                    </h3>
+
+                    <p className="mt-1 text-sm text-zinc-400">
+                        Requested airport: {taf.requestedStation}
+                        {taf.requestedAirport
+                            ? ` — ${taf.requestedAirport}`
+                            : ""}
+                    </p>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-4 py-3 text-sm">
+                    <p className="text-zinc-500">Valid Period</p>
+                    <p className="mt-1 font-semibold text-white">
+                        {formatTafTime(taf.validFrom)}
+                    </p>
+                    <p className="text-zinc-400">
+                        to {formatTafTime(taf.validTo)}
+                    </p>
+                </div>
+            </div>
+
+            {!taf.tafIsSameStation && (
+                <div className="rounded-xl border border-[#d6b35a]/40 bg-[#d6b35a]/10 p-4 text-sm text-[#f0d98a]">
+                    No TAF found for {taf.requestedStation}. Showing nearest
+                    available TAF from {taf.tafStation}
+                    {taf.distanceNm !== undefined
+                        ? `, ${taf.distanceNm} NM away`
+                        : ""}
+                    .
+                </div>
+            )}
+
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                    <h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-zinc-300">
+                        Raw TAF
+                    </h4>
+
+                    <p className="text-xs text-zinc-500">
+                        Issued {formatTafTime(taf.issueTime)}
+                    </p>
+                </div>
+
+                <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-6 text-zinc-100">
+                    {taf.rawText}
+                </pre>
+            </div>
+
+            {taf.forecast && taf.forecast.length > 0 && (
+                <div className="grid gap-3 md:grid-cols-2">
+                    {taf.forecast.map((block, index) => (
+                        <div
+                            key={`${block.change ?? "BASE"}-${block.from ?? index}`}
+                            className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4"
+                        >
+                            <div className="flex items-center justify-between gap-3">
+                                <h4 className="text-sm font-bold text-white">
+                                    {block.change ?? "BASE"}
+                                </h4>
+
+                                <p className="text-xs text-zinc-500">
+                                    {formatTafTime(block.from)} →{" "}
+                                    {formatTafTime(block.to)}
+                                </p>
+                            </div>
+
+                            <div className="mt-4 space-y-2 text-sm">
+                                <p className="text-zinc-300">
+                                    <span className="text-zinc-500">Wind:</span>{" "}
+                                    {formatTafWind(block)}
+                                </p>
+
+                                <p className="text-zinc-300">
+                                    <span className="text-zinc-500">
+                                        Visibility:
+                                    </span>{" "}
+                                    {block.visibilitySm ?? "Not reported"} SM
+                                </p>
+
+                                <p className="text-zinc-300">
+                                    <span className="text-zinc-500">
+                                        Weather:
+                                    </span>{" "}
+                                    {block.weather || "None reported"}
+                                </p>
+
+                                <p className="text-zinc-300">
+                                    <span className="text-zinc-500">
+                                        Clouds:
+                                    </span>{" "}
+                                    {formatSky(block.sky)}
+                                </p>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            <p className="text-xs leading-5 text-zinc-500">
+                TAFs are terminal forecasts for the reporting airport. When the
+                requested airport does not publish a TAF, this dashboard shows
+                the closest available TAF station.
             </p>
         </div>
     );
