@@ -219,6 +219,11 @@ const TAF_ICON_SRC: Record<TafIconKey, string> = {
     freezing: "/icons/taf/snow.png",
 };
 
+const TAF_MARKER_ICON_SRC = {
+    sunrise: "/icons/sunrise.png",
+    sunset: "/icons/sunset.png",
+};
+
 type TafTimelineMarker = {
     type: "sunrise" | "sunset" | "currencyStart" | "currencyEnd";
     label: string;
@@ -418,7 +423,7 @@ export default function Home() {
             if (latestActiveTabRef.current === "lookup") {
                 void fetchLiveMetar(latestStationRef.current);
             }
-        }, 5 * 60 * 1000);
+        }, 2 * 60 * 1000);
 
         return () => window.clearInterval(refreshTimer);
 
@@ -574,6 +579,14 @@ function MetarDashboard({
     const [activeDashboardTab, setActiveDashboardTab] =
         useState<DashboardTab>("weather");
 
+    const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
+    const fullscreenRef = useRef<HTMLDivElement | null>(null);
+
+    const [fullscreenScale, setFullscreenScale] = useState(1);
+    const [fullscreenCanvasHeight, setFullscreenCanvasHeight] = useState(1080);
+
+    const FULLSCREEN_BASE_WIDTH = 1920;
+
     const categoryStyle = FLIGHT_CATEGORY_STYLES[metar.flightCategory];
 
     useEffect(() => {
@@ -584,110 +597,290 @@ function MetarDashboard({
         return () => window.clearInterval(timer);
     }, []);
 
+    useEffect(() => {
+        if (!isFullscreenOpen) return;
+
+        const frame = window.requestAnimationFrame(() => {
+            void fullscreenRef.current?.requestFullscreen?.().catch(() => {
+                // Browser fullscreen can fail if blocked, but fixed overlay still works.
+            });
+        });
+
+        function handleFullscreenChange() {
+            if (!document.fullscreenElement) {
+                setIsFullscreenOpen(false);
+            }
+        }
+
+        document.addEventListener("fullscreenchange", handleFullscreenChange);
+
+        return () => {
+            window.cancelAnimationFrame(frame);
+            document.removeEventListener("fullscreenchange", handleFullscreenChange);
+        };
+    }, [isFullscreenOpen]);
+
+    useEffect(() => {
+        if (!isFullscreenOpen) return;
+
+        function updateFullscreenScale() {
+            const widthScale = window.innerWidth / FULLSCREEN_BASE_WIDTH;
+
+            setFullscreenScale(widthScale);
+            setFullscreenCanvasHeight(window.innerHeight / widthScale);
+        }
+
+        updateFullscreenScale();
+
+        window.addEventListener("resize", updateFullscreenScale);
+
+        return () => {
+            window.removeEventListener("resize", updateFullscreenScale);
+        };
+    }, [isFullscreenOpen]);
+
+    async function closeFullscreenDashboard() {
+        if (document.fullscreenElement) {
+            await document.exitFullscreen().catch(() => { });
+        }
+
+        setIsFullscreenOpen(false);
+    }
+
     return (
-        <section className="mt-8 overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 shadow-2xl">
-            <div className="border-b border-zinc-800 bg-gradient-to-r from-black via-zinc-950 to-[#171307] p-6">
-                <div className="flex flex-col gap-4">
-                    <div>
-                        <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#d6b35a]">
-                            Decoded Airport Weather
-                        </p>
+        <>
+            <section className="mt-8 overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 shadow-2xl">
+                <div className="border-b border-zinc-800 bg-gradient-to-r from-black via-zinc-950 to-[#171307] p-6">
+                    <div className="flex flex-col gap-4">
+                        <div>
+                            <div className="flex items-center justify-between gap-3">
+                                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#d6b35a]">
+                                    Decoded Airport Weather
+                                </p>
 
-                        <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                            <div>
-                                <h2 className="text-3xl font-bold text-white md:text-4xl">
-                                    {stationInfo?.displayName ??
-                                        metar.station ??
-                                        "Unknown Station"}
-                                </h2>
-
-                                {stationInfo && (
-                                    <p className="mt-2 text-sm text-zinc-400">
-                                        {stationInfo.displayLocation}
-                                        {stationInfo.elevationFt !== null
-                                            ? ` | Elev. ${stationInfo.elevationFt.toLocaleString()} ft`
-                                            : ""}
-                                        {stationInfo.timeZone
-                                            ? ` | ${stationInfo.timeZone}`
-                                            : ""}
-                                    </p>
-                                )}
+                                <button
+                                    type="button"
+                                    onClick={() => setIsFullscreenOpen(true)}
+                                    aria-label="Open fullscreen weather dashboard"
+                                    title="Fullscreen"
+                                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-700 bg-black/70 text-zinc-300 transition hover:border-[#d6b35a]/50 hover:bg-[#d6b35a]/10 hover:text-[#e6c76f]"
+                                >
+                                    <svg
+                                        viewBox="0 0 24 24"
+                                        className="h-4 w-4"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        strokeWidth="2.2"
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                    >
+                                        <path d="M8 3H3v5" />
+                                        <path d="M3 3l6.5 6.5" />
+                                        <path d="M16 3h5v5" />
+                                        <path d="M21 3l-6.5 6.5" />
+                                        <path d="M8 21H3v-5" />
+                                        <path d="M3 21l6.5-6.5" />
+                                        <path d="M16 21h5v-5" />
+                                        <path d="M21 21l-6.5-6.5" />
+                                    </svg>
+                                </button>
                             </div>
 
-                            <ObservationTimeBubble
-                                metar={metar}
-                                now={now}
-                                stationInfo={stationInfo}
-                            />
+                            <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                                <div>
+                                    <h2 className="text-3xl font-bold text-white md:text-4xl">
+                                        {stationInfo?.displayName ??
+                                            metar.station ??
+                                            "Unknown Station"}
+                                    </h2>
+
+                                    {stationInfo && (
+                                        <p className="mt-2 text-sm text-zinc-400">
+                                            {stationInfo.displayLocation}
+                                            {stationInfo.elevationFt !== null
+                                                ? ` | Elev. ${stationInfo.elevationFt.toLocaleString()} ft`
+                                                : ""}
+                                            {stationInfo.timeZone
+                                                ? ` | ${stationInfo.timeZone}`
+                                                : ""}
+                                        </p>
+                                    )}
+                                </div>
+
+                                <ObservationTimeBubble
+                                    metar={metar}
+                                    now={now}
+                                    stationInfo={stationInfo}
+                                />
+                            </div>
+                        </div>
+
+                        <div
+                            className={`rounded-2xl border px-5 py-3 text-center ${categoryStyle}`}
+                        >
+                            <p className="text-xs font-semibold uppercase tracking-[0.2em]">
+                                Flight Category
+                            </p>
+                            <p className="mt-1 text-3xl font-black">
+                                {metar.flightCategory}
+                            </p>
+                            <p className="mt-1 text-sm">
+                                {getFlightCategoryDescription(metar)}
+                            </p>
+                        </div>
+
+                        <div className="mt-2 flex rounded-2xl border border-zinc-800 bg-black p-1">
+                            <DashboardTabButton
+                                active={activeDashboardTab === "weather"}
+                                onClick={() => setActiveDashboardTab("weather")}
+                            >
+                                METAR
+                            </DashboardTabButton>
+
+                            <DashboardTabButton
+                                active={activeDashboardTab === "taf"}
+                                onClick={() => setActiveDashboardTab("taf")}
+                            >
+                                TAF
+                            </DashboardTabButton>
+
+                            <DashboardTabButton
+                                active={activeDashboardTab === "airport"}
+                                onClick={() => setActiveDashboardTab("airport")}
+                            >
+                                Airport Info
+                            </DashboardTabButton>
                         </div>
                     </div>
+                </div>
 
-                    <div
-                        className={`rounded-2xl border px-5 py-3 text-center ${categoryStyle}`}
-                    >
-                        <p className="text-xs font-semibold uppercase tracking-[0.2em]">
-                            Flight Category
-                        </p>
-                        <p className="mt-1 text-3xl font-black">
-                            {metar.flightCategory}
-                        </p>
-                        <p className="mt-1 text-sm">
-                            {getFlightCategoryDescription(metar)}
-                        </p>
-                    </div>
+                <div className="p-6">
+                    {activeDashboardTab === "weather" && (
+                        <WeatherDashboardTab
+                            metar={metar}
+                            rawMetar={rawMetar}
+                            runways={runways}
+                        />
+                    )}
 
-                    <div className="mt-2 flex rounded-2xl border border-zinc-800 bg-black p-1">
-                        <DashboardTabButton
-                            active={activeDashboardTab === "weather"}
-                            onClick={() => setActiveDashboardTab("weather")}
+                    {activeDashboardTab === "taf" && (
+                        <TafDashboardTab
+                            station={metar.station}
+                            timeZone={stationInfo?.timeZone}
+                            latitude={stationInfo?.latitude}
+                            longitude={stationInfo?.longitude}
+                        />
+                    )}
+
+                    {activeDashboardTab === "airport" && (
+                        <AirportInfoDashboardTab
+                            stationInfo={stationInfo}
+                            airportDiagram={airportDiagram}
+                            runways={runways}
+                        />
+                    )}
+                </div>
+            </section>
+
+            {isFullscreenOpen && (
+                <div
+                    ref={fullscreenRef}
+                    className="fixed inset-0 z-50 overflow-hidden bg-[#050505] text-zinc-100"
+                >
+                    <div className="flex h-screen w-screen items-start justify-center">
+                        <div
+                            style={{
+                                width: `${FULLSCREEN_BASE_WIDTH}px`,
+                                height: `${fullscreenCanvasHeight}px`,
+                                transform: `scale(${fullscreenScale})`,
+                                transformOrigin: "top center",
+                            }}
+                            className="flex flex-col gap-3 px-5 py-4"
                         >
-                            METAR
-                        </DashboardTabButton>
+                            <div className="h-[120px] flex-none rounded-3xl border border-zinc-800 bg-gradient-to-r from-black via-zinc-950 to-[#171307] p-4 shadow-2xl">
+                                <div
+                                    style={{
+                                        gridTemplateColumns: "minmax(0, 560px) minmax(0, 1fr) auto",
+                                    }}
+                                    className="grid h-full items-center gap-6"
+                                >
+                                    <div className="min-w-0">
+                                        <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#d6b35a]">
+                                            Fullscreen Weather
+                                        </p>
 
-                        <DashboardTabButton
-                            active={activeDashboardTab === "taf"}
-                            onClick={() => setActiveDashboardTab("taf")}
-                        >
-                            TAF
-                        </DashboardTabButton>
+                                        <div className="mt-1 min-w-0">
+                                            <h2 className="truncate text-3xl font-black leading-tight text-white md:text-4xl">
+                                                {stationInfo?.displayName ??
+                                                    metar.station ??
+                                                    "Unknown Station"}
+                                            </h2>
 
-                        <DashboardTabButton
-                            active={activeDashboardTab === "airport"}
-                            onClick={() => setActiveDashboardTab("airport")}
-                        >
-                            Airport Info
-                        </DashboardTabButton>
+                                            {stationInfo && (
+                                                <p className="mt-1 truncate text-sm text-zinc-400">
+                                                    {stationInfo.displayLocation}
+                                                    {stationInfo.elevationFt !== null
+                                                        ? ` | Elev. ${stationInfo.elevationFt.toLocaleString()} ft`
+                                                        : ""}
+                                                    {stationInfo.timeZone
+                                                        ? ` | ${stationInfo.timeZone}`
+                                                        : ""}
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    <div
+                                        style={{ width: "calc(100% - 48px)" }}
+                                        className={`h-[78px] min-w-0 justify-self-start rounded-2xl border px-7 py-3 text-center ${categoryStyle}`}
+                                    >
+                                        <p className="text-3xl font-black leading-none">
+                                            {metar.flightCategory}
+                                        </p>
+
+                                        <p className="mt-2 text-sm font-semibold">
+                                            {getFlightCategoryDescription(metar)}
+                                        </p>
+                                    </div>
+
+                                    <div className="flex shrink-0 items-center gap-3">
+                                        <ObservationTimeBubble
+                                            metar={metar}
+                                            now={now}
+                                            stationInfo={stationInfo}
+                                        />
+
+                                        <button
+                                            type="button"
+                                            onClick={closeFullscreenDashboard}
+                                            className="rounded-full border border-zinc-700 bg-black/70 px-4 py-2 text-[11px] font-black uppercase tracking-[0.16em] text-zinc-200 transition hover:border-[#d6b35a]/50 hover:text-[#e6c76f]"
+                                        >
+                                            Exit
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="min-h-0 flex-1 overflow-hidden">
+                                <RunwayWindWidget metar={metar} runways={runways} fullscreen />
+                            </div>
+
+                            <div className="h-[465px] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-4 shadow-2xl">
+                                <div className="flex h-full w-full flex-col justify-end">
+                                    <TafDashboardTab
+                                        station={metar.station}
+                                        timeZone={stationInfo?.timeZone}
+                                        latitude={stationInfo?.latitude}
+                                        longitude={stationInfo?.longitude}
+                                        hourlyOnly
+                                    />
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
-            </div>
-
-            <div className="p-6">
-                {activeDashboardTab === "weather" && (
-                    <WeatherDashboardTab
-                        metar={metar}
-                        rawMetar={rawMetar}
-                        runways={runways}
-                    />
-                )}
-
-                {activeDashboardTab === "taf" && (
-                    <TafDashboardTab
-                        station={metar.station}
-                        timeZone={stationInfo?.timeZone}
-                        latitude={stationInfo?.latitude}
-                        longitude={stationInfo?.longitude}
-                    />
-                )}
-
-                {activeDashboardTab === "airport" && (
-                    <AirportInfoDashboardTab
-                        stationInfo={stationInfo}
-                        airportDiagram={airportDiagram}
-                        runways={runways}
-                    />
-                )}
-            </div>
-        </section>
+            )}
+        </>
     );
 }
 
@@ -867,6 +1060,30 @@ function TafHourlyForecast({
         setIsDragging(false);
     }
 
+    function handleWheel(event: React.WheelEvent<HTMLDivElement>) {
+        const slider = scrollRef.current;
+        if (!slider || event.ctrlKey) return;
+
+        const absX = Math.abs(event.deltaX);
+        const absY = Math.abs(event.deltaY);
+
+        const HORIZONTAL_THRESHOLD = 12;
+        const HORIZONTAL_DOMINANCE = 1.35;
+        const SCROLL_SENSITIVITY = 0.65;
+
+        const isIntentionalHorizontalScroll =
+            absX > HORIZONTAL_THRESHOLD && absX > absY * HORIZONTAL_DOMINANCE;
+
+        // If the user is mostly scrolling vertically, let the page scroll past the TAF.
+        if (!isIntentionalHorizontalScroll) {
+            return;
+        }
+
+        event.preventDefault();
+
+        slider.scrollLeft += event.deltaX * SCROLL_SENSITIVITY;
+    }
+
     function isCurrentTafHour(date: Date) {
         const now = new Date();
         const currentHour = roundDownToUtcHour(now);
@@ -882,8 +1099,9 @@ function TafHourlyForecast({
             onMouseMove={handleMouseMove}
             onMouseUp={stopDragging}
             onMouseLeave={stopDragging}
-            className={`scrollbar-hide mt-2 overflow-x-auto pb-2 select-none ${isDragging ? "cursor-grabbing" : "cursor-grab"
-                }`}
+            onWheel={handleWheel}
+            style={{ touchAction: "pan-x" }}
+            className={`scrollbar-hide mt-0 overflow-x-auto overflow-y-hidden pb-0 select-none ${isDragging ? "cursor-grabbing" : "cursor-grab"}`}
         >
             <div className="flex min-w-max gap-3">
                 {slots.map((slot, index) => {
@@ -900,9 +1118,9 @@ function TafHourlyForecast({
                     return (
                         <div
                             key={slot.startsAt.toISOString()}
-                            className="flex h-[525px] w-[200px] shrink-0 flex-col"
+                            className="flex h-[440px] w-[155px] shrink-0 flex-col"
                         >
-                            <article className="flex h-[445px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg">
+                            <article className="flex h-[400px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg">
                                 <div className="flex items-start justify-between gap-2">
                                     <div>
                                         <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
@@ -920,7 +1138,7 @@ function TafHourlyForecast({
                                     </span>
                                 </div>
 
-                                <div className="mt-3 flex h-32 items-center justify-center">
+                                <div className="mt-0 flex h-30 items-center justify-center">
                                     <img
                                         src={TAF_ICON_SRC[slot.iconKey]}
                                         alt={slot.weatherLabel}
@@ -930,11 +1148,11 @@ function TafHourlyForecast({
                                     />
                                 </div>
 
-                                <p className="mt-3 min-h-[40px] text-center text-sm font-semibold leading-5 text-white">
+                                <p className=" min-h-[20px] text-center text-sm font-semibold leading-5 text-white">
                                     {slot.weatherLabel}
                                 </p>
 
-                                <div className="mt-2 min-h-[26px]">
+                                <div className="mt-1 min-h-[30px]">
                                     {slot.change !== "BASE" && (
                                         <p className="rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-2 py-1 text-center text-[10px] font-bold uppercase tracking-[0.12em] text-[#e6c76f]">
                                             {slot.change}
@@ -942,28 +1160,54 @@ function TafHourlyForecast({
                                     )}
                                 </div>
 
-                                <div className="mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs">                                    <TafHourRow label="Vis" value={slot.visibility} />
+                                <div className="mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs">
+                                    <TafHourRow label="Vis" value={slot.visibility} />
                                     <TafHourRow label="Ceil" value={slot.ceiling} />
                                     <TafHourRow label="Wind" value={slot.wind} />
                                     <TafHourRow label="Gust" value={slot.gusts} />
                                 </div>
                             </article>
 
-                            <div className="pointer-events-none mt-2 h-[72px] flex-none space-y-1 overflow-hidden">
-                                {slot.markers.map((marker) => (
-                                    <div
-                                        key={`${marker.type}-${marker.time.toISOString()}`}
-                                        className={`flex w-full items-center justify-between rounded-full border px-2 py-1 text-[10px] font-bold uppercase tracking-[0.1em] ${marker.type === "sunrise"
-                                                ? "border-amber-300/40 bg-amber-300/10 text-amber-200"
-                                                : marker.type === "sunset"
-                                                    ? "border-orange-400/40 bg-orange-400/10 text-orange-200"
-                                                    : "border-[#d6b35a]/40 bg-[#d6b35a]/10 text-[#e6c76f]"
-                                            }`}
-                                    >
-                                        <span>{marker.label}</span>
-                                        <span>{formatTafMarkerTime(marker.time, timeZone)}</span>
-                                    </div>
-                                ))}
+                            <div className="pointer-events-none mt-1 h-[40px] flex-none space-y-1 overflow-hidden">
+                                {slot.markers.map((marker) => {
+                                    const isSunMarker =
+                                        marker.type === "sunrise" || marker.type === "sunset";
+
+                                    if (isSunMarker) {
+                                        return (
+                                            <div
+                                                key={`${marker.type}-${marker.time.toISOString()}`}
+                                                className="flex w-full items-center justify-center gap-2 text-xs font-black text-[#f2d675]"
+                                            >
+                                                <img
+                                                    src={
+                                                        marker.type === "sunrise"
+                                                            ? TAF_MARKER_ICON_SRC.sunrise
+                                                            : TAF_MARKER_ICON_SRC.sunset
+                                                    }
+                                                    alt={marker.label}
+                                                    draggable={false}
+                                                    onDragStart={(event) => event.preventDefault()}
+                                                    className="pointer-events-none h-10 w-10 select-none object-contain drop-shadow-lg"
+                                                />
+
+                                                <span className="-ml-1">
+                                                    {formatTafMarkerTime(marker.time, timeZone)}
+                                                </span>
+                                            </div>
+                                        );
+                                    }
+
+                                    return (
+                                        <div
+                                            key={`${marker.type}-${marker.time.toISOString()}`}
+                                            className="flex w-full items-center justify-between rounded-full border border-[#d6b35a]/40 bg-[#d6b35a]/10 px-4 py-1 text-[10px] font-bold uppercase tracking-[0.1em] text-[#e6c76f]"
+                                        >
+                                            <span>{marker.label}</span>
+                                            <span>{formatTafMarkerTime(marker.time, timeZone)}</span>
+                                        </div>
+                                    );
+                                })}
 
                                 {slot.isNightCurrency && !hasNightCurrencyEdgeMarker(slot.markers) && (
                                     <div className="w-full rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-2 py-1 text-center text-[10px] font-black uppercase tracking-[0.12em] text-[#e6c76f]">
@@ -1067,13 +1311,13 @@ function buildSunCurrencyData(
 
             markers.push({
                 type: "currencyStart",
-                label: "Begin Night Currency",
+                label: "Begin Night",
                 time: currencyStart,
             });
 
             markers.push({
                 type: "currencyEnd",
-                label: "End Night Currency",
+                label: "End Night",
                 time: currencyEnd,
             });
         }
@@ -1167,7 +1411,7 @@ function buildTafHourlySlots(
         const activeBlock =
             getActiveTafBlock(forecastBlocks, cursor) ?? forecastBlocks[0];
 
-        const isDay = isTafDaylight(cursor, timeZone, latitude, longitude);
+        const isDay = isTafDayIconForHour(cursor, timeZone, latitude, longitude);
         const iconInfo = getTafIconInfo(activeBlock, isDay);
 
         slots.push({
@@ -1485,24 +1729,92 @@ function roundDownToUtcHour(date: Date) {
     return rounded;
 }
 
-function isTafDaylight(
-    date: Date,
+function isTafDayIconForHour(
+    hourStart: Date,
     timeZone?: string | null,
     latitude?: number | null,
     longitude?: number | null
 ) {
+    const hourEnd = new Date(hourStart.getTime() + 60 * 60 * 1000);
+
     if (typeof latitude === "number" && typeof longitude === "number") {
-        const times = SunCalc.getTimes(date, latitude, longitude);
+        const times = getSunTimesForLocalDay(
+            hourStart,
+            timeZone,
+            latitude,
+            longitude
+        );
 
         if (isValidDate(times.sunrise) && isValidDate(times.sunset)) {
-            return date >= times.sunrise && date < times.sunset;
+            const sunrise = times.sunrise;
+            const sunset = times.sunset;
+
+            // Hour containing sunrise uses day icon.
+            if (hourStart <= sunrise && sunrise < hourEnd) {
+                return true;
+            }
+
+            // Hour containing sunset uses night icon.
+            if (hourStart <= sunset && sunset < hourEnd) {
+                return false;
+            }
+
+            // Otherwise, normal daylight window.
+            return hourStart >= sunrise && hourStart < sunset;
         }
     }
 
-    const hour = getHourInTimeZone(date, timeZone);
-
+    const hour = getHourInTimeZone(hourStart, timeZone);
     return hour >= 6 && hour < 19;
 }
+
+function getSunTimesForLocalDay(
+    date: Date,
+    timeZone: string | null | undefined,
+    latitude: number,
+    longitude: number
+) {
+    const localParts = getLocalDateParts(date, timeZone);
+
+    // Use noon UTC for the airport's local calendar date.
+    // This prevents evening local times from rolling into the next UTC day.
+    const localDayAnchor = new Date(
+        Date.UTC(
+            localParts.year,
+            localParts.month - 1,
+            localParts.day,
+            12,
+            0,
+            0
+        )
+    );
+
+    return SunCalc.getTimes(localDayAnchor, latitude, longitude);
+}
+
+function getLocalDateParts(date: Date, timeZone?: string | null) {
+    try {
+        const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone: timeZone ?? undefined,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+        }).formatToParts(date);
+
+        const year = Number(parts.find((part) => part.type === "year")?.value);
+        const month = Number(parts.find((part) => part.type === "month")?.value);
+        const day = Number(parts.find((part) => part.type === "day")?.value);
+
+        return { year, month, day };
+    } catch {
+        return {
+            year: date.getFullYear(),
+            month: date.getMonth() + 1,
+            day: date.getDate(),
+        };
+    }
+}
+
 function getHourInTimeZone(date: Date, timeZone?: string | null) {
     try {
         const parts = new Intl.DateTimeFormat("en-US", {
@@ -1552,11 +1864,13 @@ function TafDashboardTab({
     timeZone,
     latitude,
     longitude,
+    hourlyOnly = false,
 }: {
     station?: string;
     timeZone?: string | null;
     latitude?: number | null;
     longitude?: number | null;
+    hourlyOnly?: boolean;
 }) {
     const [taf, setTaf] = useState<TafResponse | null>(null);
     const [loading, setLoading] = useState(true);
@@ -1630,6 +1944,17 @@ function TafDashboardTab({
                     {error ?? "No TAF data was returned."}
                 </p>
             </div>
+        );
+    }
+
+    if (hourlyOnly) {
+        return (
+            <TafHourlyForecast
+                taf={taf}
+                timeZone={timeZone}
+                latitude={latitude}
+                longitude={longitude}
+            />
         );
     }
 
@@ -2291,9 +2616,11 @@ function WeatherCard({
 function RunwayWindWidget({
     metar,
     runways,
+    fullscreen = false,
 }: {
     metar: NormalizedMetar;
     runways: AirportRunway[];
+    fullscreen?: boolean;
 }) {
     const [selectedEnd, setSelectedEnd] = useState<RunwayEnd | null>(null);
 
@@ -2367,39 +2694,99 @@ function RunwayWindWidget({
     const compassRotation = selectedEnd?.headingDeg ?? 0;
 
     return (
-        <div className="mb-6 rounded-2xl border border-[#d6b35a]/25 bg-black/55 p-5">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-                <div>
-                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                        Visual Decoder
-                    </p>
-                    <p className="mt-2 text-sm leading-6 text-zinc-400">
-                        Select a runway on the graphic to rotate into that runway’s point of view.
-                    </p>
+        <div
+            className={
+                fullscreen
+                    ? "relative h-full min-h-0 overflow-hidden rounded-3xl border border-[#d6b35a]/25 bg-black/55 p-2"
+                    : "mb-6 rounded-2xl border border-[#d6b35a]/25 bg-black/55 p-5"
+            }
+        >
+            {!fullscreen && (
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                    <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                            Visual Decoder
+                        </p>
+                        <p className="mt-2 text-sm leading-6 text-zinc-400">
+                            Select a runway on the graphic to rotate into that runway’s point of view.
+                        </p>
+                    </div>
                 </div>
-            </div>
+            )}
 
-            <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-2">
-                <div className="min-w-0">
-                    <RunwayCompassSvg
-                        runways={runways}
-                        runwayEnds={calculatedEnds}
-                        selectedEnd={selectedEnd}
-                        bestRunwayIdent={bestRunway?.ident ?? null}
-                        activeRunway={activeRunway}
-                        windDirectionDeg={windDirectionDeg}
-                        windSpeedKt={windSpeedKt}
-                        compassRotation={compassRotation}
-                        showResetButton={selectedEnd !== null}
-                        onResetNorthUp={() => setSelectedEnd(null)}
-                        onSelectEnd={setSelectedEnd}
-                    />
-                </div>
+            {fullscreen ? (
+                <>
+                    <div
+                        style={{
+                            position: "absolute",
+                            top: "8px",
+                            bottom: "8px",
+                            left: "8px",
+                            width: "calc(50% - 12px)",
+                            overflow: "hidden",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                        }}
+                    >
+                        <RunwayCompassSvg
+                            runways={runways}
+                            runwayEnds={calculatedEnds}
+                            selectedEnd={selectedEnd}
+                            bestRunwayIdent={bestRunway?.ident ?? null}
+                            activeRunway={activeRunway}
+                            windDirectionDeg={windDirectionDeg}
+                            windSpeedKt={windSpeedKt}
+                            compassRotation={compassRotation}
+                            showResetButton={selectedEnd !== null}
+                            onResetNorthUp={() => setSelectedEnd(null)}
+                            onSelectEnd={setSelectedEnd}
+                            fullscreen
+                        />
+                    </div>
 
-                <div className="min-w-0">
-                    <CloudCeilingPreviewSvg metar={metar} />
+                    <div
+                        style={{
+                            position: "absolute",
+                            top: "8px",
+                            bottom: "8px",
+                            right: "8px",
+                            width: "calc(50% - 12px)",
+                            overflow: "hidden",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                        }}
+                    >
+                        <CloudCeilingPreviewSvg
+                            metar={metar}
+                            fullscreen
+                        />
+                    </div>
+                </>
+            ) : (
+                <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-2">
+                    <div className="min-w-0">
+                        <RunwayCompassSvg
+                            runways={runways}
+                            runwayEnds={calculatedEnds}
+                            selectedEnd={selectedEnd}
+                            bestRunwayIdent={bestRunway?.ident ?? null}
+                            activeRunway={activeRunway}
+                            windDirectionDeg={windDirectionDeg}
+                            windSpeedKt={windSpeedKt}
+                            compassRotation={compassRotation}
+                            showResetButton={selectedEnd !== null}
+                            onResetNorthUp={() => setSelectedEnd(null)}
+                            onSelectEnd={setSelectedEnd}
+                        />
+                    </div>
+
+                    <div className="min-w-0">
+                        <CloudCeilingPreviewSvg metar={metar} />
+                    </div>
                 </div>
-            </div>
+            )}
         </div>
     );
 }
@@ -2416,6 +2803,7 @@ function RunwayCompassSvg({
     showResetButton,
     onResetNorthUp,
     onSelectEnd,
+    fullscreen = false,
 }: {
     runways: AirportRunway[];
     runwayEnds: CalculatedRunwayEnd[];
@@ -2427,7 +2815,8 @@ function RunwayCompassSvg({
     compassRotation: number;
     showResetButton: boolean;
     onResetNorthUp: () => void;
-    onSelectEnd: (runwayEnd: RunwayEnd) => void;
+        onSelectEnd: (runwayEnd: RunwayEnd) => void;
+        fullscreen?: boolean;
 }) {
     const center = 200;
     const radius = 158;
@@ -2483,7 +2872,11 @@ function RunwayCompassSvg({
     return (
         <svg
             viewBox="0 0 400 400"
-            className="h-auto w-full rounded-2xl bg-transparent"
+            className={
+                fullscreen
+                    ? "h-full w-full max-h-full max-w-full rounded-2xl bg-transparent"
+                    : "h-auto w-full rounded-2xl bg-transparent"
+            }
             role="img"
             aria-label="Runway and wind compass"
         >
@@ -3180,7 +3573,13 @@ function WindComponentStack({
     );
 }
 
-function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
+function CloudCeilingPreviewSvg({
+    metar,
+    fullscreen = false,
+}: {
+    metar: NormalizedMetar;
+    fullscreen?: boolean;
+    }) {
     const ceiling = metar.ceiling.feetAgl;
 
     const cloudLayers = metar.clouds
@@ -3216,7 +3615,11 @@ function CloudCeilingPreviewSvg({ metar }: { metar: NormalizedMetar }) {
     return (
         <svg
             viewBox="0 0 400 400"
-            className="h-auto w-full rounded-2xl bg-transparent"
+            className={
+                fullscreen
+                    ? "h-full w-full max-h-full max-w-full rounded-2xl bg-transparent"
+                    : "h-auto w-full rounded-2xl bg-transparent"
+            }
             role="img"
             aria-label="Cloud and ceiling visualization"
         >
