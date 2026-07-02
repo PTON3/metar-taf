@@ -582,11 +582,6 @@ function MetarDashboard({
     const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
     const fullscreenRef = useRef<HTMLDivElement | null>(null);
 
-    const [fullscreenScale, setFullscreenScale] = useState(1);
-    const [fullscreenCanvasHeight, setFullscreenCanvasHeight] = useState(1080);
-
-    const FULLSCREEN_BASE_WIDTH = 1920;
-
     const categoryStyle = FLIGHT_CATEGORY_STYLES[metar.flightCategory];
 
     useEffect(() => {
@@ -617,25 +612,6 @@ function MetarDashboard({
         return () => {
             window.cancelAnimationFrame(frame);
             document.removeEventListener("fullscreenchange", handleFullscreenChange);
-        };
-    }, [isFullscreenOpen]);
-
-    useEffect(() => {
-        if (!isFullscreenOpen) return;
-
-        function updateFullscreenScale() {
-            const widthScale = window.innerWidth / FULLSCREEN_BASE_WIDTH;
-
-            setFullscreenScale(widthScale);
-            setFullscreenCanvasHeight(window.innerHeight / widthScale);
-        }
-
-        updateFullscreenScale();
-
-        window.addEventListener("resize", updateFullscreenScale);
-
-        return () => {
-            window.removeEventListener("resize", updateFullscreenScale);
         };
     }, [isFullscreenOpen]);
 
@@ -769,6 +745,7 @@ function MetarDashboard({
                             timeZone={stationInfo?.timeZone}
                             latitude={stationInfo?.latitude}
                             longitude={stationInfo?.longitude}
+                            hourlyOnly
                         />
                     )}
 
@@ -787,16 +764,8 @@ function MetarDashboard({
                     ref={fullscreenRef}
                     className="fixed inset-0 z-50 overflow-hidden bg-[#050505] text-zinc-100"
                 >
-                    <div className="flex h-screen w-screen items-start justify-center">
-                        <div
-                            style={{
-                                width: `${FULLSCREEN_BASE_WIDTH}px`,
-                                height: `${fullscreenCanvasHeight}px`,
-                                transform: `scale(${fullscreenScale})`,
-                                transformOrigin: "top center",
-                            }}
-                            className="flex flex-col gap-3 px-5 py-4"
-                        >
+                    <div className="h-dvh w-screen overflow-hidden">
+                        <div className="flex h-full w-full flex-col gap-3 px-3 py-3 sm:px-5 sm:py-4">
                             <div className="h-[120px] flex-none rounded-3xl border border-zinc-800 bg-gradient-to-r from-black via-zinc-950 to-[#171307] p-4 shadow-2xl">
                                 <div
                                     style={{
@@ -865,7 +834,7 @@ function MetarDashboard({
                                 <RunwayWindWidget metar={metar} runways={runways} fullscreen />
                             </div>
 
-                            <div className="h-[465px] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-4 shadow-2xl">
+                            <div className="h-[33.333dvh] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-4">
                                 <div className="flex h-full w-full flex-col justify-end">
                                     <TafDashboardTab
                                         station={metar.station}
@@ -873,6 +842,7 @@ function MetarDashboard({
                                         latitude={stationInfo?.latitude}
                                         longitude={stationInfo?.longitude}
                                         hourlyOnly
+                                        fullscreen
                                     />
                                 </div>
                             </div>
@@ -1011,11 +981,13 @@ function TafHourlyForecast({
     timeZone,
     latitude,
     longitude,
+    fullscreen = false,
 }: {
     taf: TafResponse;
     timeZone?: string | null;
     latitude?: number | null;
     longitude?: number | null;
+    fullscreen?: boolean;
 }) {
     const slots = buildTafHourlySlots(
         taf,
@@ -1101,9 +1073,9 @@ function TafHourlyForecast({
             onMouseLeave={stopDragging}
             onWheel={handleWheel}
             style={{ touchAction: "pan-x" }}
-            className={`scrollbar-hide mt-0 overflow-x-auto overflow-y-hidden pb-0 select-none ${isDragging ? "cursor-grabbing" : "cursor-grab"}`}
+            className={`scrollbar-hide mt-0 ${fullscreen ? "h-full" : ""} overflow-x-auto overflow-y-hidden pb-0 select-none ${isDragging ? "cursor-grabbing" : "cursor-grab"}`}
         >
-            <div className="flex min-w-max gap-3">
+            <div className={`flex min-w-max ${fullscreen ? "h-full gap-2" : "gap-3"}`}>
                 {slots.map((slot, index) => {
                     const { dayLabel, hourLabel } = formatTafHourLabel(
                         slot.startsAt,
@@ -1118,9 +1090,19 @@ function TafHourlyForecast({
                     return (
                         <div
                             key={slot.startsAt.toISOString()}
-                            className="flex h-[440px] w-[155px] shrink-0 flex-col"
+                            className={
+                                fullscreen
+                                    ? "flex h-full w-[142px] shrink-0 flex-col"
+                                    : "flex h-[440px] w-[155px] shrink-0 flex-col"
+                            }
                         >
-                            <article className="flex h-[400px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg">
+                            <article
+                                className={
+                                    fullscreen
+                                        ? "flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-3 shadow-lg"
+                                        : "flex h-[400px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
+                                }
+                            >
                                 <div className="flex items-start justify-between gap-2">
                                     <div>
                                         <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
@@ -1168,7 +1150,13 @@ function TafHourlyForecast({
                                 </div>
                             </article>
 
-                            <div className="pointer-events-none mt-1 h-[40px] flex-none space-y-1 overflow-hidden">
+                            <div
+                                className={
+                                    fullscreen
+                                        ? "pointer-events-none mt-1 h-[28px] flex-none space-y-1 overflow-hidden"
+                                        : "pointer-events-none mt-1 h-[40px] flex-none space-y-1 overflow-hidden"
+                                }
+                            >
                                 {slot.markers.map((marker) => {
                                     const isSunMarker =
                                         marker.type === "sunrise" || marker.type === "sunset";
@@ -1865,12 +1853,14 @@ function TafDashboardTab({
     latitude,
     longitude,
     hourlyOnly = false,
+    fullscreen = false,
 }: {
     station?: string;
     timeZone?: string | null;
     latitude?: number | null;
     longitude?: number | null;
     hourlyOnly?: boolean;
+    fullscreen?: boolean;
 }) {
     const [taf, setTaf] = useState<TafResponse | null>(null);
     const [loading, setLoading] = useState(true);
@@ -1954,6 +1944,7 @@ function TafDashboardTab({
                 timeZone={timeZone}
                 latitude={latitude}
                 longitude={longitude}
+                fullscreen={fullscreen}
             />
         );
     }
