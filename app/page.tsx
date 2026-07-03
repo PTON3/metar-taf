@@ -758,7 +758,6 @@ function MetarDashboard({
                             timeZone={stationInfo?.timeZone}
                             latitude={stationInfo?.latitude}
                             longitude={stationInfo?.longitude}
-                            hourlyOnly
                         />
                     )}
 
