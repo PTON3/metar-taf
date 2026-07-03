@@ -834,7 +834,7 @@ function MetarDashboard({
                                 <RunwayWindWidget metar={metar} runways={runways} fullscreen />
                             </div>
 
-                            <div className="h-[33.333dvh] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-4">
+                            <div className="h-[min(33.333dvh,420px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-4">
                                 <div className="flex h-full w-full flex-col justify-end">
                                     <TafDashboardTab
                                         station={metar.station}
@@ -1075,7 +1075,7 @@ function TafHourlyForecast({
             style={{ touchAction: "pan-x" }}
             className={`scrollbar-hide mt-0 ${fullscreen ? "h-full" : ""} overflow-x-auto overflow-y-hidden pb-0 select-none ${isDragging ? "cursor-grabbing" : "cursor-grab"}`}
         >
-            <div className={`flex min-w-max ${fullscreen ? "h-full gap-2" : "gap-3"}`}>
+            <div className={`flex min-w-max ${fullscreen ? "h-full items-end gap-2" : "gap-3"}`}>
                 {slots.map((slot, index) => {
                     const { dayLabel, hourLabel } = formatTafHourLabel(
                         slot.startsAt,
@@ -1092,14 +1092,14 @@ function TafHourlyForecast({
                             key={slot.startsAt.toISOString()}
                             className={
                                 fullscreen
-                                    ? "flex h-full w-[142px] shrink-0 flex-col"
+                                    ? "flex h-fit w-[142px] shrink-0 flex-col"
                                     : "flex h-[440px] w-[155px] shrink-0 flex-col"
                             }
                         >
                             <article
                                 className={
                                     fullscreen
-                                        ? "flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-3 shadow-lg"
+                                        ? "flex h-fit flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-3 shadow-lg"
                                         : "flex h-[400px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
                                 }
                             >
@@ -1142,7 +1142,13 @@ function TafHourlyForecast({
                                     )}
                                 </div>
 
-                                <div className="mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs">
+                                <div
+                                    className={
+                                        fullscreen
+                                            ? "mt-1 space-y-1 rounded-xl border border-zinc-800 bg-black/35 p-2 text-[11px]"
+                                            : "mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs"
+                                    }
+                                >
                                     <TafHourRow label="Vis" value={slot.visibility} />
                                     <TafHourRow label="Ceil" value={slot.ceiling} />
                                     <TafHourRow label="Wind" value={slot.wind} />
@@ -1153,7 +1159,7 @@ function TafHourlyForecast({
                             <div
                                 className={
                                     fullscreen
-                                        ? "pointer-events-none mt-1 h-[28px] flex-none space-y-1 overflow-hidden"
+                                        ? "pointer-events-none mt-1 h-[36px] flex-none space-y-1 overflow-visible"
                                         : "pointer-events-none mt-1 h-[40px] flex-none space-y-1 overflow-hidden"
                                 }
                             >
