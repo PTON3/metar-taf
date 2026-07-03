@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
 import * as SunCalc from "suncalc";
+import Image from "next/image";
 
 type ApiResponse = {
     raw?: string;
@@ -262,7 +263,7 @@ export default function Home() {
     const [runways, setRunways] = useState<AirportRunway[]>([]);
     const [error, setError] = useState("");
 
-    const [loading, setLoading] = useState(false);
+    const [loading, setLoading] = useState(true);
     const latestStationRef = useRef(station);
     const latestActiveTabRef = useRef(activeTab);
 
@@ -274,13 +275,7 @@ export default function Home() {
         latestActiveTabRef.current = activeTab;
     }, [activeTab]);
 
-    async function fetchLiveMetar(stationToFetch = station) {
-        const cleanStation = stationToFetch.trim().toUpperCase();
-
-        setLoading(true);
-        setError("");
-        setStation(cleanStation);
-
+    async function loadLiveMetar(cleanStation: string) {
         try {
             const response = await fetch(
                 `/api/metar/live?station=${encodeURIComponent(cleanStation)}`
@@ -305,6 +300,17 @@ export default function Home() {
         } finally {
             setLoading(false);
         }
+    }
+
+    function fetchLiveMetar(stationToFetch = station) {
+        const cleanStation = stationToFetch.trim().toUpperCase();
+
+        setLoading(true);
+        setError("");
+        setStation(cleanStation);
+        latestStationRef.current = cleanStation;
+
+        void loadLiveMetar(cleanStation);
     }
 
     async function decodeRawMetar() {
@@ -417,7 +423,9 @@ export default function Home() {
     }
 
     useEffect(() => {
-        void fetchLiveMetar("KFCM");
+        const initialLoadTimer = window.setTimeout(() => {
+            void loadLiveMetar("KFCM");
+        }, 0);
 
         const refreshTimer = window.setInterval(() => {
             if (latestActiveTabRef.current === "lookup") {
@@ -425,9 +433,12 @@ export default function Home() {
             }
         }, 2 * 60 * 1000);
 
-        return () => window.clearInterval(refreshTimer);
+        return () => {
+            window.clearTimeout(initialLoadTimer);
+            window.clearInterval(refreshTimer);
+        };
 
-        // Run once on page load, then refresh the current live ICAO lookup every 5 minutes.
+        // Run once on page load, then refresh the current live ICAO lookup every 2 minutes.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
@@ -541,6 +552,7 @@ export default function Home() {
                     <MetarDashboard
                         metar={metar}
                         rawMetar={rawMetar ?? metar.raw}
+                        station={station}
                         stationInfo={stationInfo}
                         airportDiagram={airportDiagram}
                         runways={runways}
@@ -564,16 +576,17 @@ export default function Home() {
 function MetarDashboard({
     metar,
     rawMetar,
+    station,
     stationInfo,
     airportDiagram,
     runways,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
+    station: string;
     stationInfo: StationInfo | null;
     airportDiagram: AirportDiagramInfo | null;
     runways: AirportRunway[];
-
 }) {
     const [now, setNow] = useState(() => new Date());
     const [activeDashboardTab, setActiveDashboardTab] =
@@ -741,7 +754,7 @@ function MetarDashboard({
 
                     {activeDashboardTab === "taf" && (
                         <TafDashboardTab
-                            station={metar.station}
+                            station={metar.station ?? station}
                             timeZone={stationInfo?.timeZone}
                             latitude={stationInfo?.latitude}
                             longitude={stationInfo?.longitude}
@@ -837,7 +850,7 @@ function MetarDashboard({
                             <div className="h-[min(33.333dvh,420px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-4">
                                 <div className="flex h-full w-full flex-col justify-end">
                                     <TafDashboardTab
-                                        station={metar.station}
+                                        station={metar.station ?? station}
                                         timeZone={stationInfo?.timeZone}
                                         latitude={stationInfo?.latitude}
                                         longitude={stationInfo?.longitude}
@@ -940,40 +953,6 @@ function formatTafTime(value?: string | null) {
         minute: "2-digit",
         timeZoneName: "short",
     }).format(date);
-}
-
-function formatTafWind(block: TafForecastBlock) {
-    const speed = block.windSpeedKt;
-
-    if (speed === null || speed === undefined || speed === "") {
-        return "Not reported";
-    }
-
-    const direction =
-        block.windDirection === "VRB"
-            ? "VRB"
-            : block.windDirection !== null && block.windDirection !== undefined
-                ? `${String(block.windDirection).padStart(3, "0")}°`
-                : "Variable";
-
-    const gust = block.windGustKt ? ` G${block.windGustKt}` : "";
-
-    return `${direction} at ${speed}${gust} kt`;
-}
-
-function formatSky(sky?: TafSkyCondition[]) {
-    if (!sky || sky.length === 0) return "Not reported";
-
-    return sky
-        .map((layer) => {
-            if (!layer.cover) return null;
-
-            if (!layer.baseFtAgl) return layer.cover;
-
-            return `${layer.cover}${layer.baseFtAgl} ft AGL`;
-        })
-        .filter(Boolean)
-        .join(", ");
 }
 
 function TafHourlyForecast({
@@ -1121,9 +1100,11 @@ function TafHourlyForecast({
                                 </div>
 
                                 <div className="mt-0 flex h-30 items-center justify-center">
-                                    <img
+                                    <Image
                                         src={TAF_ICON_SRC[slot.iconKey]}
                                         alt={slot.weatherLabel}
+                                        width={128}
+                                        height={128}
                                         draggable={false}
                                         onDragStart={(event) => event.preventDefault()}
                                         className="pointer-events-none h-32 w-32 select-none object-contain drop-shadow-2xl"
@@ -1173,13 +1154,15 @@ function TafHourlyForecast({
                                                 key={`${marker.type}-${marker.time.toISOString()}`}
                                                 className="flex w-full items-center justify-center gap-2 text-xs font-black text-[#f2d675]"
                                             >
-                                                <img
+                                                <Image
                                                     src={
                                                         marker.type === "sunrise"
                                                             ? TAF_MARKER_ICON_SRC.sunrise
                                                             : TAF_MARKER_ICON_SRC.sunset
                                                     }
                                                     alt={marker.label}
+                                                    width={40}
+                                                    height={40}
                                                     draggable={false}
                                                     onDragStart={(event) => event.preventDefault()}
                                                     className="pointer-events-none h-10 w-10 select-none object-contain drop-shadow-lg"
@@ -1275,6 +1258,7 @@ function buildSunCurrencyData(
 
         const sunrise = todayTimes.sunrise;
         const sunset = todayTimes.sunset;
+        const tomorrowSunrise = tomorrowTimes.sunrise;
 
         if (isValidDate(sunrise)) {
             markers.push({
@@ -1292,10 +1276,10 @@ function buildSunCurrencyData(
             });
         }
 
-        if (isValidDate(sunset) && isValidDate(tomorrowTimes.sunrise)) {
+        if (isValidDate(sunset) && isValidDate(tomorrowSunrise)) {
             const currencyStart = new Date(sunset.getTime() + 60 * 60 * 1000);
             const currencyEnd = new Date(
-                tomorrowTimes.sunrise.getTime() - 60 * 60 * 1000
+                tomorrowSunrise.getTime() - 60 * 60 * 1000
             );
 
             windows.push({
@@ -1339,7 +1323,7 @@ function buildSunCurrencyData(
     };
 }
 
-function isValidDate(value: Date) {
+function isValidDate(value: Date | null | undefined): value is Date {
     return value instanceof Date && !Number.isNaN(value.getTime());
 }
 
@@ -2223,6 +2207,7 @@ function AirportDiagramPreviewCard({
                 context.clearRect(0, 0, canvas.width, canvas.height);
 
                 const renderTask = page.render({
+                    canvas,
                     canvasContext: context,
                     viewport,
                 });
@@ -2640,7 +2625,6 @@ function RunwayWindWidget({
             : metar.wind.directionDeg;
 
     const windSpeedKt = metar.wind.speedKt ?? 0;
-    const hasWindDirection = windDirectionDeg !== null && windSpeedKt > 0;
 
     const runwayEnds = getRunwayEnds(runways);
 
