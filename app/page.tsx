@@ -2711,6 +2711,7 @@ function RunwayWindWidget({
     fullscreen?: boolean;
 }) {
     const [selectedEnd, setSelectedEnd] = useState<RunwayEnd | null>(null);
+    const [compassRotation, setCompassRotation] = useState(0);
 
     if (runways.length === 0) {
         return (
@@ -2778,7 +2779,28 @@ function RunwayWindWidget({
             bestRunway
             : bestRunway;
 
-    const compassRotation = selectedEnd?.headingDeg ?? 0;
+    function handleSelectEnd(runwayEnd: RunwayEnd) {
+        setSelectedEnd(runwayEnd);
+        setCompassRotation(runwayEnd.headingDeg);
+    }
+
+    function handleSetCompassRotation(rotationDeg: number) {
+        setSelectedEnd(null);
+        setCompassRotation(normalizeAngle360(rotationDeg));
+    }
+
+    function handleResetNorthUp() {
+        setSelectedEnd(null);
+        setCompassRotation(0);
+    }
+
+    function handleOrientToInflight() {
+        setSelectedEnd(null);
+        setCompassRotation(160);
+    }
+
+    const showResetButton =
+        selectedEnd !== null || Math.round(normalizeAngle360(compassRotation)) !== 0;
 
     return (
         <div
@@ -2825,9 +2847,12 @@ function RunwayWindWidget({
                             windDirectionDeg={windDirectionDeg}
                             windSpeedKt={windSpeedKt}
                             compassRotation={compassRotation}
-                            showResetButton={selectedEnd !== null}
-                            onResetNorthUp={() => setSelectedEnd(null)}
-                            onSelectEnd={setSelectedEnd}
+                            visibilitySm={metar.visibility.statuteMiles}
+                            showResetButton={showResetButton}
+                            onResetNorthUp={handleResetNorthUp}
+                            onSelectEnd={handleSelectEnd}
+                            onCompassRotationChange={handleSetCompassRotation}
+                            onOrientToInflight={handleOrientToInflight}
                             fullscreen
                         />
                     </div>
@@ -2863,9 +2888,12 @@ function RunwayWindWidget({
                             windDirectionDeg={windDirectionDeg}
                             windSpeedKt={windSpeedKt}
                             compassRotation={compassRotation}
-                            showResetButton={selectedEnd !== null}
-                            onResetNorthUp={() => setSelectedEnd(null)}
-                            onSelectEnd={setSelectedEnd}
+                            visibilitySm={metar.visibility.statuteMiles}
+                            showResetButton={showResetButton}
+                            onResetNorthUp={handleResetNorthUp}
+                            onSelectEnd={handleSelectEnd}
+                            onCompassRotationChange={handleSetCompassRotation}
+                            onOrientToInflight={handleOrientToInflight}
                         />
                     </div>
 
@@ -2890,6 +2918,9 @@ function RunwayCompassSvg({
     showResetButton,
     onResetNorthUp,
     onSelectEnd,
+    visibilitySm,
+    onCompassRotationChange,
+    onOrientToInflight,
     fullscreen = false,
 }: {
     runways: AirportRunway[];
@@ -2902,11 +2933,23 @@ function RunwayCompassSvg({
     compassRotation: number;
     showResetButton: boolean;
     onResetNorthUp: () => void;
-        onSelectEnd: (runwayEnd: RunwayEnd) => void;
-        fullscreen?: boolean;
+    onSelectEnd: (runwayEnd: RunwayEnd) => void;
+    visibilitySm: number | null;
+    onCompassRotationChange: (rotationDeg: number) => void;
+    onOrientToInflight: () => void;
+    fullscreen?: boolean;
 }) {
     const center = 200;
     const radius = 158;
+
+    const dragStateRef = useRef<{
+        pointerId: number;
+        startAngleDeg: number;
+        startRotationDeg: number;
+        startClientX: number;
+        startClientY: number;
+        isDragging: boolean;
+    } | null>(null);
 
     const [windDisplayMode, setWindDisplayMode] =
         useState<WindDisplayMode>("animated");
@@ -2948,12 +2991,89 @@ function RunwayCompassSvg({
                 ? "Wind direction"
                 : "Wind hidden";
 
+    const headingAtPointer = Math.round(normalizeAngle360(compassRotation)) % 360;
+    const headingAtPointerLabel = `${String(headingAtPointer).padStart(3, "0")}°`;
+    const visibilityLabel = formatCompassVisibility(visibilitySm);
+
     function cycleWindDisplayMode() {
         setWindDisplayMode((currentMode) => {
             if (currentMode === "animated") return "direction";
             if (currentMode === "direction") return "hidden";
             return "animated";
         });
+    }
+
+    function getPointerAngle(event: PointerEvent<SVGSVGElement>): number | null {
+        const bounds = event.currentTarget.getBoundingClientRect();
+
+        if (bounds.width === 0 || bounds.height === 0) return null;
+
+        const x = event.clientX - bounds.left - bounds.width / 2;
+        const y = event.clientY - bounds.top - bounds.height / 2;
+
+        return normalizeAngle360((Math.atan2(x, -y) * 180) / Math.PI);
+    }
+
+    function beginCompassDrag(event: PointerEvent<SVGSVGElement>) {
+        if (event.pointerType === "mouse" && event.button !== 0) return;
+
+        const target = event.target;
+
+        if (
+            target instanceof Element &&
+            target.closest("[data-compass-control='true']")
+        ) {
+            return;
+        }
+
+        const pointerAngle = getPointerAngle(event);
+        if (pointerAngle === null) return;
+
+        dragStateRef.current = {
+            pointerId: event.pointerId,
+            startAngleDeg: pointerAngle,
+            startRotationDeg: compassRotation,
+            startClientX: event.clientX,
+            startClientY: event.clientY,
+            isDragging: false,
+        };
+
+        event.currentTarget.setPointerCapture(event.pointerId);
+        event.preventDefault();
+    }
+
+    function dragCompass(event: PointerEvent<SVGSVGElement>) {
+        const dragState = dragStateRef.current;
+        if (!dragState || dragState.pointerId !== event.pointerId) return;
+
+        const pointerAngle = getPointerAngle(event);
+        if (pointerAngle === null) return;
+
+        const pointerTravel = Math.hypot(
+            event.clientX - dragState.startClientX,
+            event.clientY - dragState.startClientY
+        );
+
+        if (!dragState.isDragging && pointerTravel < 3) return;
+
+        dragState.isDragging = true;
+        onCompassRotationChange(
+            dragState.startRotationDeg -
+            normalizeAngle180(pointerAngle - dragState.startAngleDeg)
+        );
+
+        event.preventDefault();
+    }
+
+    function endCompassDrag(event: PointerEvent<SVGSVGElement>) {
+        const dragState = dragStateRef.current;
+        if (!dragState || dragState.pointerId !== event.pointerId) return;
+
+        dragStateRef.current = null;
+
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+        }
     }
 
     return (
@@ -2966,6 +3086,11 @@ function RunwayCompassSvg({
             }
             role="img"
             aria-label="Runway and wind compass"
+            style={{ touchAction: "none", cursor: "grab" }}
+            onPointerDown={beginCompassDrag}
+            onPointerMove={dragCompass}
+            onPointerUp={endCompassDrag}
+            onPointerCancel={endCompassDrag}
         >
 
             <defs>
@@ -3110,6 +3235,7 @@ function RunwayCompassSvg({
                         key={layout.feature.id}
                         layout={layout}
                         labelSide={getInflightLabelSide(selectedEnd)}
+                        onOrientToInflight={onOrientToInflight}
                     />
                 ))}
             </g>
@@ -3126,6 +3252,10 @@ function RunwayCompassSvg({
 
             <circle cx={center} cy={center} r="4" fill="#e6c76f" />
 
+            <CompassVisibilityBadge label={visibilityLabel} />
+
+            <CompassHeadingPointer label={headingAtPointerLabel} />
+
             {activeRunway && (
                 <RunwayStatusBadge
                     activeRunway={activeRunway}
@@ -3135,6 +3265,7 @@ function RunwayCompassSvg({
 
             {showResetButton && (
                 <g
+                    data-compass-control="true"
                     onClick={onResetNorthUp}
                     style={{ cursor: "pointer" }}
                     role="button"
@@ -3190,6 +3321,7 @@ function RunwayCompassSvg({
             </g>
 
             <g
+                data-compass-control="true"
                 onClick={cycleWindDisplayMode}
                 onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
@@ -3237,16 +3369,36 @@ function getInflightLabelSide(selectedEnd: RunwayEnd | null): "left" | "right" {
 function CompassFeatureMarker({
     layout,
     labelSide,
+    onOrientToInflight,
 }: {
     layout: AirportMapFeatureLayout;
     labelSide: "left" | "right";
+    onOrientToInflight: () => void;
 }) {
     const { point } = layout;
 
     const labelX = labelSide === "left" ? -22 : 22;
 
     return (
-        <g transform={`translate(${point.x} ${point.y})`} pointerEvents="none">
+        <g
+            data-compass-control="true"
+            transform={`translate(${point.x} ${point.y})`}
+            style={{ cursor: "pointer" }}
+            role="button"
+            tabIndex={0}
+            aria-label="Orient compass to Inflight Aviation"
+            onClick={(event) => {
+                event.stopPropagation();
+                onOrientToInflight();
+            }}
+            onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onOrientToInflight();
+                }
+            }}
+        >
+            <circle cx="0" cy="-13" r="18" fill="transparent" />
             <image
                 href="/icons/ping_icon.png"
                 x="-11"
@@ -3281,6 +3433,80 @@ function CompassFeatureMarker({
             >
                 Aviation
             </text>
+        </g>
+    );
+}
+
+function CompassVisibilityBadge({ label }: { label: string }) {
+    return (
+        <g pointerEvents="none">
+            <rect
+                x="16"
+                y="18"
+                width="88"
+                height="28"
+                rx="14"
+                fill="#050505"
+                stroke="#3f3f46"
+                strokeWidth="1"
+                opacity="0.92"
+            />
+
+            <image
+                href="/icons/visibility.png"
+                x="26"
+                y="24"
+                width="16"
+                height="16"
+                preserveAspectRatio="xMidYMid meet"
+            />
+
+            <text
+                x="50"
+                y="32"
+                dominantBaseline="middle"
+                fill="#f4f4f5"
+                fontSize="12"
+                fontWeight="850"
+            >
+                {label}
+            </text>
+        </g>
+    );
+}
+
+function CompassHeadingPointer({ label }: { label: string }) {
+    return (
+        <g pointerEvents="none">
+            <rect
+                x="169"
+                y="15"
+                width="62"
+                height="22"
+                rx="11"
+                fill="#050505"
+                stroke="#ef4444"
+                strokeWidth="1.2"
+            />
+
+            <text
+                x="200"
+                y="27"
+                textAnchor="middle"
+                dominantBaseline="middle"
+                fill="#fecaca"
+                fontSize="11"
+                fontWeight="900"
+            >
+                {label}
+            </text>
+
+            <path
+                d="M 200 50 L 190 34 L 210 34 Z"
+                fill="#ef4444"
+                stroke="#fecaca"
+                strokeWidth="0.8"
+            />
         </g>
     );
 }
@@ -4165,6 +4391,7 @@ function CompassRunwayPair({
             {/* Runway identifiers outside the runway ends */}
             {endA && (
                 <g
+                    data-compass-control="true"
                     onClick={(event) => {
                         event.stopPropagation();
                         onSelectEnd(endA);
@@ -4194,6 +4421,7 @@ function CompassRunwayPair({
 
             {endB && (
                 <g
+                    data-compass-control="true"
                     onClick={(event) => {
                         event.stopPropagation();
                         onSelectEnd(endB);
@@ -4295,6 +4523,16 @@ function formatWindDetail(metar: NormalizedMetar): string {
 function formatVisibility(metar: NormalizedMetar): string {
     if (metar.visibility.statuteMiles === null) return "Not reported";
     return `${metar.visibility.statuteMiles} SM`;
+}
+
+function formatCompassVisibility(visibilitySm: number | null): string {
+    if (visibilitySm === null) return "-- SM";
+
+    const roundedVisibility = Number.isInteger(visibilitySm)
+        ? String(visibilitySm)
+        : visibilitySm.toFixed(1).replace(/\.0$/, "");
+
+    return `${roundedVisibility} SM`;
 }
 
 function formatCeiling(metar: NormalizedMetar): string {
