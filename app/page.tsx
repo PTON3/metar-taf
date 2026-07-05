@@ -231,6 +231,8 @@ const TAF_REFRESH_MS = 5 * 60 * 1000;
 
 const TAF_FULLSCREEN_BASE_HEIGHT = 440;
 const TAF_FULLSCREEN_MIN_SCALE = 0.45;
+const TAF_FULLSCREEN_CARD_WIDTH = 155;
+const TAF_FULLSCREEN_CARD_GAP = 12;
 
 type TafTimelineMarker = {
     type: "sunrise" | "sunset" | "currencyStart" | "currencyEnd";
@@ -981,6 +983,10 @@ function TafHourlyForecast({
         longitude
     ).slice(0, 24);
 
+    const tafFullscreenContentWidth =
+        slots.length * TAF_FULLSCREEN_CARD_WIDTH +
+        Math.max(0, slots.length - 1) * TAF_FULLSCREEN_CARD_GAP;
+
     const scrollRef = useRef<HTMLDivElement | null>(null);
     const [isDragging, setIsDragging] = useState(false);
     const [startX, setStartX] = useState(0);
@@ -1100,13 +1106,29 @@ function TafHourlyForecast({
                 style={
                     fullscreen
                         ? {
-                            transform: `scale(${tafScale})`,
-                            transformOrigin: "bottom left",
+                            width: `${tafFullscreenContentWidth * tafScale}px`,
+                            height: `${TAF_FULLSCREEN_BASE_HEIGHT * tafScale}px`,
+                            position: "relative",
+                            flex: "0 0 auto",
                         }
                         : undefined
                 }
-                className={`flex min-w-max ${fullscreen ? "h-[440px] items-end gap-3" : "gap-3"}`}
+                className={fullscreen ? "" : "flex min-w-max gap-3"}
             >
+                <div
+                    style={
+                        fullscreen
+                            ? {
+                                position: "absolute",
+                                bottom: 0,
+                                left: 0,
+                                transform: `scale(${tafScale})`,
+                                transformOrigin: "bottom left",
+                            }
+                            : undefined
+                    }
+                    className={`flex min-w-max ${fullscreen ? "h-[440px] items-end gap-3" : "gap-3"}`}
+                >
                 {slots.map((slot, index) => {
                     const { dayLabel, hourLabel } = formatTafHourLabel(
                         slot.startsAt,
@@ -1247,6 +1269,7 @@ function TafHourlyForecast({
                         </div>
                     );
                 })}
+                </div>
             </div>
         </div>
     );
