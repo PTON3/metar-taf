@@ -225,6 +225,13 @@ const TAF_MARKER_ICON_SRC = {
     sunset: "/icons/sunset.png",
 };
 
+// Refresh intervals in milliseconds. Change the leading integer for minutes.
+const LIVE_WEATHER_REFRESH_MS = 1 * 60 * 1000;
+const TAF_REFRESH_MS = 5 * 60 * 1000;
+
+const TAF_FULLSCREEN_BASE_HEIGHT = 440;
+const TAF_FULLSCREEN_MIN_SCALE = 0.45;
+
 type TafTimelineMarker = {
     type: "sunrise" | "sunset" | "currencyStart" | "currencyEnd";
     label: string;
@@ -431,7 +438,7 @@ export default function Home() {
             if (latestActiveTabRef.current === "lookup") {
                 void fetchLiveMetar(latestStationRef.current);
             }
-        }, 2 * 60 * 1000);
+        }, LIVE_WEATHER_REFRESH_MS);
 
         return () => {
             window.clearTimeout(initialLoadTimer);
@@ -776,8 +783,8 @@ function MetarDashboard({
                     ref={fullscreenRef}
                     className="fixed inset-0 z-50 overflow-hidden bg-[#050505] text-zinc-100"
                 >
-                    <div className="h-dvh w-screen overflow-hidden">
-                        <div className="flex h-full w-full flex-col gap-3 px-3 py-3 sm:px-5 sm:py-4">
+                    <div className="absolute inset-0 overflow-hidden">
+                        <div className="flex h-full min-h-0 w-full flex-col gap-3 px-3 py-3 sm:px-5 sm:py-4">
                             <div className="h-[120px] flex-none rounded-3xl border border-zinc-800 bg-gradient-to-r from-black via-zinc-950 to-[#171307] p-4 shadow-2xl">
                                 <div
                                     style={{
@@ -846,7 +853,7 @@ function MetarDashboard({
                                 <RunwayWindWidget metar={metar} runways={runways} fullscreen />
                             </div>
 
-                            <div className="h-[min(33.333dvh,420px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-4">
+                            <div className="h-[clamp(240px,30dvh,360px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-3">
                                 <div className="flex h-full w-full flex-col justify-end">
                                     <TafDashboardTab
                                         station={metar.station ?? station}
@@ -979,6 +986,42 @@ function TafHourlyForecast({
     const [startX, setStartX] = useState(0);
     const [scrollLeft, setScrollLeft] = useState(0);
 
+    const [tafScale, setTafScale] = useState(1);
+
+    useEffect(() => {
+        if (!fullscreen) {
+            return;
+        }
+
+        const slider = scrollRef.current;
+        if (!slider) return;
+
+        const updateScale = () => {
+            const availableHeight = slider.clientHeight;
+            const nextScale = Math.min(
+                1,
+                Math.max(
+                    TAF_FULLSCREEN_MIN_SCALE,
+                    availableHeight / TAF_FULLSCREEN_BASE_HEIGHT
+                )
+            );
+
+            setTafScale(Number(nextScale.toFixed(3)));
+        };
+
+        const frame = window.requestAnimationFrame(updateScale);
+        const observer = new ResizeObserver(updateScale);
+
+        observer.observe(slider);
+        window.addEventListener("resize", updateScale);
+
+        return () => {
+            window.cancelAnimationFrame(frame);
+            observer.disconnect();
+            window.removeEventListener("resize", updateScale);
+        };
+    }, [fullscreen]);
+
     if (slots.length === 0) {
         return null;
     }
@@ -1051,9 +1094,19 @@ function TafHourlyForecast({
             onMouseLeave={stopDragging}
             onWheel={handleWheel}
             style={{ touchAction: "pan-x" }}
-            className={`scrollbar-hide mt-0 ${fullscreen ? "h-full" : ""} overflow-x-auto overflow-y-hidden pb-0 select-none ${isDragging ? "cursor-grabbing" : "cursor-grab"}`}
+            className={`scrollbar-hide mt-0 ${fullscreen ? "flex h-full min-h-0 items-end" : ""} overflow-x-auto overflow-y-hidden pb-0 select-none ${isDragging ? "cursor-grabbing" : "cursor-grab"}`}
         >
-            <div className={`flex min-w-max ${fullscreen ? "h-full items-end gap-2" : "gap-3"}`}>
+            <div
+                style={
+                    fullscreen
+                        ? {
+                            transform: `scale(${tafScale})`,
+                            transformOrigin: "bottom left",
+                        }
+                        : undefined
+                }
+                className={`flex min-w-max ${fullscreen ? "h-[440px] items-end gap-3" : "gap-3"}`}
+            >
                 {slots.map((slot, index) => {
                     const { dayLabel, hourLabel } = formatTafHourLabel(
                         slot.startsAt,
@@ -1070,18 +1123,18 @@ function TafHourlyForecast({
                             key={slot.startsAt.toISOString()}
                             className={
                                 fullscreen
-                                    ? "flex h-fit w-[142px] shrink-0 flex-col"
+                                    ? "flex h-[440px] w-[155px] shrink-0 flex-col"
                                     : "flex h-[440px] w-[155px] shrink-0 flex-col"
                             }
                         >
                             <article
                                 className={
                                     fullscreen
-                                        ? "flex h-fit flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-3 shadow-lg"
+                                        ? "flex h-[400px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
                                         : "flex h-[400px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
                                 }
                             >
-                                <div className="flex items-start justify-between gap-2">
+                                <div className="flex flex-none items-start justify-between gap-2">
                                     <div>
                                         <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
                                             {dayLabel}
@@ -1110,7 +1163,7 @@ function TafHourlyForecast({
                                     />
                                 </div>
 
-                                <p className=" min-h-[20px] text-center text-sm font-semibold leading-5 text-white">
+                                <p className="min-h-[20px] text-center text-sm font-semibold leading-5 text-white">
                                     {slot.weatherLabel}
                                 </p>
 
@@ -1125,7 +1178,7 @@ function TafHourlyForecast({
                                 <div
                                     className={
                                         fullscreen
-                                            ? "mt-1 space-y-1 rounded-xl border border-zinc-800 bg-black/35 p-2 text-[11px]"
+                                            ? "mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs"
                                             : "mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs"
                                     }
                                 >
@@ -1139,7 +1192,7 @@ function TafHourlyForecast({
                             <div
                                 className={
                                     fullscreen
-                                        ? "pointer-events-none mt-1 h-[36px] flex-none space-y-1 overflow-visible"
+                                        ? "pointer-events-none mt-1 h-[40px] flex-none space-y-1 overflow-visible"
                                         : "pointer-events-none mt-1 h-[40px] flex-none space-y-1 overflow-hidden"
                                 }
                             >
@@ -1855,17 +1908,32 @@ function TafDashboardTab({
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
 
-    useEffect(() => {
-        const controller = new AbortController();
+    const latestTafRef = useRef<TafResponse | null>(null);
 
-        async function loadTaf() {
+    useEffect(() => {
+        latestTafRef.current = taf;
+    }, [taf]);
+
+    useEffect(() => {
+        let isActive = true;
+        let controller: AbortController | null = null;
+
+        async function loadTaf(showLoading = true) {
+            controller?.abort();
+            const requestController = new AbortController();
+            controller = requestController;
+
             try {
-                setLoading(true);
-                setError(null);
+                if (showLoading || !latestTafRef.current) {
+                    setLoading(true);
+                }
 
                 const response = await fetch(
                     `/api/taf?station=${encodeURIComponent(station)}`,
-                    { signal: controller.signal }
+                    {
+                        cache: "no-store",
+                        signal: requestController.signal,
+                    }
                 );
 
                 if (!response.ok) {
@@ -1873,25 +1941,47 @@ function TafDashboardTab({
                 }
 
                 const data = await response.json();
+
+                if (!isActive || requestController.signal.aborted) return;
+
                 setTaf(data);
+                setError(null);
             } catch (err) {
                 if (err instanceof DOMException && err.name === "AbortError") {
                     return;
                 }
 
-                setError(
-                    err instanceof Error
-                        ? err.message
-                        : "Something went wrong loading the TAF."
-                );
+                if (!latestTafRef.current) {
+                    setError(
+                        err instanceof Error
+                            ? err.message
+                            : "Something went wrong loading the TAF."
+                    );
+                }
             } finally {
-                setLoading(false);
+                if (isActive && !requestController.signal.aborted) {
+                    setLoading(false);
+                }
             }
         }
 
-        loadTaf();
+        const initialLoadTimer = window.setTimeout(() => {
+            latestTafRef.current = null;
+            setTaf(null);
+            setError(null);
+            void loadTaf(true);
+        }, 0);
 
-        return () => controller.abort();
+        const refreshTimer = window.setInterval(() => {
+            void loadTaf(false);
+        }, TAF_REFRESH_MS);
+
+        return () => {
+            isActive = false;
+            window.clearTimeout(initialLoadTimer);
+            window.clearInterval(refreshTimer);
+            controller?.abort();
+        };
     }, [station]);
 
     if (loading) {
