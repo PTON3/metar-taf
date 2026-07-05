@@ -1197,13 +1197,7 @@ function TafHourlyForecast({
                                     )}
                                 </div>
 
-                                <div
-                                    className={
-                                        fullscreen
-                                            ? "mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs"
-                                            : "mt-auto space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs"
-                                    }
-                                >
+                                <div className="mt-2 space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs">
                                     <TafHourRow label="Vis" value={slot.visibility} />
                                     <TafHourRow label="Ceil" value={slot.ceiling} />
                                     <TafHourRow label="Wind" value={slot.wind} />
