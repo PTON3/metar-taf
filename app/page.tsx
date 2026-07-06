@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
 import * as SunCalc from "suncalc";
 import Image from "next/image";
@@ -259,6 +259,8 @@ type TafHourSlot = {
     markers: TafTimelineMarker[];
     isNightCurrency: boolean;
 };
+
+type InflightLabelSide = "left" | "right" | "middle";
 
 export default function Home() {
     const [activeTab, setActiveTab] = useState<DecoderTab>("lookup");
@@ -2796,7 +2798,7 @@ function RunwayWindWidget({
 
     function handleOrientToInflight() {
         setSelectedEnd(null);
-        setCompassRotation(160);
+        setCompassRotation(200);
     }
 
     const showResetButton =
@@ -3234,7 +3236,7 @@ function RunwayCompassSvg({
                     <CompassFeatureMarker
                         key={layout.feature.id}
                         layout={layout}
-                        labelSide={getInflightLabelSide(selectedEnd)}
+                        labelSide={getInflightLabelSide(layout.point, runwayLayout)}
                         onOrientToInflight={onOrientToInflight}
                     />
                 ))}
@@ -3350,20 +3352,94 @@ function RunwayCompassSvg({
     );
 }
 
-function getInflightLabelSide(selectedEnd: RunwayEnd | null): "left" | "right" {
-    if (!selectedEnd) {
-        return "right";
+function getInflightLabelSide(
+    featurePoint: SvgPoint,
+    runwayLayout: RunwayLayout[]
+): InflightLabelSide {
+    const candidates: { side: InflightLabelSide; center: SvgPoint }[] = [
+        {
+            side: "left",
+            center: { x: featurePoint.x - 22, y: featurePoint.y - 9.5 },
+        },
+        {
+            side: "right",
+            center: { x: featurePoint.x + 22, y: featurePoint.y - 9.5 },
+        },
+        {
+            side: "middle",
+            center: { x: featurePoint.x, y: featurePoint.y + 9 },
+        },
+    ];
+
+    return candidates
+        .map((candidate) => ({
+            side: candidate.side,
+            score: getInflightLabelClearanceScore(candidate.center, runwayLayout),
+        }))
+        .sort((a, b) => b.score - a.score)[0].side;
+}
+
+function getInflightLabelClearanceScore(
+    labelCenter: SvgPoint,
+    runwayLayout: RunwayLayout[]
+): number {
+    const labelHalfWidth = 22;
+    const labelHalfHeight = 9;
+
+    const samplePoints = [
+        labelCenter,
+        { x: labelCenter.x - labelHalfWidth, y: labelCenter.y - labelHalfHeight },
+        { x: labelCenter.x + labelHalfWidth, y: labelCenter.y - labelHalfHeight },
+        { x: labelCenter.x - labelHalfWidth, y: labelCenter.y + labelHalfHeight },
+        { x: labelCenter.x + labelHalfWidth, y: labelCenter.y + labelHalfHeight },
+    ];
+
+    let closestDistance = Number.POSITIVE_INFINITY;
+
+    runwayLayout.forEach((layout) => {
+        samplePoints.forEach((point) => {
+            closestDistance = Math.min(
+                closestDistance,
+                distancePointToSegment(point, layout.start, layout.end),
+                distanceBetweenPoints(point, layout.start),
+                distanceBetweenPoints(point, layout.end)
+            );
+        });
+    });
+
+    return closestDistance;
+}
+
+function distancePointToSegment(
+    point: SvgPoint,
+    segmentStart: SvgPoint,
+    segmentEnd: SvgPoint
+): number {
+    const dx = segmentEnd.x - segmentStart.x;
+    const dy = segmentEnd.y - segmentStart.y;
+    const lengthSquared = dx * dx + dy * dy;
+
+    if (lengthSquared === 0) {
+        return distanceBetweenPoints(point, segmentStart);
     }
 
-    if (selectedEnd.ident === "36") {
-        return "right";
-    }
+    const t = Math.max(
+        0,
+        Math.min(
+            1,
+            ((point.x - segmentStart.x) * dx + (point.y - segmentStart.y) * dy) /
+            lengthSquared
+        )
+    );
 
-    if (selectedEnd.ident === "18") {
-        return "left";
-    }
+    return distanceBetweenPoints(point, {
+        x: segmentStart.x + t * dx,
+        y: segmentStart.y + t * dy,
+    });
+}
 
-    return "right";
+function distanceBetweenPoints(pointA: SvgPoint, pointB: SvgPoint): number {
+    return Math.hypot(pointA.x - pointB.x, pointA.y - pointB.y);
 }
 
 function CompassFeatureMarker({
@@ -3372,64 +3448,67 @@ function CompassFeatureMarker({
     onOrientToInflight,
 }: {
     layout: AirportMapFeatureLayout;
-    labelSide: "left" | "right";
+    labelSide: InflightLabelSide;
     onOrientToInflight: () => void;
 }) {
     const { point } = layout;
 
-    const labelX = labelSide === "left" ? -22 : 22;
+    const labelX =
+        labelSide === "left" ? -22 : labelSide === "right" ? 22 : 0;
+
+    const labelLineOneY = labelSide === "middle" ? 5 : -13;
+    const labelLineTwoY = labelSide === "middle" ? 12 : -6;
 
     return (
-        <g
-            data-compass-control="true"
-            transform={`translate(${point.x} ${point.y})`}
-            style={{ cursor: "pointer" }}
-            role="button"
-            tabIndex={0}
-            aria-label="Orient compass to Inflight Aviation"
-            onClick={(event) => {
-                event.stopPropagation();
-                onOrientToInflight();
-            }}
-            onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
+        <g transform={`translate(${point.x} ${point.y})`}>
+            <g
+                data-compass-control="true"
+                style={{ cursor: "pointer", outline: "none" }}
+                onClick={(event) => {
+                    event.stopPropagation();
                     onOrientToInflight();
-                }
-            }}
-        >
-            <circle cx="0" cy="-13" r="18" fill="transparent" />
-            <image
-                href="/icons/ping_icon.png"
-                x="-11"
-                y="-22"
-                width="22"
-                height="22"
-                preserveAspectRatio="xMidYMid meet"
-            />
+                }}
+                onMouseDown={(event) => {
+                    event.preventDefault();
+                }}
+            >
+                <circle cx="0" cy="-13" r="12" fill="transparent" />
+
+                <image
+                    href="/icons/ping_icon.png"
+                    x="-11"
+                    y="-22"
+                    width="22"
+                    height="22"
+                    preserveAspectRatio="xMidYMid meet"
+                    pointerEvents="none"
+                />
+            </g>
 
             <text
                 x={labelX}
-                y="-13"
+                y={labelLineOneY}
                 textAnchor="middle"
                 dominantBaseline="middle"
                 fill="#e6c76f"
                 fontSize="6.5"
                 fontWeight="750"
                 letterSpacing="0.25"
+                pointerEvents="none"
             >
                 Inflight
             </text>
 
             <text
                 x={labelX}
-                y="-6"
+                y={labelLineTwoY}
                 textAnchor="middle"
                 dominantBaseline="middle"
                 fill="#e6c76f"
                 fontSize="6.5"
                 fontWeight="750"
                 letterSpacing="0.25"
+                pointerEvents="none"
             >
                 Aviation
             </text>
@@ -3440,33 +3519,21 @@ function CompassFeatureMarker({
 function CompassVisibilityBadge({ label }: { label: string }) {
     return (
         <g pointerEvents="none">
-            <rect
-                x="16"
-                y="18"
-                width="88"
-                height="28"
-                rx="14"
-                fill="#050505"
-                stroke="#3f3f46"
-                strokeWidth="1"
-                opacity="0.92"
-            />
-
             <image
                 href="/icons/visibility.png"
-                x="26"
-                y="24"
-                width="16"
-                height="16"
+                x="18"
+                y="19"
+                width="24"
+                height="24"
                 preserveAspectRatio="xMidYMid meet"
             />
 
             <text
-                x="50"
+                x="48"
                 y="32"
                 dominantBaseline="middle"
-                fill="#f4f4f5"
-                fontSize="12"
+                fill="#e6c76f"
+                fontSize="13"
                 fontWeight="850"
             >
                 {label}
