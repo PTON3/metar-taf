@@ -1145,18 +1145,10 @@ function TafHourlyForecast({
                     return (
                         <div
                             key={slot.startsAt.toISOString()}
-                            className={
-                                fullscreen
-                                    ? "flex h-[440px] w-[155px] shrink-0 flex-col"
-                                    : "flex h-[440px] w-[155px] shrink-0 flex-col"
-                            }
+                            className="flex h-[420px] w-[155px] shrink-0 flex-col"
                         >
                             <article
-                                className={
-                                    fullscreen
-                                        ? "flex h-[400px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
-                                        : "flex h-[400px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
-                                }
+                                className="flex h-[380px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
                             >
                                 <div className="flex flex-none items-start justify-between gap-2">
                                     <div>
@@ -1183,7 +1175,7 @@ function TafHourlyForecast({
                                         height={128}
                                         draggable={false}
                                         onDragStart={(event) => event.preventDefault()}
-                                        className="pointer-events-none h-32 w-32 select-none object-contain drop-shadow-2xl"
+                                        className="pointer-events-none h-32 w-32 max-w-none select-none object-contain drop-shadow-2xl"
                                     />
                                 </div>
 
