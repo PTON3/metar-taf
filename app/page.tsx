@@ -2988,8 +2988,25 @@ function RunwayCompassSvg({
                 ? "Wind direction"
                 : "Wind hidden";
 
-    const headingAtPointer = Math.round(normalizeAngle360(compassRotation)) % 360;
-    const headingAtPointerLabel = `${String(headingAtPointer).padStart(3, "0")}°`;
+    // Round the heading beneath the red pointer to the nearest 10 degrees.
+    const headingAtPointer = normalizeAngle360(
+        Math.round(normalizeAngle360(compassRotation) / 10) * 10
+    );
+
+    const headingAtPointerLabel =
+        `${String(headingAtPointer).padStart(3, "0")}°`;
+
+    // Wind components now use the compass heading rather than the
+    // selected or automatically recommended runway.
+    const dynamicWindComponent =
+        windDirectionDeg !== null
+            ? calculateRunwayWindComponent(
+                windDirectionDeg,
+                windSpeedKt,
+                headingAtPointer
+            )
+            : null;
+
     const visibilityLabel = formatCompassVisibility(visibilitySm);
 
     function cycleWindDisplayMode() {
@@ -3336,9 +3353,9 @@ function RunwayCompassSvg({
                 <WindModeIcon mode={windDisplayMode} x={37} y={367} />
             </g>
 
-            {activeRunway && (
+            {dynamicWindComponent && (
                 <WindComponentStack
-                    component={activeRunway.component}
+                    component={dynamicWindComponent}
                     x={320}
                     y={350}
                 />
