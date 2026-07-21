@@ -614,7 +614,7 @@ function MetarDashboard({
     useEffect(() => {
         const timer = window.setInterval(() => {
             setNow(new Date());
-        }, 60_000);
+        }, 1_000);
 
         return () => window.clearInterval(timer);
     }, []);
@@ -710,11 +710,18 @@ function MetarDashboard({
                                     )}
                                 </div>
 
-                                <ObservationTimeBubble
-                                    metar={metar}
-                                    now={now}
-                                    stationInfo={stationInfo}
-                                />
+                                <div className="flex flex-wrap items-center gap-3">
+                                    <LiveAirportClock
+                                        now={now}
+                                        timeZone={stationInfo?.timeZone}
+                                    />
+
+                                    <ObservationTimeBubble
+                                        metar={metar}
+                                        now={now}
+                                        stationInfo={stationInfo}
+                                    />
+                                </div>
                             </div>
                         </div>
 
@@ -839,6 +846,11 @@ function MetarDashboard({
                                     </div>
 
                                     <div className="flex shrink-0 items-center gap-3">
+                                        <LiveAirportClock
+                                            now={now}
+                                            timeZone={stationInfo?.timeZone}
+                                        />
+
                                         <ObservationTimeBubble
                                             metar={metar}
                                             now={now}
@@ -2487,6 +2499,79 @@ function DashboardTabButton({
     );
 }
 
+function LiveAirportClock({
+    now,
+    timeZone,
+}: {
+    now: Date;
+    timeZone: string | null | undefined;
+}) {
+    const clockTime = formatLiveAirportClockTime(now, timeZone);
+    const clockZone = formatLiveAirportClockZone(now, timeZone);
+
+    return (
+        <div
+            className="inline-flex w-fit items-center gap-2 whitespace-nowrap rounded-2xl border border-zinc-700 bg-black/65 px-4 py-3 text-sm font-semibold text-zinc-200"
+            aria-label={`Current airport time: ${clockTime} ${clockZone}`}
+        >
+            <span className="text-white">
+                <ClockIcon />
+            </span>
+
+            <span className="tabular-nums text-white">
+                {clockTime}
+            </span>
+
+            {clockZone && (
+                <span className="text-zinc-400">
+                    {clockZone}
+                </span>
+            )}
+        </div>
+    );
+}
+
+function formatLiveAirportClockTime(
+    now: Date,
+    timeZone: string | null | undefined
+): string {
+    if (!timeZone) {
+        return "--:--:--";
+    }
+
+    try {
+        return new Intl.DateTimeFormat("en-US", {
+            timeZone,
+            hour: "numeric",
+            minute: "2-digit",
+            second: "2-digit",
+            hour12: true,
+        }).format(now);
+    } catch {
+        return "--:--:--";
+    }
+}
+
+function formatLiveAirportClockZone(
+    now: Date,
+    timeZone: string | null | undefined
+): string {
+    if (!timeZone) {
+        return "";
+    }
+
+    try {
+        const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone,
+            timeZoneName: "short",
+        }).formatToParts(now);
+
+        return parts.find((part) => part.type === "timeZoneName")?.value ?? "";
+    } catch {
+        return "";
+    }
+}
+
 function ObservationTimeBubble({
     metar,
     now,
@@ -2502,7 +2587,7 @@ function ObservationTimeBubble({
     return (
         <div className="inline-flex w-fit flex-wrap items-center gap-2 rounded-2xl border border-zinc-700 bg-black/65 px-4 py-3 text-sm font-semibold text-zinc-200">
             <span className={`inline-flex items-center gap-2 ${ageColor}`}>
-                <ClockIcon />
+                <HourglassIcon />
                 {formatMetarAge(ageMinutes)}
             </span>
 
@@ -2538,6 +2623,39 @@ function ClockIcon() {
                 strokeWidth="2"
                 strokeLinecap="round"
                 strokeLinejoin="round"
+            />
+        </svg>
+    );
+}
+
+function HourglassIcon() {
+    return (
+        <svg
+            className="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+        >
+            <path
+                d="M6 3h12M6 21h12"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+            />
+
+            <path
+                d="M7 3c0 4 1.5 6.2 5 9-3.5 2.8-5 5-5 9M17 3c0 4-1.5 6.2-5 9 3.5 2.8 5 5 5 9"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+            />
+
+            <path
+                d="M9 18h6"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
             />
         </svg>
     );
