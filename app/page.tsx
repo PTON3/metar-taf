@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
 import * as SunCalc from "suncalc";
 import Image from "next/image";
+import FeedbackWidget from "./FeedbackWidget";
 
 type ApiResponse = {
     raw?: string;
@@ -580,6 +581,8 @@ export default function Home() {
                 </footer>
 
             </div>
+
+            <FeedbackWidget currentStation={station} />
         </main>
     );
 }
