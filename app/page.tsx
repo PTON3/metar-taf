@@ -2506,17 +2506,22 @@ function LiveAirportClock({
     now: Date;
     timeZone: string | null | undefined;
 }) {
+    const clockZulu = formatLiveAirportClockZulu(now);
     const clockTime = formatLiveAirportClockTime(now, timeZone);
     const clockZone = formatLiveAirportClockZone(now, timeZone);
 
     return (
         <div
-            className="inline-flex w-fit items-center gap-2 whitespace-nowrap rounded-2xl border border-zinc-700 bg-black/65 px-4 py-3 text-sm font-semibold text-zinc-200"
-            aria-label={`Current airport time: ${clockTime} ${clockZone}`}
+            className="inline-flex w-fit flex-wrap items-center gap-2 whitespace-nowrap rounded-2xl border border-zinc-700 bg-black/65 px-4 py-3 text-sm font-semibold text-zinc-200"
+            aria-label={`Current time: ${clockZulu} Zulu, ${clockTime} ${clockZone}`}
         >
             <span className="text-white">
                 <ClockIcon />
             </span>
+
+            <span className="tabular-nums text-white">{clockZulu}</span>
+
+            <span className="text-zinc-600">|</span>
 
             <span className="tabular-nums text-white">
                 {clockTime}
@@ -2529,6 +2534,21 @@ function LiveAirportClock({
             )}
         </div>
     );
+}
+
+function formatLiveAirportClockZulu(now: Date): string {
+    try {
+        return `${new Intl.DateTimeFormat("en-US", {
+            timeZone: "UTC",
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+        })
+            .format(now)
+            .replace(":", "")}Z`;
+    } catch {
+        return "----Z";
+    }
 }
 
 function formatLiveAirportClockTime(
