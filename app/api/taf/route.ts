@@ -168,6 +168,10 @@ function summarizeForecastBlocks(forecast: unknown) {
 
         return {
             change: block.change_indicator ?? "BASE",
+            probability:
+                block.probability !== undefined && block.probability !== null
+                    ? Number(block.probability)
+                    : null,
             from: block.fcst_time_from,
             to: block.fcst_time_to,
             windDirection: block.wind_dir_degrees ?? null,
