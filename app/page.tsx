@@ -142,6 +142,7 @@ type TafSkyCondition = {
 
 type TafForecastBlock = {
     change?: string | null;
+    probability?: number | null;
     from?: string | null;
     to?: string | null;
     windDirection?: string | number | null;
@@ -231,7 +232,7 @@ const TAF_MARKER_ICON_SRC = {
 const LIVE_WEATHER_REFRESH_MS = 1 * 60 * 1000;
 const TAF_REFRESH_MS = 5 * 60 * 1000;
 
-const TAF_FULLSCREEN_BASE_HEIGHT = 440;
+const TAF_FULLSCREEN_BASE_HEIGHT = 490;
 const TAF_FULLSCREEN_MIN_SCALE = 0.45;
 const TAF_FULLSCREEN_CARD_WIDTH = 155;
 const TAF_FULLSCREEN_CARD_GAP = 12;
@@ -258,6 +259,8 @@ type TafHourSlot = {
     wind: string;
     gusts: string;
     change: string;
+    precipChance: { percent: number; label: string } | null;
+    changeNote: string | null;
     markers: TafTimelineMarker[];
     isNightCurrency: boolean;
 };
@@ -1018,11 +1021,13 @@ function TafHourlyForecast({
         Math.max(0, slots.length - 1) * TAF_FULLSCREEN_CARD_GAP;
 
     const scrollRef = useRef<HTMLDivElement | null>(null);
+    const rowRef = useRef<HTMLDivElement | null>(null);
     const [isDragging, setIsDragging] = useState(false);
     const [startX, setStartX] = useState(0);
     const [scrollLeft, setScrollLeft] = useState(0);
 
     const [tafScale, setTafScale] = useState(1);
+    const [naturalRowHeight, setNaturalRowHeight] = useState(TAF_FULLSCREEN_BASE_HEIGHT);
 
     useEffect(() => {
         if (!fullscreen) {
@@ -1030,7 +1035,10 @@ function TafHourlyForecast({
         }
 
         const slider = scrollRef.current;
-        if (!slider) return;
+        const row = rowRef.current;
+        if (!slider || !row) return;
+
+        let latestRowHeight = row.offsetHeight || TAF_FULLSCREEN_BASE_HEIGHT;
 
         const updateScale = () => {
             const availableHeight = slider.clientHeight;
@@ -1038,22 +1046,31 @@ function TafHourlyForecast({
                 1,
                 Math.max(
                     TAF_FULLSCREEN_MIN_SCALE,
-                    availableHeight / TAF_FULLSCREEN_BASE_HEIGHT
+                    availableHeight / latestRowHeight
                 )
             );
 
             setTafScale(Number(nextScale.toFixed(3)));
         };
 
-        const frame = window.requestAnimationFrame(updateScale);
-        const observer = new ResizeObserver(updateScale);
+        const handleRowResize = () => {
+            latestRowHeight = row.offsetHeight || latestRowHeight;
+            setNaturalRowHeight(latestRowHeight);
+            updateScale();
+        };
 
-        observer.observe(slider);
+        const frame = window.requestAnimationFrame(handleRowResize);
+        const sliderObserver = new ResizeObserver(updateScale);
+        const rowObserver = new ResizeObserver(handleRowResize);
+
+        sliderObserver.observe(slider);
+        rowObserver.observe(row);
         window.addEventListener("resize", updateScale);
 
         return () => {
             window.cancelAnimationFrame(frame);
-            observer.disconnect();
+            sliderObserver.disconnect();
+            rowObserver.disconnect();
             window.removeEventListener("resize", updateScale);
         };
     }, [fullscreen]);
@@ -1137,7 +1154,7 @@ function TafHourlyForecast({
                     fullscreen
                         ? {
                             width: `${tafFullscreenContentWidth * tafScale}px`,
-                            height: `${TAF_FULLSCREEN_BASE_HEIGHT * tafScale}px`,
+                            height: `${naturalRowHeight * tafScale}px`,
                             position: "relative",
                             flex: "0 0 auto",
                         }
@@ -1146,6 +1163,7 @@ function TafHourlyForecast({
                 className={fullscreen ? "" : "flex min-w-max gap-3"}
             >
                 <div
+                    ref={rowRef}
                     style={
                         fullscreen
                             ? {
@@ -1157,7 +1175,7 @@ function TafHourlyForecast({
                             }
                             : undefined
                     }
-                    className={`flex min-w-max ${fullscreen ? "h-[440px] items-end gap-3" : "gap-3"}`}
+                    className="flex min-w-max gap-3"
                 >
                 {slots.map((slot, index) => {
                     const { dayLabel, hourLabel } = formatTafHourLabel(
@@ -1173,10 +1191,10 @@ function TafHourlyForecast({
                     return (
                         <div
                             key={slot.startsAt.toISOString()}
-                            className="flex h-[420px] w-[155px] shrink-0 flex-col"
+                            className="flex w-[155px] shrink-0 flex-col"
                         >
                             <article
-                                className="flex h-[380px] flex-none flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 shadow-lg"
+                                className="flex h-full flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 pb-2 shadow-lg"
                             >
                                 <div className="flex flex-none items-start justify-between gap-2">
                                     <div>
@@ -1195,7 +1213,7 @@ function TafHourlyForecast({
                                     </span>
                                 </div>
 
-                                <div className="mt-0 flex h-30 items-center justify-center">
+                                <div className="mt-0 flex h-32 items-center justify-center">
                                     <Image
                                         src={TAF_ICON_SRC[slot.iconKey]}
                                         alt={slot.weatherLabel}
@@ -1207,16 +1225,15 @@ function TafHourlyForecast({
                                     />
                                 </div>
 
-                                <p className="min-h-[20px] text-center text-sm font-semibold leading-5 text-white">
+                                <p className="min-h-[40px] text-center text-sm font-semibold leading-5 text-white">
                                     {slot.weatherLabel}
                                 </p>
 
-                                <div className="mt-1 min-h-[30px]">
-                                    {slot.change !== "BASE" && (
-                                        <p className="rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-2 py-1 text-center text-[10px] font-bold uppercase tracking-[0.12em] text-[#e6c76f]">
-                                            {slot.change}
-                                        </p>
-                                    )}
+                                <div className="mt-3 min-h-[30px]">
+                                    <p className="flex items-center justify-center gap-1.5 rounded-full border border-dashed border-sky-400/50 px-2 py-1 text-center text-[10px] font-bold uppercase tracking-[0.12em] text-sky-300">
+                                        <RaindropIcon />
+                                        {slot.precipChance ? slot.precipChance.percent : 0}% chance
+                                    </p>
                                 </div>
 
                                 <div className="mt-2 space-y-2 rounded-xl border border-zinc-800 bg-black/35 p-3 text-xs">
@@ -1225,6 +1242,12 @@ function TafHourlyForecast({
                                     <TafHourRow label="Wind" value={slot.wind} />
                                     <TafHourRow label="Gust" value={slot.gusts} />
                                 </div>
+
+                                {slot.changeNote && (
+                                    <p className="mt-2 text-center text-[10px] uppercase tracking-[0.1em] text-zinc-600">
+                                        {slot.changeNote}
+                                    </p>
+                                )}
                             </article>
 
                             <div
@@ -1482,6 +1505,7 @@ function buildTafHourlySlots(
 
         const isDay = isTafDayIconForHour(cursor, timeZone, latitude, longitude);
         const iconInfo = getTafIconInfo(activeBlock, isDay);
+        const changeInfo = getTafChangeInfo(activeBlock);
 
         slots.push({
             startsAt: new Date(cursor),
@@ -1494,6 +1518,8 @@ function buildTafHourlySlots(
             wind: formatTafWindShort(activeBlock),
             gusts: activeBlock.windGustKt ? `${activeBlock.windGustKt} kt` : "—",
             change: activeBlock.change ?? "BASE",
+            precipChance: changeInfo.precipChance,
+            changeNote: changeInfo.changeNote,
             markers: [],
             isNightCurrency: false,
         });
@@ -1546,6 +1572,53 @@ function getActiveTafBlock(
     return matchingBlocks.sort(
         (a, b) => getTafChangePriority(b.change) - getTafChangePriority(a.change)
     )[0];
+}
+
+function getTafChangeInfo(block: TafForecastBlock): {
+    precipChance: { percent: number; label: string } | null;
+    changeNote: string | null;
+} {
+    const code = (block.change ?? "BASE").toUpperCase();
+
+    if (code.includes("PROB")) {
+        const percentMatch = code.match(/PROB(\d+)/);
+        const percent = block.probability ?? (percentMatch ? Number(percentMatch[1]) : null);
+        const precipLabel = getPrecipChanceLabel(block.weather);
+
+        if (percent && precipLabel) {
+            return { precipChance: { percent, label: precipLabel }, changeNote: null };
+        }
+    }
+
+    if (code.includes("TEMPO")) {
+        return { precipChance: null, changeNote: "TEMPO" };
+    }
+
+    if (code.includes("BECMG")) {
+        return { precipChance: null, changeNote: "BECMG" };
+    }
+
+    if (code.startsWith("FM")) {
+        return { precipChance: null, changeNote: "FM" };
+    }
+
+    return { precipChance: null, changeNote: null };
+}
+
+function getPrecipChanceLabel(weather?: string | null): string | null {
+    const w = (weather ?? "").toUpperCase();
+
+    if (!w) return null;
+
+    if (w.includes("TS")) return w.includes("RA") ? "Thunderstorms / rain" : "Thunderstorms";
+    if (w.includes("FZRA") || w.includes("FZDZ")) return "Freezing rain";
+    if (w.includes("PL") || w.includes("IC")) return "Freezing precip";
+    if (w.includes("SN") || w.includes("SG") || w.includes("BLSN")) return "Snow";
+    if (w.includes("SHRA") || w.includes("VCSH")) return "Rain showers";
+    if (w.includes("RA") || w.includes("DZ")) return "Rain";
+    if (w.includes("GR") || w.includes("GS")) return "Hail";
+
+    return null;
 }
 
 function getTafChangePriority(change?: string | null) {
@@ -2633,6 +2706,24 @@ function ObservationTimeBubble({
 
             <span>{formatLocalObservation(metar, stationInfo?.timeZone)}</span>
         </div>
+    );
+}
+
+function RaindropIcon() {
+    return (
+        <svg
+            className="h-3 w-3 shrink-0"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+        >
+            <path
+                d="M12 3c3.2 4.4 6 8.2 6 11.2a6 6 0 1 1-12 0C6 11.2 8.8 7.4 12 3Z"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinejoin="round"
+            />
+        </svg>
     );
 }
 
