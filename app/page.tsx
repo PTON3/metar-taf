@@ -1,6 +1,7 @@
 ﻿"use client";
 
 import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
 import * as SunCalc from "suncalc";
 import Image from "next/image";
@@ -728,8 +729,9 @@ function MetarDashboard({
                         <div
                             className={`rounded-2xl border px-5 py-3 text-center ${categoryStyle}`}
                         >
-                            <p className="text-xs font-semibold uppercase tracking-[0.2em]">
+                            <p className="flex items-center justify-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em]">
                                 Flight Category
+                                <InfoTooltip text="Combines ceiling and visibility into one rating: VFR (good), MVFR (marginal), IFR (low), or LIFR (very low)." />
                             </p>
                             <p className="mt-1 text-3xl font-black">
                                 {metar.flightCategory}
@@ -906,12 +908,18 @@ function WeatherDashboardTab({
 
             <RunwayWindWidget metar={metar} runways={runways} />
 
+            <p className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                METAR
+                <InfoTooltip text="A routine surface weather observation taken directly at the airport, issued hourly or whenever conditions change significantly." />
+            </p>
+
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 <WeatherCard
                     label="Wind"
                     value={formatWind(metar)}
                     detail={formatWindDetail(metar)}
                     accent="gold"
+                    info="Direction the wind is blowing from (degrees true) and its sustained speed in knots. Gusts are shown when reported."
                 />
 
                 <WeatherCard
@@ -919,6 +927,7 @@ function WeatherDashboardTab({
                     value={formatVisibility(metar)}
                     detail={getVisibilityDescription(metar)}
                     accent="silver"
+                    info="How far you can see horizontally, in statute miles. Lower numbers mean hazier or thicker weather."
                 />
 
                 <WeatherCard
@@ -926,6 +935,7 @@ function WeatherDashboardTab({
                     value={formatCeiling(metar)}
                     detail={getCeilingDescription(metar)}
                     accent="silver"
+                    info="Height of the lowest broken or overcast cloud layer, in feet above the ground. Usually the main limiter for visual flying."
                 />
 
                 <WeatherCard
@@ -933,6 +943,7 @@ function WeatherDashboardTab({
                     value={formatClouds(metar)}
                     detail={getCloudDescription(metar)}
                     accent="gold"
+                    info="Sky cover by layer — few, scattered, broken, or overcast — listed from lowest to highest."
                 />
 
                 <WeatherCard
@@ -940,6 +951,7 @@ function WeatherDashboardTab({
                     value={formatTemperature(metar)}
                     detail={getSpreadDescription(metar)}
                     accent="silver"
+                    info="Air temperature and dew point in degrees Celsius. The smaller the gap between them, the higher the chance of fog or low clouds."
                 />
 
                 <WeatherCard
@@ -947,6 +959,7 @@ function WeatherDashboardTab({
                     value={formatAltimeter(metar)}
                     detail="Pressure setting"
                     accent="gold"
+                    info="The local barometric pressure setting, in inches of mercury. Dial this into your altimeter so it reads true altitude."
                 />
             </div>
 
@@ -2058,8 +2071,9 @@ function TafDashboardTab({
         <div className="space-y-4 rounded-2xl border border-zinc-800 bg-black/55 p-6">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
                         TAF
+                        <InfoTooltip text="Terminal Aerodrome Forecast — a scheduled forecast of expected airport weather over the next 24-30 hours, updated a few times a day." />
                     </p>
 
                     <h3 className="mt-2 text-2xl font-bold text-white">
@@ -2811,24 +2825,92 @@ function TabButton({
     );
 }
 
+const INFO_TOOLTIP_WIDTH = 224;
+const INFO_TOOLTIP_MARGIN = 8;
+
+function InfoTooltip({ text }: { text: string }) {
+    const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
+    const buttonRef = useRef<HTMLButtonElement | null>(null);
+
+    function show() {
+        const rect = buttonRef.current?.getBoundingClientRect();
+        if (!rect) return;
+
+        const left = Math.min(
+            Math.max(
+                rect.left + rect.width / 2 - INFO_TOOLTIP_WIDTH / 2,
+                INFO_TOOLTIP_MARGIN
+            ),
+            window.innerWidth - INFO_TOOLTIP_WIDTH - INFO_TOOLTIP_MARGIN
+        );
+
+        setCoords({ top: rect.top - INFO_TOOLTIP_MARGIN, left });
+    }
+
+    function hide() {
+        setCoords(null);
+    }
+
+    return (
+        <span className="relative inline-flex">
+            <button
+                ref={buttonRef}
+                type="button"
+                onMouseEnter={show}
+                onMouseLeave={hide}
+                onFocus={show}
+                onBlur={hide}
+                className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-zinc-600 p-0 text-zinc-400 transition hover:border-[#d6b35a]/60 hover:text-[#e6c76f] focus:border-[#d6b35a]/60 focus:text-[#e6c76f] focus:outline-none"
+                aria-label="More information"
+            >
+                <svg
+                    viewBox="0 0 24 24"
+                    className="h-2.5 w-2.5"
+                    fill="currentColor"
+                    aria-hidden="true"
+                >
+                    <circle cx="12" cy="6.5" r="2" />
+                    <rect x="10.25" y="10.5" width="3.5" height="9.5" rx="1.2" />
+                </svg>
+            </button>
+
+            {coords &&
+                typeof document !== "undefined" &&
+                createPortal(
+                    <span
+                        role="tooltip"
+                        style={{ top: coords.top, left: coords.left, width: INFO_TOOLTIP_WIDTH }}
+                        className="pointer-events-none fixed z-50 -translate-y-full rounded-lg border border-zinc-700 bg-zinc-900 p-2.5 text-left text-xs font-normal normal-case leading-5 tracking-normal text-zinc-300 shadow-xl"
+                    >
+                        {text}
+                    </span>,
+                    document.body
+                )}
+        </span>
+    );
+}
+
 function WeatherCard({
     label,
     value,
     detail,
     accent,
+    info,
 }: {
     label: string;
     value: string;
     detail: string;
     accent: "gold" | "silver";
+    info?: string;
 }) {
     const accentClass =
         accent === "gold" ? "border-[#d6b35a]/30" : "border-zinc-700";
 
     return (
         <div className={`rounded-2xl border ${accentClass} bg-black/55 p-5`}>
-            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+            <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
                 {label}
+                {info && <InfoTooltip text={info} />}
             </p>
             <p className="mt-3 text-2xl font-bold text-white">{value}</p>
             <p className="mt-2 text-sm leading-6 text-zinc-400">{detail}</p>
@@ -2948,8 +3030,9 @@ function RunwayWindWidget({
             {!fullscreen && (
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
                     <div>
-                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                        <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
                             Visual Decoder
+                            <InfoTooltip text="Click a runway number to view wind from that runway's perspective. Click and drag the compass ring to rotate it manually. RESET snaps back to north-up, and the ping icon orients to the inflight view. The gold outline marks the runway with the best headwind." />
                         </p>
                         <p className="mt-2 text-sm leading-6 text-zinc-400">
                             Select a runway on the graphic to rotate into that runway’s point of view.
@@ -3423,6 +3506,8 @@ function RunwayCompassSvg({
                     role="button"
                     aria-label="Reset north up"
                 >
+                    <title>Reset compass to north-up</title>
+
                     <rect
                         x="334"
                         y="18"
@@ -3622,6 +3707,8 @@ function CompassFeatureMarker({
                     event.preventDefault();
                 }}
             >
+                <title>Orient to inflight view</title>
+
                 <circle cx="0" cy="-13" r="12" fill="transparent" />
 
                 <image
@@ -4614,6 +4701,8 @@ function CompassRunwayPair({
                         onSelectEnd(endA);
                     }}
                 >
+                    <title>{`View from runway ${endA.ident}`}</title>
+
                     <text
                         x="0"
                         y={-runwayLength / 2 - labelOffset}
@@ -4644,6 +4733,8 @@ function CompassRunwayPair({
                         onSelectEnd(endB);
                     }}
                 >
+                    <title>{`View from runway ${endB.ident}`}</title>
+
                     <text
                         x="0"
                         y={runwayLength / 2 + labelOffset}
