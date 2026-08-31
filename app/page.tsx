@@ -270,6 +270,7 @@ type InflightLabelSide = "left" | "right" | "middle";
 export default function Home() {
     const [activeTab, setActiveTab] = useState<DecoderTab>("lookup");
     const [station, setStation] = useState("KFCM");
+    const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
     const [rawInput, setRawInput] = useState("");
 
     const [metar, setMetar] = useState<NormalizedMetar | null>(null);
@@ -572,6 +573,8 @@ export default function Home() {
                         stationInfo={stationInfo}
                         airportDiagram={airportDiagram}
                         runways={runways}
+                        isFullscreenOpen={isFullscreenOpen}
+                        setIsFullscreenOpen={setIsFullscreenOpen}
                     />
                     ) : (
                     <EmptyState />
@@ -586,7 +589,7 @@ export default function Home() {
 
             </div>
 
-            <FeedbackWidget currentStation={station} />
+            <FeedbackWidget currentStation={station} hidden={isFullscreenOpen} />
         </main>
     );
 }
@@ -598,6 +601,8 @@ function MetarDashboard({
     stationInfo,
     airportDiagram,
     runways,
+    isFullscreenOpen,
+    setIsFullscreenOpen,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
@@ -605,12 +610,13 @@ function MetarDashboard({
     stationInfo: StationInfo | null;
     airportDiagram: AirportDiagramInfo | null;
     runways: AirportRunway[];
+    isFullscreenOpen: boolean;
+    setIsFullscreenOpen: (value: boolean) => void;
 }) {
     const [now, setNow] = useState(() => new Date());
     const [activeDashboardTab, setActiveDashboardTab] =
         useState<DashboardTab>("weather");
 
-    const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
     const fullscreenRef = useRef<HTMLDivElement | null>(null);
 
     const categoryStyle = FLIGHT_CATEGORY_STYLES[metar.flightCategory];
@@ -654,6 +660,60 @@ function MetarDashboard({
         setIsFullscreenOpen(false);
     }
 
+    const fullscreenStationInfoBlock = (
+        <div className="min-w-0">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#d6b35a]">
+                Fullscreen Weather
+            </p>
+
+            <div className="mt-1 min-w-0">
+                <h2 className="truncate text-3xl font-black leading-tight text-white md:text-4xl">
+                    {stationInfo?.displayName ??
+                        metar.station ??
+                        "Unknown Station"}
+                </h2>
+
+                {stationInfo && (
+                    <p className="mt-1 truncate text-sm text-zinc-400">
+                        {stationInfo.displayLocation}
+                        {stationInfo.elevationFt !== null
+                            ? ` | Elev. ${stationInfo.elevationFt.toLocaleString()} ft`
+                            : ""}
+                        {stationInfo.timeZone
+                            ? ` | ${stationInfo.timeZone}`
+                            : ""}
+                    </p>
+                )}
+            </div>
+        </div>
+    );
+
+    const fullscreenFlightCategoryBadge = (
+        <div className={`rounded-2xl border px-7 py-3 text-center ${categoryStyle}`}>
+            <p className="text-3xl font-black leading-none">
+                {metar.flightCategory}
+            </p>
+
+            <p className="mt-2 text-sm font-semibold">
+                {getFlightCategoryDescription(metar)}
+            </p>
+        </div>
+    );
+
+    const fullscreenClockExitBlock = (
+        <div className="flex shrink-0 items-center gap-3">
+            <LiveAirportClock now={now} timeZone={stationInfo?.timeZone} />
+
+            <button
+                type="button"
+                onClick={closeFullscreenDashboard}
+                className="rounded-full border border-zinc-700 bg-black/70 px-4 py-2 text-[11px] font-black uppercase tracking-[0.16em] text-zinc-200 transition hover:border-[#d6b35a]/50 hover:text-[#e6c76f]"
+            >
+                Exit
+            </button>
+        </div>
+    );
+
     return (
         <>
             <section className="mt-8 overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 shadow-2xl">
@@ -670,7 +730,7 @@ function MetarDashboard({
                                     onClick={() => setIsFullscreenOpen(true)}
                                     aria-label="Open fullscreen weather dashboard"
                                     title="Fullscreen"
-                                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-700 bg-black/70 text-zinc-300 transition hover:border-[#d6b35a]/50 hover:bg-[#d6b35a]/10 hover:text-[#e6c76f]"
+                                    className="hidden h-9 w-9 items-center justify-center rounded-full border border-zinc-700 bg-black/70 text-zinc-300 transition hover:border-[#d6b35a]/50 hover:bg-[#d6b35a]/10 hover:text-[#e6c76f] min-[700px]:inline-flex"
                                 >
                                     <svg
                                         viewBox="0 0 24 24"
@@ -801,66 +861,32 @@ function MetarDashboard({
                 >
                     <div className="absolute inset-0 overflow-hidden">
                         <div className="flex h-full min-h-0 w-full flex-col gap-3 px-3 py-3 sm:px-5 sm:py-4">
-                            <div className="h-[120px] flex-none rounded-3xl border border-zinc-800 bg-gradient-to-r from-black via-zinc-950 to-[#171307] p-4 shadow-2xl">
+                            <div className="flex-none rounded-3xl border border-zinc-800 bg-gradient-to-r from-black via-zinc-950 to-[#171307] p-4 shadow-2xl">
                                 <div
                                     style={{
                                         gridTemplateColumns: "minmax(0, 560px) minmax(0, 1fr) auto",
                                     }}
-                                    className="grid h-full items-center gap-6"
+                                    className="hidden h-[120px] items-center gap-6 min-[1250px]:grid"
                                 >
-                                    <div className="min-w-0">
-                                        <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#d6b35a]">
-                                            Fullscreen Weather
-                                        </p>
-
-                                        <div className="mt-1 min-w-0">
-                                            <h2 className="truncate text-3xl font-black leading-tight text-white md:text-4xl">
-                                                {stationInfo?.displayName ??
-                                                    metar.station ??
-                                                    "Unknown Station"}
-                                            </h2>
-
-                                            {stationInfo && (
-                                                <p className="mt-1 truncate text-sm text-zinc-400">
-                                                    {stationInfo.displayLocation}
-                                                    {stationInfo.elevationFt !== null
-                                                        ? ` | Elev. ${stationInfo.elevationFt.toLocaleString()} ft`
-                                                        : ""}
-                                                    {stationInfo.timeZone
-                                                        ? ` | ${stationInfo.timeZone}`
-                                                        : ""}
-                                                </p>
-                                            )}
-                                        </div>
-                                    </div>
+                                    {fullscreenStationInfoBlock}
 
                                     <div
                                         style={{ width: "calc(100% - 48px)" }}
-                                        className={`h-[78px] min-w-0 justify-self-start rounded-2xl border px-7 py-3 text-center ${categoryStyle}`}
+                                        className="h-[78px] min-w-0 justify-self-start"
                                     >
-                                        <p className="text-3xl font-black leading-none">
-                                            {metar.flightCategory}
-                                        </p>
-
-                                        <p className="mt-2 text-sm font-semibold">
-                                            {getFlightCategoryDescription(metar)}
-                                        </p>
+                                        {fullscreenFlightCategoryBadge}
                                     </div>
 
-                                    <div className="flex shrink-0 items-center gap-3">
-                                        <LiveAirportClock
-                                            now={now}
-                                            timeZone={stationInfo?.timeZone}
-                                        />
+                                    {fullscreenClockExitBlock}
+                                </div>
 
-                                        <button
-                                            type="button"
-                                            onClick={closeFullscreenDashboard}
-                                            className="rounded-full border border-zinc-700 bg-black/70 px-4 py-2 text-[11px] font-black uppercase tracking-[0.16em] text-zinc-200 transition hover:border-[#d6b35a]/50 hover:text-[#e6c76f]"
-                                        >
-                                            Exit
-                                        </button>
+                                <div className="flex flex-col gap-3 min-[1250px]:hidden">
+                                    <div className="flex items-start justify-between gap-3">
+                                        {fullscreenStationInfoBlock}
+                                        {fullscreenClockExitBlock}
                                     </div>
+
+                                    {fullscreenFlightCategoryBadge}
                                 </div>
                             </div>
 
@@ -874,7 +900,7 @@ function MetarDashboard({
                                 />
                             </div>
 
-                            <div className="h-[clamp(260px,32dvh,380px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-3">
+                            <div className="relative h-[clamp(260px,32dvh,380px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-3">
                                 <div className="flex h-full w-full flex-col justify-end">
                                     <TafDashboardTab
                                         station={metar.station ?? station}
@@ -2140,8 +2166,8 @@ function TafDashboardTab({
     if (hourlyOnly) {
         if (fullscreen) {
             return (
-                <div className="relative h-full w-full">
-                    <div className="pointer-events-none absolute -right-2 -top-2 z-10 sm:-right-3 sm:-top-3">
+                <>
+                    <div className="pointer-events-none absolute right-2 top-2 z-10">
                         <TafIssuedBubble
                             issueTime={taf.issueTime}
                             timeZone={timeZone}
@@ -2157,7 +2183,7 @@ function TafDashboardTab({
                         longitude={longitude}
                         fullscreen={fullscreen}
                     />
-                </div>
+                </>
             );
         }
 
@@ -2845,10 +2871,10 @@ function ClockIcon() {
     );
 }
 
-function HourglassIcon() {
+function HourglassIcon({ className = "h-4 w-4" }: { className?: string }) {
     return (
         <svg
-            className="h-4 w-4"
+            className={className}
             viewBox="0 0 24 24"
             fill="none"
             aria-hidden="true"
