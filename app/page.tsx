@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
+import { OPERATIONAL_MINIMUMS } from "@/lib/minimums/weatherMinimums";
 import * as SunCalc from "suncalc";
 import Image from "next/image";
 import FeedbackWidget from "./FeedbackWidget";
@@ -3287,20 +3288,8 @@ function RunwayWindWidget({
             )}
 
             {fullscreen ? (
-                <>
-                    <div
-                        style={{
-                            position: "absolute",
-                            top: "8px",
-                            bottom: "8px",
-                            left: "8px",
-                            width: "calc(50% - 12px)",
-                            overflow: "hidden",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                        }}
-                    >
+                <div className="absolute inset-2 flex gap-4">
+                    <div className="flex min-w-0 flex-1 items-center justify-center overflow-hidden">
                         <RunwayCompassSvg
                             runways={runways}
                             runwayEnds={calculatedEnds}
@@ -3320,21 +3309,9 @@ function RunwayWindWidget({
                         />
                     </div>
 
-                    <div
-                        style={{
-                            position: "absolute",
-                            top: "8px",
-                            bottom: "8px",
-                            right: "8px",
-                            width: "calc(50% - 12px)",
-                            overflow: "hidden",
-                            display: "flex",
-                            flexDirection: "column",
-                            alignItems: "flex-end",
-                        }}
-                    >
+                    <div className="flex min-w-0 flex-1 flex-col overflow-hidden min-[1250px]:items-center min-[1250px]:justify-center">
                         {now && (
-                            <div className="flex-none pb-2">
+                            <div className="flex flex-none justify-end pb-2 min-[1250px]:hidden">
                                 <ObservationTimeBubble
                                     metar={metar}
                                     now={now}
@@ -3350,9 +3327,25 @@ function RunwayWindWidget({
                             />
                         </div>
                     </div>
-                </>
+
+                    <div className="relative hidden w-80 flex-none flex-col overflow-hidden min-[1250px]:flex">
+                        {now && (
+                            <div className="flex-none pb-2">
+                                <ObservationTimeBubble
+                                    metar={metar}
+                                    now={now}
+                                    stationInfo={stationInfo ?? null}
+                                />
+                            </div>
+                        )}
+
+                        <div className="min-h-0 flex-1 overflow-hidden pt-2">
+                            <WeatherMinimumsPanel metar={metar} bestRunway={bestRunway} />
+                        </div>
+                    </div>
+                </div>
             ) : (
-                <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-2">
+                <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
                     <div className="min-w-0">
                         <RunwayCompassSvg
                             runways={runways}
@@ -3374,6 +3367,10 @@ function RunwayWindWidget({
 
                     <div className="min-w-0">
                         <CloudCeilingPreviewSvg metar={metar} />
+                    </div>
+
+                    <div className="w-full min-w-0 lg:w-80">
+                        <WeatherMinimumsPanel metar={metar} bestRunway={bestRunway} />
                     </div>
                 </div>
             )}
@@ -4444,6 +4441,68 @@ function WindComponentStack({
                 </text>
             </g>
         </g>
+    );
+}
+
+function WeatherMinimumsPanel({
+    metar,
+    bestRunway,
+}: {
+    metar: NormalizedMetar;
+    bestRunway: CalculatedRunwayEnd | undefined;
+}) {
+    const windKt = metar.wind.gustKt ?? metar.wind.speedKt ?? 0;
+    const ceilingFtAgl = metar.ceiling.feetAgl;
+    const visibilitySm = metar.visibility.statuteMiles;
+    const crosswindKt = bestRunway?.component.crosswindKt ?? null;
+
+    const rows = OPERATIONAL_MINIMUMS.map((minimum) => {
+        const ceilingOk =
+            minimum.ceilingFtAgl === null ||
+            ceilingFtAgl === null ||
+            ceilingFtAgl >= minimum.ceilingFtAgl;
+
+        const visibilityOk =
+            minimum.visibilitySm === null ||
+            visibilitySm === null ||
+            visibilitySm >= minimum.visibilitySm;
+
+        const windOk = windKt <= minimum.maxWindsKt;
+
+        const crosswindOk =
+            typeof minimum.crosswindKt !== "number" ||
+            crosswindKt === null ||
+            crosswindKt <= minimum.crosswindKt;
+
+        return {
+            minimum,
+            passes: ceilingOk && visibilityOk && windOk && crosswindOk,
+        };
+    });
+
+    return (
+        <div className="flex h-full flex-col pl-3">
+            <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                Weather Minimums
+                <InfoTooltip text="Compares the current METAR (and best-runway crosswind) against Inflight's operational minimums for each type of flight." />
+            </p>
+
+            <div className="mt-2 flex flex-1 flex-col justify-center divide-y divide-zinc-800/70">
+                {rows.map(({ minimum, passes }) => (
+                    <div
+                        key={minimum.operation}
+                        className="flex items-center gap-2 py-2.5 text-sm font-semibold text-zinc-200"
+                    >
+                        <span
+                            className={`h-2 w-2 flex-none rounded-full ${
+                                passes ? "bg-emerald-400" : "bg-red-400"
+                            }`}
+                        />
+                        {minimum.label}
+                    </div>
+                ))}
+            </div>
+        </div>
     );
 }
 
