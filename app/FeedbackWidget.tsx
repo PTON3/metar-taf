@@ -8,10 +8,12 @@ type SubmitState = "idle" | "sending" | "success" | "error";
 
 type FeedbackWidgetProps = {
     currentStation?: string;
+    hidden?: boolean;
 };
 
 export default function FeedbackWidget({
     currentStation,
+    hidden = false,
 }: FeedbackWidgetProps) {
     const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
     const [isOpen, setIsOpen] = useState(false);
@@ -117,6 +119,8 @@ export default function FeedbackWidget({
         setSubmitState("idle");
         setResponseMessage("");
     }
+
+    if (hidden) return null;
 
     const widget = (
         <div className="fixed bottom-4 right-4 z-[100] flex flex-col items-end sm:bottom-6 sm:right-6">
