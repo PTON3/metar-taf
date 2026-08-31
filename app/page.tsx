@@ -719,12 +719,6 @@ function MetarDashboard({
                                         now={now}
                                         timeZone={stationInfo?.timeZone}
                                     />
-
-                                    <ObservationTimeBubble
-                                        metar={metar}
-                                        now={now}
-                                        stationInfo={stationInfo}
-                                    />
                                 </div>
                             </div>
                         </div>
@@ -775,6 +769,8 @@ function MetarDashboard({
                             metar={metar}
                             rawMetar={rawMetar}
                             runways={runways}
+                            now={now}
+                            stationInfo={stationInfo}
                         />
                     )}
 
@@ -784,6 +780,7 @@ function MetarDashboard({
                             timeZone={stationInfo?.timeZone}
                             latitude={stationInfo?.latitude}
                             longitude={stationInfo?.longitude}
+                            now={now}
                         />
                     )}
 
@@ -856,12 +853,6 @@ function MetarDashboard({
                                             timeZone={stationInfo?.timeZone}
                                         />
 
-                                        <ObservationTimeBubble
-                                            metar={metar}
-                                            now={now}
-                                            stationInfo={stationInfo}
-                                        />
-
                                         <button
                                             type="button"
                                             onClick={closeFullscreenDashboard}
@@ -874,10 +865,16 @@ function MetarDashboard({
                             </div>
 
                             <div className="min-h-0 flex-1 overflow-hidden">
-                                <RunwayWindWidget metar={metar} runways={runways} fullscreen />
+                                <RunwayWindWidget
+                                    metar={metar}
+                                    runways={runways}
+                                    now={now}
+                                    stationInfo={stationInfo}
+                                    fullscreen
+                                />
                             </div>
 
-                            <div className="h-[clamp(240px,30dvh,360px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-3">
+                            <div className="h-[clamp(260px,32dvh,380px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-3">
                                 <div className="flex h-full w-full flex-col justify-end">
                                     <TafDashboardTab
                                         station={metar.station ?? station}
@@ -886,6 +883,7 @@ function MetarDashboard({
                                         longitude={stationInfo?.longitude}
                                         hourlyOnly
                                         fullscreen
+                                        now={now}
                                     />
                                 </div>
                             </div>
@@ -901,15 +899,24 @@ function WeatherDashboardTab({
     metar,
     rawMetar,
     runways,
+    now,
+    stationInfo,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
     runways: AirportRunway[];
+    now: Date;
+    stationInfo: StationInfo | null;
 }) {
     return (
         <>
 
-            <RunwayWindWidget metar={metar} runways={runways} />
+            <RunwayWindWidget
+                metar={metar}
+                runways={runways}
+                now={now}
+                stationInfo={stationInfo}
+            />
 
             <p className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
                 METAR
@@ -1194,7 +1201,7 @@ function TafHourlyForecast({
                             className="flex w-[155px] shrink-0 flex-col"
                         >
                             <article
-                                className="flex h-full flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 pb-2 shadow-lg"
+                                className={`flex h-full flex-col overflow-hidden rounded-2xl ${fullscreen ? "border-2" : "border"} border-zinc-800 bg-gradient-to-b from-black/70 to-zinc-950 p-4 pb-2 shadow-lg`}
                             >
                                 <div className="flex flex-none items-start justify-between gap-2">
                                     <div>
@@ -2008,6 +2015,7 @@ function TafDashboardTab({
     longitude,
     hourlyOnly = false,
     fullscreen = false,
+    now,
 }: {
     station?: string;
     timeZone?: string | null;
@@ -2015,6 +2023,7 @@ function TafDashboardTab({
     longitude?: number | null;
     hourlyOnly?: boolean;
     fullscreen?: boolean;
+    now: Date;
 }) {
     const [taf, setTaf] = useState<TafResponse | null>(null);
     const [loading, setLoading] = useState(true);
@@ -2129,6 +2138,29 @@ function TafDashboardTab({
     }
 
     if (hourlyOnly) {
+        if (fullscreen) {
+            return (
+                <div className="relative h-full w-full">
+                    <div className="pointer-events-none absolute -right-2 -top-2 z-10 sm:-right-3 sm:-top-3">
+                        <TafIssuedBubble
+                            issueTime={taf.issueTime}
+                            timeZone={timeZone}
+                            now={now}
+                            solid
+                        />
+                    </div>
+
+                    <TafHourlyForecast
+                        taf={taf}
+                        timeZone={timeZone}
+                        latitude={latitude}
+                        longitude={longitude}
+                        fullscreen={fullscreen}
+                    />
+                </div>
+            );
+        }
+
         return (
             <TafHourlyForecast
                 taf={taf}
@@ -2160,6 +2192,8 @@ function TafDashboardTab({
                             : ""}
                     </p>
                 </div>
+
+                <TafIssuedBubble issueTime={taf.issueTime} timeZone={timeZone} now={now} />
             </div>
 
             <TafHourlyForecast
@@ -2709,6 +2743,64 @@ function ObservationTimeBubble({
     );
 }
 
+function TafIssuedBubble({
+    issueTime,
+    timeZone,
+    now,
+    solid = false,
+}: {
+    issueTime?: string | null;
+    timeZone?: string | null;
+    now: Date;
+    solid?: boolean;
+}) {
+    const date = issueTime ? new Date(issueTime) : null;
+    const isValid = date !== null && !Number.isNaN(date.getTime());
+    const ageMinutes = isValid ? getTafAgeMinutes(date, now) : null;
+    const ageColor = getTafAgeColor(ageMinutes);
+
+    return (
+        <div
+            className={`inline-flex w-fit flex-wrap items-center gap-2 rounded-2xl border border-zinc-700 px-4 py-3 text-sm font-semibold text-zinc-200 ${solid ? "bg-zinc-950" : "bg-black/65"}`}
+        >
+            <span className={`inline-flex items-center gap-2 ${ageColor}`}>
+                <HourglassIcon />
+                {formatTafAge(ageMinutes)}
+            </span>
+
+            <span className="text-zinc-600">|</span>
+
+            <span>{isValid ? formatZuluFromDate(date) : "Zulu unavailable"}</span>
+
+            <span className="text-zinc-600">|</span>
+
+            <span>{isValid ? formatLocalFromDate(date, timeZone) : "LT unavailable"}</span>
+        </div>
+    );
+}
+
+function formatZuluFromDate(date: Date): string {
+    return `${new Intl.DateTimeFormat("en-US", {
+        timeZone: "UTC",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+    })
+        .format(date)
+        .replace(":", "")}Z`;
+}
+
+function formatLocalFromDate(date: Date, timeZone?: string | null): string {
+    if (!timeZone) return "LT unavailable";
+
+    return new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        hour: "numeric",
+        minute: "2-digit",
+        timeZoneName: "short",
+    }).format(date);
+}
+
 function RaindropIcon() {
     return (
         <svg
@@ -2859,6 +2951,30 @@ function getMetarAgeColor(ageMinutes: number | null): string {
 function formatMetarAge(ageMinutes: number | null): string {
     if (ageMinutes === null) return "Age unavailable";
     return `${ageMinutes} min ago`;
+}
+
+function getTafAgeMinutes(issueDate: Date, now: Date): number | null {
+    return Math.max(
+        0,
+        Math.round((now.getTime() - issueDate.getTime()) / 60_000)
+    );
+}
+
+function getTafAgeColor(ageMinutes: number | null): string {
+    if (ageMinutes === null) return "text-zinc-200";
+    if (ageMinutes >= 360) return "text-red-400";
+    if (ageMinutes >= 240) return "text-yellow-300";
+    return "text-zinc-200";
+}
+
+function formatTafAge(ageMinutes: number | null): string {
+    if (ageMinutes === null) return "Age unavailable";
+    if (ageMinutes < 60) return `${ageMinutes} min ago`;
+
+    const hours = Math.floor(ageMinutes / 60);
+    const minutes = ageMinutes % 60;
+
+    return minutes === 0 ? `${hours}h ago` : `${hours}h ${minutes}m ago`;
 }
 
 function formatZuluObservation(metar: NormalizedMetar): string {
@@ -3012,10 +3128,14 @@ function WeatherCard({
 function RunwayWindWidget({
     metar,
     runways,
+    now,
+    stationInfo,
     fullscreen = false,
 }: {
     metar: NormalizedMetar;
     runways: AirportRunway[];
+    now?: Date;
+    stationInfo?: StationInfo | null;
     fullscreen?: boolean;
 }) {
     const [selectedEnd, setSelectedEnd] = useState<RunwayEnd | null>(null);
@@ -3129,6 +3249,14 @@ function RunwayWindWidget({
                             Select a runway on the graphic to rotate into that runway’s point of view.
                         </p>
                     </div>
+
+                    {now && (
+                        <ObservationTimeBubble
+                            metar={metar}
+                            now={now}
+                            stationInfo={stationInfo ?? null}
+                        />
+                    )}
                 </div>
             )}
 
@@ -3175,14 +3303,26 @@ function RunwayWindWidget({
                             width: "calc(50% - 12px)",
                             overflow: "hidden",
                             display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
+                            flexDirection: "column",
+                            alignItems: "flex-end",
                         }}
                     >
-                        <CloudCeilingPreviewSvg
-                            metar={metar}
-                            fullscreen
-                        />
+                        {now && (
+                            <div className="flex-none pb-2">
+                                <ObservationTimeBubble
+                                    metar={metar}
+                                    now={now}
+                                    stationInfo={stationInfo ?? null}
+                                />
+                            </div>
+                        )}
+
+                        <div className="flex min-h-0 w-full flex-1 items-center justify-center">
+                            <CloudCeilingPreviewSvg
+                                metar={metar}
+                                fullscreen
+                            />
+                        </div>
                     </div>
                 </>
             ) : (
