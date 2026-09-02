@@ -3,7 +3,10 @@
 import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
-import { OPERATIONAL_MINIMUMS } from "@/lib/minimums/weatherMinimums";
+import {
+    OPERATIONAL_MINIMUMS,
+    NIGHT_STACKING_RAMP_ELIGIBILITY,
+} from "@/lib/minimums/weatherMinimums";
 import * as SunCalc from "suncalc";
 import Image from "next/image";
 import FeedbackWidget from "./FeedbackWidget";
@@ -622,6 +625,12 @@ function MetarDashboard({
 
     const categoryStyle = FLIGHT_CATEGORY_STYLES[metar.flightCategory];
 
+    const tafStation = metar.station ?? station;
+    const [taf, setTaf] = useState<TafResponse | null>(null);
+    const [tafLoading, setTafLoading] = useState(true);
+    const [tafError, setTafError] = useState<string | null>(null);
+    const latestTafRef = useRef<TafResponse | null>(null);
+
     useEffect(() => {
         const timer = window.setInterval(() => {
             setNow(new Date());
@@ -629,6 +638,80 @@ function MetarDashboard({
 
         return () => window.clearInterval(timer);
     }, []);
+
+    useEffect(() => {
+        latestTafRef.current = taf;
+    }, [taf]);
+
+    useEffect(() => {
+        let isActive = true;
+        let controller: AbortController | null = null;
+
+        async function loadTaf(showLoading = true) {
+            controller?.abort();
+            const requestController = new AbortController();
+            controller = requestController;
+
+            try {
+                if (showLoading || !latestTafRef.current) {
+                    setTafLoading(true);
+                }
+
+                const response = await fetch(
+                    `/api/taf?station=${encodeURIComponent(tafStation)}`,
+                    {
+                        cache: "no-store",
+                        signal: requestController.signal,
+                    }
+                );
+
+                if (!response.ok) {
+                    throw new Error("Unable to load TAF data.");
+                }
+
+                const data = await response.json();
+
+                if (!isActive || requestController.signal.aborted) return;
+
+                setTaf(data);
+                setTafError(null);
+            } catch (err) {
+                if (err instanceof DOMException && err.name === "AbortError") {
+                    return;
+                }
+
+                if (!latestTafRef.current) {
+                    setTafError(
+                        err instanceof Error
+                            ? err.message
+                            : "Something went wrong loading the TAF."
+                    );
+                }
+            } finally {
+                if (isActive && !requestController.signal.aborted) {
+                    setTafLoading(false);
+                }
+            }
+        }
+
+        const initialLoadTimer = window.setTimeout(() => {
+            latestTafRef.current = null;
+            setTaf(null);
+            setTafError(null);
+            void loadTaf(true);
+        }, 0);
+
+        const refreshTimer = window.setInterval(() => {
+            void loadTaf(false);
+        }, TAF_REFRESH_MS);
+
+        return () => {
+            isActive = false;
+            window.clearTimeout(initialLoadTimer);
+            window.clearInterval(refreshTimer);
+            controller?.abort();
+        };
+    }, [tafStation]);
 
     useEffect(() => {
         if (!isFullscreenOpen) return;
@@ -832,16 +915,20 @@ function MetarDashboard({
                             runways={runways}
                             now={now}
                             stationInfo={stationInfo}
+                            taf={taf}
                         />
                     )}
 
                     {activeDashboardTab === "taf" && (
                         <TafDashboardTab
-                            station={metar.station ?? station}
+                            station={tafStation}
                             timeZone={stationInfo?.timeZone}
                             latitude={stationInfo?.latitude}
                             longitude={stationInfo?.longitude}
                             now={now}
+                            taf={taf}
+                            loading={tafLoading}
+                            error={tafError}
                         />
                     )}
 
@@ -897,6 +984,7 @@ function MetarDashboard({
                                     runways={runways}
                                     now={now}
                                     stationInfo={stationInfo}
+                                    taf={taf}
                                     fullscreen
                                 />
                             </div>
@@ -904,13 +992,16 @@ function MetarDashboard({
                             <div className="relative h-[clamp(260px,32dvh,380px)] flex-none overflow-hidden rounded-3xl border border-zinc-800 bg-zinc-950/90 p-2 shadow-2xl sm:p-3">
                                 <div className="flex h-full w-full flex-col justify-end">
                                     <TafDashboardTab
-                                        station={metar.station ?? station}
+                                        station={tafStation}
                                         timeZone={stationInfo?.timeZone}
                                         latitude={stationInfo?.latitude}
                                         longitude={stationInfo?.longitude}
                                         hourlyOnly
                                         fullscreen
                                         now={now}
+                                        taf={taf}
+                                        loading={tafLoading}
+                                        error={tafError}
                                     />
                                 </div>
                             </div>
@@ -928,12 +1019,14 @@ function WeatherDashboardTab({
     runways,
     now,
     stationInfo,
+    taf,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
     runways: AirportRunway[];
     now: Date;
     stationInfo: StationInfo | null;
+    taf: TafResponse | null;
 }) {
     return (
         <>
@@ -943,6 +1036,7 @@ function WeatherDashboardTab({
                 runways={runways}
                 now={now}
                 stationInfo={stationInfo}
+                taf={taf}
             />
 
             <p className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
@@ -2049,6 +2143,9 @@ function TafDashboardTab({
     hourlyOnly = false,
     fullscreen = false,
     now,
+    taf,
+    loading,
+    error,
 }: {
     station?: string;
     timeZone?: string | null;
@@ -2057,87 +2154,10 @@ function TafDashboardTab({
     hourlyOnly?: boolean;
     fullscreen?: boolean;
     now: Date;
+    taf: TafResponse | null;
+    loading: boolean;
+    error: string | null;
 }) {
-    const [taf, setTaf] = useState<TafResponse | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
-
-    const latestTafRef = useRef<TafResponse | null>(null);
-
-    useEffect(() => {
-        latestTafRef.current = taf;
-    }, [taf]);
-
-    useEffect(() => {
-        let isActive = true;
-        let controller: AbortController | null = null;
-
-        async function loadTaf(showLoading = true) {
-            controller?.abort();
-            const requestController = new AbortController();
-            controller = requestController;
-
-            try {
-                if (showLoading || !latestTafRef.current) {
-                    setLoading(true);
-                }
-
-                const response = await fetch(
-                    `/api/taf?station=${encodeURIComponent(station)}`,
-                    {
-                        cache: "no-store",
-                        signal: requestController.signal,
-                    }
-                );
-
-                if (!response.ok) {
-                    throw new Error("Unable to load TAF data.");
-                }
-
-                const data = await response.json();
-
-                if (!isActive || requestController.signal.aborted) return;
-
-                setTaf(data);
-                setError(null);
-            } catch (err) {
-                if (err instanceof DOMException && err.name === "AbortError") {
-                    return;
-                }
-
-                if (!latestTafRef.current) {
-                    setError(
-                        err instanceof Error
-                            ? err.message
-                            : "Something went wrong loading the TAF."
-                    );
-                }
-            } finally {
-                if (isActive && !requestController.signal.aborted) {
-                    setLoading(false);
-                }
-            }
-        }
-
-        const initialLoadTimer = window.setTimeout(() => {
-            latestTafRef.current = null;
-            setTaf(null);
-            setError(null);
-            void loadTaf(true);
-        }, 0);
-
-        const refreshTimer = window.setInterval(() => {
-            void loadTaf(false);
-        }, TAF_REFRESH_MS);
-
-        return () => {
-            isActive = false;
-            window.clearTimeout(initialLoadTimer);
-            window.clearInterval(refreshTimer);
-            controller?.abort();
-        };
-    }, [station]);
-
     if (loading) {
         return (
             <div className="rounded-2xl border border-zinc-800 bg-black/55 p-8 text-center">
@@ -3163,12 +3183,14 @@ function RunwayWindWidget({
     runways,
     now,
     stationInfo,
+    taf,
     fullscreen = false,
 }: {
     metar: NormalizedMetar;
     runways: AirportRunway[];
     now?: Date;
     stationInfo?: StationInfo | null;
+    taf: TafResponse | null;
     fullscreen?: boolean;
 }) {
     const [selectedEnd, setSelectedEnd] = useState<RunwayEnd | null>(null);
@@ -3304,6 +3326,7 @@ function RunwayWindWidget({
                             activeRunway={activeRunway}
                             windDirectionDeg={windDirectionDeg}
                             windSpeedKt={windSpeedKt}
+                            windVariable={metar.wind.variable}
                             compassRotation={compassRotation}
                             visibilitySm={metar.visibility.statuteMiles}
                             showResetButton={showResetButton}
@@ -3334,7 +3357,7 @@ function RunwayWindWidget({
                         </div>
                     </div>
 
-                    <div className="relative hidden w-80 flex-none flex-col overflow-hidden min-[1250px]:flex">
+                    <div className="relative hidden w-fit flex-none flex-col items-end overflow-hidden min-[1250px]:flex">
                         {now && (
                             <div className="flex-none pb-2">
                                 <ObservationTimeBubble
@@ -3345,8 +3368,14 @@ function RunwayWindWidget({
                             </div>
                         )}
 
-                        <div className="min-h-0 flex-1 overflow-hidden pt-2">
+                        <div className="flex w-72 min-h-0 flex-1 flex-col gap-4 overflow-y-auto pt-2">
                             <WeatherMinimumsPanel metar={metar} bestRunway={bestRunway} />
+                            <NightStackingPanel
+                                taf={taf}
+                                timeZone={stationInfo?.timeZone}
+                                latitude={stationInfo?.latitude}
+                                longitude={stationInfo?.longitude}
+                            />
                         </div>
                     </div>
                 </div>
@@ -3361,6 +3390,7 @@ function RunwayWindWidget({
                             activeRunway={activeRunway}
                             windDirectionDeg={windDirectionDeg}
                             windSpeedKt={windSpeedKt}
+                            windVariable={metar.wind.variable}
                             compassRotation={compassRotation}
                             visibilitySm={metar.visibility.statuteMiles}
                             showResetButton={showResetButton}
@@ -3375,8 +3405,14 @@ function RunwayWindWidget({
                         <CloudCeilingPreviewSvg metar={metar} />
                     </div>
 
-                    <div className="w-full min-w-0 lg:w-80">
+                    <div className="flex w-full min-w-0 flex-col gap-4 lg:w-72">
                         <WeatherMinimumsPanel metar={metar} bestRunway={bestRunway} />
+                        <NightStackingPanel
+                            taf={taf}
+                            timeZone={stationInfo?.timeZone}
+                            latitude={stationInfo?.latitude}
+                            longitude={stationInfo?.longitude}
+                        />
                     </div>
                 </div>
             )}
@@ -3392,6 +3428,7 @@ function RunwayCompassSvg({
     activeRunway,
     windDirectionDeg,
     windSpeedKt,
+    windVariable = false,
     compassRotation,
     showResetButton,
     onResetNorthUp,
@@ -3408,6 +3445,7 @@ function RunwayCompassSvg({
     activeRunway: CalculatedRunwayEnd | undefined;
     windDirectionDeg: number | null;
     windSpeedKt: number;
+    windVariable?: boolean;
     compassRotation: number;
     showResetButton: boolean;
     onResetNorthUp: () => void;
@@ -3460,7 +3498,9 @@ function RunwayCompassSvg({
     const windLabel =
         windDirectionDeg !== null
             ? `${windDirectionDeg}° ${windSpeedKt} kt`
-            : `${windSpeedKt} kt`;
+            : windVariable
+                ? `VRB ${windSpeedKt} kt`
+                : `${windSpeedKt} kt`;
 
     const windModeLabel =
         windDisplayMode === "animated"
@@ -4450,6 +4490,51 @@ function WindComponentStack({
     );
 }
 
+type CriteriaStatus = "pass" | "warn" | "fail";
+
+const CRITERIA_STATUS_STYLES: Record<
+    CriteriaStatus,
+    { bg: string; text: string; icon: string }
+> = {
+    pass: { bg: "bg-emerald-400", text: "text-emerald-950", icon: "✓" },
+    warn: { bg: "bg-amber-400", text: "text-amber-950", icon: "!" },
+    fail: { bg: "bg-red-400", text: "text-red-950", icon: "×" },
+};
+
+function CriteriaDot({ status }: { status: CriteriaStatus }) {
+    const style = CRITERIA_STATUS_STYLES[status];
+
+    return (
+        <span
+            className={`flex h-4 w-4 flex-none items-center justify-center rounded-full text-[10px] font-black leading-none ${style.bg} ${style.text}`}
+        >
+            {style.icon}
+        </span>
+    );
+}
+
+const OVERALL_STATUS_LABELS: Record<CriteriaStatus, string> = {
+    pass: "Go",
+    warn: "Caution",
+    fail: "No-Go",
+};
+
+const OVERALL_STATUS_STYLES: Record<CriteriaStatus, string> = {
+    pass: "border-emerald-400/50 bg-emerald-400/15 text-emerald-200",
+    warn: "border-amber-400/50 bg-amber-400/15 text-amber-200",
+    fail: "border-red-400/50 bg-red-400/15 text-red-200",
+};
+
+function OverallStatusIndicator({ status }: { status: CriteriaStatus }) {
+    return (
+        <span
+            className={`ml-auto flex-none rounded-full border px-2 py-1 text-[10px] font-black uppercase tracking-[0.08em] ${OVERALL_STATUS_STYLES[status]}`}
+        >
+            {OVERALL_STATUS_LABELS[status]}
+        </span>
+    );
+}
+
 function WeatherMinimumsPanel({
     metar,
     bestRunway,
@@ -4486,28 +4571,170 @@ function WeatherMinimumsPanel({
         };
     });
 
+    const failCount = rows.filter((row) => !row.passes).length;
+    const overall: CriteriaStatus =
+        failCount === 0 ? "pass" : failCount === rows.length ? "fail" : "warn";
+
     return (
         <div className="flex h-full flex-col pl-3">
-            <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                Weather Minimums
-                <InfoTooltip text="Compares the current METAR (and best-runway crosswind) against Inflight's operational minimums for each type of flight." />
+            <p className="flex flex-wrap items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                <span className="whitespace-nowrap">Weather Minimums</span>
+                <InfoTooltip text="Compares the current METAR (and best-runway crosswind) against Inflight's operational minimums for each type of flight. Go means every category is flyable, caution means only some are, and no-go means none are." />
+                <OverallStatusIndicator status={overall} />
             </p>
 
             <div className="mt-2 flex flex-1 flex-col justify-center divide-y divide-zinc-800/70">
                 {rows.map(({ minimum, passes }) => (
                     <div
                         key={minimum.operation}
-                        className="flex items-center gap-2 py-2.5 text-sm font-semibold text-zinc-200"
+                        className="flex items-center gap-2.5 py-2.5 text-sm font-semibold text-zinc-200"
                     >
-                        <span
-                            className={`h-2 w-2 flex-none rounded-full ${
-                                passes ? "bg-emerald-400" : "bg-red-400"
-                            }`}
-                        />
+                        <CriteriaDot status={passes ? "pass" : "fail"} />
                         {minimum.label}
                     </div>
                 ))}
             </div>
+        </div>
+    );
+}
+
+function getNightStackingStatus(
+    taf: TafResponse | null,
+    timeZone?: string | null,
+    latitude?: number | null,
+    longitude?: number | null
+): {
+    wind: CriteriaStatus;
+    precip: CriteriaStatus;
+    thunderstorms: CriteriaStatus;
+    hasData: boolean;
+} {
+    if (!taf) {
+        return { wind: "pass", precip: "pass", thunderstorms: "pass", hasData: false };
+    }
+
+    const slots = buildTafHourlySlots(taf, timeZone, latitude, longitude);
+    const nightSlots = slots.filter((slot) => slot.isNightCurrency);
+
+    if (nightSlots.length === 0) {
+        return { wind: "pass", precip: "pass", thunderstorms: "pass", hasData: false };
+    }
+
+    const maxWindKt = Math.max(
+        0,
+        ...nightSlots.map((slot) => Number(slot.block.windSpeedKt ?? 0))
+    );
+
+    const wind: CriteriaStatus =
+        maxWindKt > NIGHT_STACKING_RAMP_ELIGIBILITY.maxSustainedWindsKt
+            ? "fail"
+            : maxWindKt >= NIGHT_STACKING_RAMP_ELIGIBILITY.maxSustainedWindsKt - 2
+                ? "warn"
+                : "pass";
+
+    // Any forecasted precip or storms — PROB or otherwise — violates the flat
+    // "0% precip" / "no storms" requirement, so it's a hard fail, not a caution.
+    const hasPrecip = nightSlots.some(
+        (slot) => getPrecipChanceLabel(slot.block.weather) !== null
+    );
+
+    const hasThunderstorms = nightSlots.some((slot) =>
+        (slot.block.weather ?? "").toUpperCase().includes("TS")
+    );
+
+    // "Evolving" risk: nothing forecast has crossed the line yet, but TEMPO
+    // groups or a low broken/overcast ceiling suggest unsettled conditions
+    // that could still tip into precip or storms overnight.
+    const hasTempo = nightSlots.some((slot) =>
+        (slot.block.change ?? "").toUpperCase().includes("TEMPO")
+    );
+
+    const hasLowBrokenOrOvercastCeiling = nightSlots.some((slot) =>
+        (slot.block.sky ?? []).some((layer) => {
+            const cover = (layer.cover ?? "").toUpperCase();
+            const base = layer.baseFtAgl;
+
+            return (
+                (cover === "BKN" || cover === "OVC") &&
+                base !== null &&
+                base !== undefined &&
+                base < 3000
+            );
+        })
+    );
+
+    const evolvingRisk = hasTempo || hasLowBrokenOrOvercastCeiling;
+
+    const precip: CriteriaStatus = hasPrecip ? "fail" : evolvingRisk ? "warn" : "pass";
+    const thunderstorms: CriteriaStatus = hasThunderstorms
+        ? "fail"
+        : evolvingRisk
+            ? "warn"
+            : "pass";
+
+    return { wind, precip, thunderstorms, hasData: true };
+}
+
+function NightStackingPanel({
+    taf,
+    timeZone,
+    latitude,
+    longitude,
+}: {
+    taf: TafResponse | null;
+    timeZone?: string | null;
+    latitude?: number | null;
+    longitude?: number | null;
+}) {
+    const status = getNightStackingStatus(taf, timeZone, latitude, longitude);
+
+    const rows = [
+        {
+            key: "wind",
+            label: `Winds ≤ ${NIGHT_STACKING_RAMP_ELIGIBILITY.maxSustainedWindsKt} kt overnight`,
+            status: status.wind,
+        },
+        {
+            key: "precip",
+            label: "No overnight precip forecast",
+            status: status.precip,
+        },
+        {
+            key: "storms",
+            label: `No storms within ${NIGHT_STACKING_RAMP_ELIGIBILITY.thunderstormFreeRadiusNm} NM overnight`,
+            status: status.thunderstorms,
+        },
+    ];
+
+    const overall: CriteriaStatus = rows.some((row) => row.status === "fail")
+        ? "fail"
+        : rows.some((row) => row.status === "warn")
+            ? "warn"
+            : "pass";
+
+    return (
+        <div className="flex flex-col pl-3">
+            <p className="flex flex-wrap items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                <span className="whitespace-nowrap">Night Stacking</span>
+                <InfoTooltip text="Whether tonight's TAF supports leaving a non-Cirrus aircraft on the ramp overnight instead of hangaring it, per Inflight's ramp-eligibility criteria. These thresholds are specific to Inflight's KFCM ramp operations. No-go means the forecast already crosses the line; caution means conditions look unsettled (TEMPO groups or a low ceiling) and could still turn red." />
+                {status.hasData && <OverallStatusIndicator status={overall} />}
+            </p>
+
+            {status.hasData ? (
+                <div className="mt-2 flex flex-col divide-y divide-zinc-800/70">
+                    {rows.map((row) => (
+                        <div
+                            key={row.key}
+                            className="flex items-center gap-2.5 py-2.5 text-sm font-semibold text-zinc-200"
+                        >
+                            <CriteriaDot status={row.status} />
+                            {row.label}
+                        </div>
+                    ))}
+                </div>
+            ) : (
+                <p className="mt-2 text-sm text-zinc-500">Loading overnight forecast…</p>
+            )}
         </div>
     );
 }
