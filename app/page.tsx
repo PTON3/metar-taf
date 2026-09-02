@@ -1264,7 +1264,13 @@ function TafHourlyForecast({
                                 </p>
 
                                 <div className="mt-3 min-h-[30px]">
-                                    <p className="flex items-center justify-center gap-1.5 rounded-full border border-dashed border-sky-400/50 px-2 py-1 text-center text-[10px] font-bold uppercase tracking-[0.12em] text-sky-300">
+                                    <p
+                                        className={`flex items-center justify-center gap-1.5 rounded-full border border-dashed px-2 py-1 text-center text-[10px] font-bold uppercase tracking-[0.12em] ${
+                                            slot.precipChance && slot.precipChance.percent > 0
+                                                ? "border-sky-400/50 text-sky-300"
+                                                : "border-zinc-500/60 text-zinc-400"
+                                        }`}
+                                    >
                                         <RaindropIcon />
                                         {slot.precipChance ? slot.precipChance.percent : 0}% chance
                                     </p>
