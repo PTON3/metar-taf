@@ -468,100 +468,119 @@ export default function Home() {
             <div className="absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top_left,_rgba(214,179,90,0.16),_transparent_35%),radial-gradient(circle_at_top_right,_rgba(255,255,255,0.08),_transparent_30%)]" />
 
             <div className="mx-auto w-full max-w-[2400px] px-3 py-6 sm:px-4 md:w-[95vw] md:py-8 lg:px-8">
-                <header className="mb-8 border-b border-[#d6b35a]/20 pb-8">
-                    <div className="mb-4 inline-flex items-center gap-3 rounded-full border border-[#d6b35a]/30 bg-[#d6b35a]/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.22em] text-[#e6c76f]">
-                        Inflight Aviation
+                <header className="relative mb-8 overflow-hidden rounded-3xl border border-zinc-900 bg-gradient-to-b from-zinc-950 to-black px-5 py-5 sm:px-7 sm:py-6">
+                    <svg
+                        className="pointer-events-none absolute -right-16 -top-16 h-[220px] w-[220px] text-[#d6b35a] opacity-[0.08] sm:h-[260px] sm:w-[260px]"
+                        viewBox="0 0 400 400"
+                        fill="none"
+                        aria-hidden="true"
+                    >
+                        <circle cx="200" cy="200" r="188" stroke="currentColor" strokeWidth="1" />
+                        <circle cx="200" cy="200" r="138" stroke="currentColor" strokeWidth="1" />
+                        <circle cx="200" cy="200" r="3" fill="currentColor" />
+                        {Array.from({ length: 12 }).map((_, i) => {
+                            const angle = (i * 30 * Math.PI) / 180;
+                            const inner = i % 3 === 0 ? 168 : 178;
+                            const x1 = Number((200 + Math.sin(angle) * inner).toFixed(2));
+                            const y1 = Number((200 - Math.cos(angle) * inner).toFixed(2));
+                            const x2 = Number((200 + Math.sin(angle) * 188).toFixed(2));
+                            const y2 = Number((200 - Math.cos(angle) * 188).toFixed(2));
+                            return (
+                                <line
+                                    key={i}
+                                    x1={x1}
+                                    y1={y1}
+                                    x2={x2}
+                                    y2={y2}
+                                    stroke="currentColor"
+                                    strokeWidth={i % 3 === 0 ? 2 : 1}
+                                />
+                            );
+                        })}
+                    </svg>
+
+                    <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                        <div className="flex items-center gap-3">
+                            <Image
+                                src="/inflight-logo.svg"
+                                alt="Inflight Aviation"
+                                width={40}
+                                height={40}
+                                className="h-10 w-10 shrink-0 object-contain"
+                            />
+
+                            <div>
+                                <p className="text-[10px] font-semibold uppercase tracking-[0.25em] text-[#e6c76f]">
+                                    Inflight Aviation
+                                </p>
+                                <h1 className="text-2xl font-bold tracking-tight text-white sm:text-3xl">
+                                    Weather
+                                </h1>
+                            </div>
+                        </div>
+
+                        <div className="w-full lg:w-[360px] lg:flex-none">
+                            {activeTab === "lookup" ? (
+                                <>
+                                    <div className="flex items-center gap-1.5 rounded-full border border-zinc-700 bg-black/60 py-1.5 pl-5 pr-1.5 transition focus-within:border-[#d6b35a]">
+                                        <input
+                                            value={station}
+                                            onChange={(event) =>
+                                                setStation(event.target.value.toUpperCase())
+                                            }
+                                            onKeyDown={(event) => {
+                                                if (event.key === "Enter") fetchLiveMetar();
+                                            }}
+                                            className="min-w-0 flex-1 bg-transparent text-sm font-semibold text-white outline-none placeholder:font-normal placeholder:text-zinc-600"
+                                            placeholder="Enter ICAO code — KFCM"
+                                        />
+
+                                        <button
+                                            onClick={() => fetchLiveMetar()}
+                                            disabled={loading}
+                                            className="shrink-0 rounded-full bg-[#d6b35a] px-5 py-2 text-xs font-black uppercase tracking-[0.08em] text-black transition hover:bg-[#e6c76f] disabled:cursor-not-allowed disabled:opacity-50"
+                                        >
+                                            {loading ? "…" : "Fetch"}
+                                        </button>
+                                    </div>
+
+                                    <button
+                                        onClick={() => setActiveTab("raw")}
+                                        className="mt-2 text-xs font-semibold text-zinc-500 transition hover:text-[#e6c76f]"
+                                    >
+                                        Have a raw METAR? Paste it instead →
+                                    </button>
+                                </>
+                            ) : (
+                                <>
+                                    <textarea
+                                        value={rawInput}
+                                        onChange={(event) => setRawInput(event.target.value)}
+                                        className="min-h-24 w-full rounded-2xl border border-zinc-700 bg-black/60 px-4 py-3 font-mono text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus:border-[#d6b35a]"
+                                        placeholder="KFCM 011753Z AUTO 35012KT 10SM FEW050 SCT250 22/15 A2992 RMK AO2"
+                                    />
+
+                                    <div className="mt-3 flex items-center justify-between gap-3">
+                                        <button
+                                            onClick={() => setActiveTab("lookup")}
+                                            className="text-xs font-semibold text-zinc-500 transition hover:text-[#e6c76f]"
+                                        >
+                                            ← Back to airport lookup
+                                        </button>
+
+                                        <button
+                                            onClick={decodeRawMetar}
+                                            disabled={loading}
+                                            className="shrink-0 rounded-full bg-[#d6b35a] px-5 py-2 text-xs font-black uppercase tracking-[0.08em] text-black transition hover:bg-[#e6c76f] disabled:cursor-not-allowed disabled:opacity-50"
+                                        >
+                                            {loading ? "Decoding…" : "Decode"}
+                                        </button>
+                                    </div>
+                                </>
+                            )}
+                        </div>
                     </div>
-
-                    <h1 className="max-w-3xl text-4xl font-bold tracking-tight text-white md:text-6xl">
-                        Weather
-                    </h1>
-
                 </header>
-
-                <section className="rounded-3xl border border-zinc-800 bg-zinc-950/80 p-5 shadow-2xl">
-                    <div className="mb-5 flex rounded-2xl border border-zinc-800 bg-black p-1">
-                        <TabButton
-                            active={activeTab === "lookup"}
-                            onClick={() => setActiveTab("lookup")}
-                        >
-                            ICAO Lookup
-                        </TabButton>
-
-                        <TabButton
-                            active={activeTab === "raw"}
-                            onClick={() => setActiveTab("raw")}
-                        >
-                            Decode Raw METAR
-                        </TabButton>
-                    </div>
-
-                    {activeTab === "lookup" && (
-                        <div>
-                            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                                Current conditions
-                            </p>
-
-                            <h2 className="mt-2 mb-5 text-2xl font-bold text-white">
-                                Live airport lookup
-                            </h2>
-
-                            <div className="flex flex-col gap-3 sm:flex-row">
-                                <input
-                                    value={station}
-                                    onChange={(event) =>
-                                        setStation(event.target.value.toUpperCase())
-                                    }
-                                    className="w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 text-zinc-100 outline-none transition placeholder:text-zinc-600 focus:border-[#d6b35a]"
-                                    placeholder="KFCM"
-                                />
-
-                                <button
-                                    onClick={() => fetchLiveMetar()}
-                                    disabled={loading}
-                                    className="mt-3 rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                                >
-                                    {loading ? "Loading..." : "Fetch"}
-                                </button>
-                            </div>
-
-                            <p className="mt-3 text-sm text-zinc-500">
-                                Valid for any airport with an ICAO code and reports METAR data to AviationWeather.gov
-                            </p>
-                        </div>
-                    )}
-
-                    {activeTab === "raw" && (
-                        <div>
-                            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                                Copy and paste
-                            </p>
-
-                            <h2 className="mt-2 mb-5 text-2xl font-bold text-white">
-                                Decode raw METAR
-                            </h2>
-
-                            <div className="flex flex-col gap-3 sm:flex-row">
-
-                                <textarea
-                                    value={rawInput}
-                                    onChange={(event) => setRawInput(event.target.value)}
-                                    className="min-h-20 w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 font-mono text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus:border-[#d6b35a]"
-                                    placeholder="KFCM 011753Z AUTO 35012KT 10SM FEW050 SCT250 22/15 A2992 RMK AO2"
-                                />
-
-                                <button
-                                    onClick={decodeRawMetar}
-                                    disabled={loading}
-                                    className="mt-3 rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                                >
-                                    {loading ? "Loading..." : "Decode"}
-                                </button>
-                            </div>
-
-                        </div>
-                    )}
-                </section>
 
                 {error && (
                     <div className="mt-6 rounded-2xl border border-red-500/40 bg-red-950/30 p-4 text-red-200">
@@ -837,7 +856,7 @@ function MetarDashboard({
                                 </button>
                             </div>
 
-                            <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                            <div className="mt-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                                 <div>
                                     <h2 className="text-3xl font-bold text-white md:text-4xl">
                                         {stationInfo?.displayName ??
@@ -1030,6 +1049,20 @@ function WeatherDashboardTab({
 }) {
     return (
         <>
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    Visual Decoder
+                    <InfoTooltip text="Click a runway number to view wind from that runway's perspective. Click and drag the compass ring to rotate it manually. RESET snaps back to north-up, and the ping icon orients to the inflight view. The gold outline marks the runway with the best headwind." />
+                </p>
+
+                {now && (
+                    <ObservationTimeBubble
+                        metar={metar}
+                        now={now}
+                        stationInfo={stationInfo ?? null}
+                    />
+                )}
+            </div>
 
             <RunwayWindWidget
                 metar={metar}
@@ -2226,8 +2259,8 @@ function TafDashboardTab({
     }
 
     return (
-        <div className="space-y-4 rounded-2xl border border-zinc-800 bg-black/55 p-6">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <>
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
                     <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
                         TAF
@@ -2249,35 +2282,37 @@ function TafDashboardTab({
                 <TafIssuedBubble issueTime={taf.issueTime} timeZone={timeZone} now={now} />
             </div>
 
-            <TafHourlyForecast
-                taf={taf}
-                timeZone={timeZone}
-                latitude={latitude}
-                longitude={longitude}
-            />
+            <div className="space-y-4 rounded-2xl border border-zinc-800 bg-black/55 p-6">
+                <TafHourlyForecast
+                    taf={taf}
+                    timeZone={timeZone}
+                    latitude={latitude}
+                    longitude={longitude}
+                />
 
-            <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4">
-                <div className="mb-2 flex items-center justify-between gap-3">
-                    <h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-zinc-300">
-                        Raw TAF
-                    </h4>
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                        <h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-zinc-300">
+                            Raw TAF
+                        </h4>
 
-                    <p className="text-xs text-zinc-500">
-                        Issued {formatTafTime(taf.issueTime)}
-                    </p>
+                        <p className="text-xs text-zinc-500">
+                            Issued {formatTafTime(taf.issueTime)}
+                        </p>
+                    </div>
+
+                    <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-6 text-zinc-100">
+                        {taf.rawText}
+                    </pre>
                 </div>
 
-                <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-6 text-zinc-100">
-                    {taf.rawText}
-                </pre>
+                <p className="text-xs leading-5 text-zinc-500">
+                    TAFs are terminal forecasts for the reporting airport. When the
+                    requested airport does not publish a TAF, this dashboard shows
+                    the closest available TAF station.
+                </p>
             </div>
-
-            <p className="text-xs leading-5 text-zinc-500">
-                TAFs are terminal forecasts for the reporting airport. When the
-                requested airport does not publish a TAF, this dashboard shows
-                the closest available TAF station.
-            </p>
-        </div>
+        </>
     );
 }
 
@@ -2779,9 +2814,9 @@ function ObservationTimeBubble({
     const ageColor = getMetarAgeColor(ageMinutes);
 
     return (
-        <div className="inline-flex w-fit flex-wrap items-center gap-2 rounded-2xl border border-zinc-700 bg-black/65 px-4 py-3 text-sm font-semibold text-zinc-200">
-            <span className={`inline-flex items-center gap-2 ${ageColor}`}>
-                <HourglassIcon />
+        <div className="inline-flex w-fit flex-wrap items-center gap-1.5 rounded-2xl border border-zinc-700 bg-black/65 px-3 py-2 text-xs font-semibold text-zinc-200 sm:gap-2 sm:px-4 sm:py-3 sm:text-sm">
+            <span className={`inline-flex items-center gap-1.5 sm:gap-2 ${ageColor}`}>
+                <HourglassIcon className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                 {formatMetarAge(ageMinutes)}
             </span>
 
@@ -2814,10 +2849,10 @@ function TafIssuedBubble({
 
     return (
         <div
-            className={`inline-flex w-fit flex-wrap items-center gap-2 rounded-2xl border border-zinc-700 px-4 py-3 text-sm font-semibold text-zinc-200 ${solid ? "bg-zinc-950" : "bg-black/65"}`}
+            className={`inline-flex w-fit flex-wrap items-center gap-1.5 rounded-2xl border border-zinc-700 px-3 py-2 text-xs font-semibold text-zinc-200 sm:gap-2 sm:px-4 sm:py-3 sm:text-sm ${solid ? "bg-zinc-950" : "bg-black/65"}`}
         >
-            <span className={`inline-flex items-center gap-2 ${ageColor}`}>
-                <HourglassIcon />
+            <span className={`inline-flex items-center gap-1.5 sm:gap-2 ${ageColor}`}>
+                <HourglassIcon className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                 {formatTafAge(ageMinutes)}
             </span>
 
@@ -3063,28 +3098,6 @@ function formatLocalObservation(
     }).format(observed);
 }
 
-function TabButton({
-    active,
-    onClick,
-    children,
-}: {
-    active: boolean;
-    onClick: () => void;
-    children: ReactNode;
-}) {
-    return (
-        <button
-            onClick={onClick}
-            className={`w-full rounded-xl px-4 py-3 text-sm font-bold transition ${active
-                    ? "bg-[#d6b35a] text-black"
-                    : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
-                }`}
-        >
-            {children}
-        </button>
-    );
-}
-
 const INFO_TOOLTIP_WIDTH = 224;
 const INFO_TOOLTIP_MARGIN = 8;
 
@@ -3293,28 +3306,6 @@ function RunwayWindWidget({
                     : "mb-6 rounded-2xl border border-[#d6b35a]/25 bg-black/55 p-5"
             }
         >
-            {!fullscreen && (
-                <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-                    <div>
-                        <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
-                            Visual Decoder
-                            <InfoTooltip text="Click a runway number to view wind from that runway's perspective. Click and drag the compass ring to rotate it manually. RESET snaps back to north-up, and the ping icon orients to the inflight view. The gold outline marks the runway with the best headwind." />
-                        </p>
-                        <p className="mt-2 text-sm leading-6 text-zinc-400">
-                            Select a runway on the graphic to rotate into that runway’s point of view.
-                        </p>
-                    </div>
-
-                    {now && (
-                        <ObservationTimeBubble
-                            metar={metar}
-                            now={now}
-                            stationInfo={stationInfo ?? null}
-                        />
-                    )}
-                </div>
-            )}
-
             {fullscreen ? (
                 <div className="absolute inset-2 flex gap-4">
                     <div className="flex min-w-0 flex-1 items-center justify-center overflow-hidden">
@@ -3380,8 +3371,8 @@ function RunwayWindWidget({
                     </div>
                 </div>
             ) : (
-                <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
-                    <div className="min-w-0">
+                <div className="grid grid-cols-1 gap-5 min-[1350px]:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                    <div className="flex min-w-0 items-center justify-center">
                         <RunwayCompassSvg
                             runways={runways}
                             runwayEnds={calculatedEnds}
@@ -3401,11 +3392,11 @@ function RunwayWindWidget({
                         />
                     </div>
 
-                    <div className="min-w-0">
+                    <div className="flex min-w-0 items-center justify-center">
                         <CloudCeilingPreviewSvg metar={metar} />
                     </div>
 
-                    <div className="flex w-full min-w-0 flex-col gap-4 lg:w-72">
+                    <div className="flex w-full min-w-0 flex-col gap-4 min-[1350px]:w-72">
                         <WeatherMinimumsPanel metar={metar} bestRunway={bestRunway} />
                         <NightStackingPanel
                             taf={taf}
