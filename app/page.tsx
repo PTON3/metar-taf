@@ -285,6 +285,7 @@ export default function Home() {
     const [airportDiagram, setAirportDiagram] = useState<AirportDiagramInfo | null>(null);
     const [runways, setRunways] = useState<AirportRunway[]>([]);
     const [error, setError] = useState("");
+    const [lastMetarFetchAttempt, setLastMetarFetchAttempt] = useState<Date | null>(null);
 
     const [loading, setLoading] = useState(true);
     const latestStationRef = useRef(station);
@@ -299,6 +300,8 @@ export default function Home() {
     }, [activeTab]);
 
     async function loadLiveMetar(cleanStation: string) {
+        setLastMetarFetchAttempt(new Date());
+
         try {
             const response = await fetch(
                 `/api/metar/live?station=${encodeURIComponent(cleanStation)}`
@@ -651,6 +654,8 @@ export default function Home() {
                             runways={runways}
                             isFullscreenOpen={isFullscreenOpen}
                             setIsFullscreenOpen={setIsFullscreenOpen}
+                            lastMetarFetchAttempt={lastMetarFetchAttempt}
+                            onRefetchMetar={() => fetchLiveMetar()}
                         />
                     )
                     ) : (
@@ -680,6 +685,8 @@ function MetarDashboard({
     runways,
     isFullscreenOpen,
     setIsFullscreenOpen,
+    lastMetarFetchAttempt,
+    onRefetchMetar,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
@@ -689,6 +696,8 @@ function MetarDashboard({
     runways: AirportRunway[];
     isFullscreenOpen: boolean;
     setIsFullscreenOpen: (value: boolean) => void;
+    lastMetarFetchAttempt: Date | null;
+    onRefetchMetar: () => void;
 }) {
     const [now, setNow] = useState(() => new Date());
     const [activeDashboardTab, setActiveDashboardTab] =
@@ -702,6 +711,8 @@ function MetarDashboard({
     const [taf, setTaf] = useState<TafResponse | null>(null);
     const [tafLoading, setTafLoading] = useState(true);
     const [tafError, setTafError] = useState<string | null>(null);
+    const [lastTafFetchAttempt, setLastTafFetchAttempt] = useState<Date | null>(null);
+    const [tafRefreshNonce, setTafRefreshNonce] = useState(0);
     const latestTafRef = useRef<TafResponse | null>(null);
 
     useEffect(() => {
@@ -724,6 +735,7 @@ function MetarDashboard({
             controller?.abort();
             const requestController = new AbortController();
             controller = requestController;
+            setLastTafFetchAttempt(new Date());
 
             try {
                 if (showLoading || !latestTafRef.current) {
@@ -784,7 +796,11 @@ function MetarDashboard({
             window.clearInterval(refreshTimer);
             controller?.abort();
         };
-    }, [tafStation]);
+    }, [tafStation, tafRefreshNonce]);
+
+    function refetchTaf() {
+        setTafRefreshNonce((current) => current + 1);
+    }
 
     useEffect(() => {
         if (!isFullscreenOpen) return;
@@ -989,6 +1005,8 @@ function MetarDashboard({
                             now={now}
                             stationInfo={stationInfo}
                             taf={taf}
+                            lastMetarFetchAttempt={lastMetarFetchAttempt}
+                            onRefetchMetar={onRefetchMetar}
                         />
                     )}
 
@@ -1002,6 +1020,8 @@ function MetarDashboard({
                             taf={taf}
                             loading={tafLoading}
                             error={tafError}
+                            lastTafFetchAttempt={lastTafFetchAttempt}
+                            onRefetchTaf={refetchTaf}
                         />
                     )}
 
@@ -1093,6 +1113,8 @@ function WeatherDashboardTab({
     now,
     stationInfo,
     taf,
+    lastMetarFetchAttempt,
+    onRefetchMetar,
 }: {
     metar: NormalizedMetar;
     rawMetar: string;
@@ -1100,6 +1122,8 @@ function WeatherDashboardTab({
     now: Date;
     stationInfo: StationInfo | null;
     taf: TafResponse | null;
+    lastMetarFetchAttempt: Date | null;
+    onRefetchMetar: () => void;
 }) {
     return (
         <>
@@ -1110,11 +1134,18 @@ function WeatherDashboardTab({
                 </p>
 
                 {now && (
-                    <ObservationTimeBubble
-                        metar={metar}
-                        now={now}
-                        stationInfo={stationInfo ?? null}
-                    />
+                    <div className="flex flex-col items-start">
+                        <ObservationTimeBubble
+                            metar={metar}
+                            now={now}
+                            stationInfo={stationInfo ?? null}
+                        />
+                        <LastFetchFinePrint
+                            label="METAR"
+                            lastAttempt={lastMetarFetchAttempt}
+                            onResync={onRefetchMetar}
+                        />
+                    </div>
                 )}
             </div>
 
@@ -2233,6 +2264,8 @@ function TafDashboardTab({
     taf,
     loading,
     error,
+    lastTafFetchAttempt = null,
+    onRefetchTaf,
 }: {
     station?: string;
     timeZone?: string | null;
@@ -2244,6 +2277,8 @@ function TafDashboardTab({
     taf: TafResponse | null;
     loading: boolean;
     error: string | null;
+    lastTafFetchAttempt?: Date | null;
+    onRefetchTaf?: () => void;
 }) {
     if (loading) {
         return (
@@ -2333,7 +2368,16 @@ function TafDashboardTab({
                     </p>
                 </div>
 
-                <TafIssuedBubble issueTime={taf.issueTime} timeZone={timeZone} now={now} />
+                <div className="flex flex-col items-start">
+                    <TafIssuedBubble issueTime={taf.issueTime} timeZone={timeZone} now={now} />
+                    {onRefetchTaf && (
+                        <LastFetchFinePrint
+                            label="TAF"
+                            lastAttempt={lastTafFetchAttempt}
+                            onResync={onRefetchTaf}
+                        />
+                    )}
+                </div>
             </div>
 
             <div className="space-y-4 rounded-2xl border border-zinc-800 bg-black/55 p-6">
@@ -2918,6 +2962,52 @@ function TafIssuedBubble({
 
             <span>{isValid ? formatLocalFromDate(date, timeZone) : "LT unavailable"}</span>
         </div>
+    );
+}
+
+function formatFinePrintTime(date: Date): string {
+    return new Intl.DateTimeFormat("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+    }).format(date);
+}
+
+function LastFetchFinePrint({
+    label,
+    lastAttempt,
+    onResync,
+}: {
+    label: string;
+    lastAttempt: Date | null;
+    onResync: () => void;
+}) {
+    return (
+        <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-zinc-500">
+            <span>
+                Last sync: {lastAttempt ? formatFinePrintTime(lastAttempt) : "—"}
+            </span>
+            <button
+                type="button"
+                onClick={onResync}
+                aria-label={`Resync ${label}`}
+                className="flex h-4 w-4 items-center justify-center text-[#e6c76f] transition hover:text-white"
+            >
+                <svg
+                    viewBox="0 0 24 24"
+                    className="h-3 w-3"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                >
+                    <polyline points="23 4 23 10 17 10" />
+                    <polyline points="1 20 1 14 7 14" />
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                </svg>
+            </button>
+        </p>
     );
 }
 
