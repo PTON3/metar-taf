@@ -3413,7 +3413,7 @@ function RunwayWindWidget({
                             </div>
                         )}
 
-                        <div className="flex w-72 min-h-0 flex-1 flex-col gap-4 overflow-y-auto pt-2">
+                        <div className="flex w-72 min-h-0 flex-1 flex-col justify-center gap-4 overflow-y-auto pt-2">
                             <WeatherMinimumsPanel metar={metar} bestRunway={bestRunway} />
                             <NightStackingPanel
                                 taf={taf}
@@ -3450,7 +3450,7 @@ function RunwayWindWidget({
                         <CloudCeilingPreviewSvg metar={metar} />
                     </div>
 
-                    <div className="flex w-full min-w-0 flex-col gap-4 min-[1350px]:w-72">
+                    <div className="flex w-full min-w-0 flex-col justify-center gap-4 min-[1350px]:w-72">
                         <WeatherMinimumsPanel metar={metar} bestRunway={bestRunway} />
                         <NightStackingPanel
                             taf={taf}
@@ -4621,14 +4621,14 @@ function WeatherMinimumsPanel({
         failCount === 0 ? "pass" : failCount === rows.length ? "fail" : "warn";
 
     return (
-        <div className="flex h-full flex-col pl-3">
+        <div className="flex flex-col pl-3">
             <p className="flex flex-wrap items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
                 <span className="whitespace-nowrap">Weather Minimums</span>
                 <InfoTooltip text="Compares the current METAR (and best-runway crosswind) against Inflight's operational minimums for each type of flight. Go means every category is flyable, caution means only some are, and no-go means none are." />
                 <OverallStatusIndicator status={overall} />
             </p>
 
-            <div className="mt-2 flex flex-1 flex-col justify-center divide-y divide-zinc-800/70">
+            <div className="mt-2 flex flex-col divide-y divide-zinc-800/70">
                 {rows.map(({ minimum, passes }) => (
                     <div
                         key={minimum.operation}
@@ -5911,7 +5911,7 @@ function QuizPanel({
             </p>
 
             <h2 className="mt-2 text-2xl font-bold text-white">
-                {submitted ? "Your results" : "Decode this METAR"}
+                {submitted ? "Your results" : "Decode the current METAR"}
             </h2>
 
             <div className="mt-4 rounded-2xl border border-zinc-800 bg-black/60 p-4">
@@ -6293,10 +6293,9 @@ function QuizPanel({
 
                     <button
                         onClick={onContinue}
-                        className="flex items-center gap-2 rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
+                        className="rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
                     >
-                        Dashboard
-                        <span className="text-lg font-black">→</span>
+                        Continue
                     </button>
                 </div>
             )}
