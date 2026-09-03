@@ -1134,7 +1134,7 @@ function WeatherDashboardTab({
                 </p>
 
                 {now && (
-                    <div className="flex flex-col items-start">
+                    <div className="flex flex-col items-end">
                         <ObservationTimeBubble
                             metar={metar}
                             now={now}
@@ -2368,7 +2368,7 @@ function TafDashboardTab({
                     </p>
                 </div>
 
-                <div className="flex flex-col items-start">
+                <div className="flex flex-col items-end">
                     <TafIssuedBubble issueTime={taf.issueTime} timeZone={timeZone} now={now} />
                     {onRefetchTaf && (
                         <LastFetchFinePrint
