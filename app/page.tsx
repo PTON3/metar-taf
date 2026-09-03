@@ -276,6 +276,8 @@ export default function Home() {
     const [station, setStation] = useState("KFCM");
     const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
     const [rawInput, setRawInput] = useState("");
+    const [searchMode, setSearchMode] = useState<"decode" | "quiz">("decode");
+    const [quizMode, setQuizMode] = useState(false);
 
     const [metar, setMetar] = useState<NormalizedMetar | null>(null);
     const [rawMetar, setRawMetar] = useState<string | null>(null);
@@ -334,9 +336,24 @@ export default function Home() {
         void loadLiveMetar(cleanStation);
     }
 
+    function startQuiz() {
+        setQuizMode(true);
+        fetchLiveMetar();
+    }
+
+    function runSearch() {
+        if (searchMode === "quiz") {
+            startQuiz();
+        } else {
+            setQuizMode(false);
+            fetchLiveMetar();
+        }
+    }
+
     async function decodeRawMetar() {
         setLoading(true);
         setError("");
+        setQuizMode(false);
 
         try {
             const response = await fetch("/api/metar/parse", {
@@ -529,27 +546,54 @@ export default function Home() {
                                                 setStation(event.target.value.toUpperCase())
                                             }
                                             onKeyDown={(event) => {
-                                                if (event.key === "Enter") fetchLiveMetar();
+                                                if (event.key === "Enter") runSearch();
                                             }}
                                             className="min-w-0 flex-1 bg-transparent text-sm font-semibold text-white outline-none placeholder:font-normal placeholder:text-zinc-600"
                                             placeholder="Enter ICAO code — KFCM"
                                         />
 
                                         <button
-                                            onClick={() => fetchLiveMetar()}
+                                            onClick={runSearch}
                                             disabled={loading}
                                             className="shrink-0 rounded-full bg-[#d6b35a] px-5 py-2 text-xs font-black uppercase tracking-[0.08em] text-black transition hover:bg-[#e6c76f] disabled:cursor-not-allowed disabled:opacity-50"
                                         >
-                                            {loading ? "…" : "Fetch"}
+                                            {loading ? "…" : "Go"}
                                         </button>
                                     </div>
 
-                                    <button
-                                        onClick={() => setActiveTab("raw")}
-                                        className="mt-2 text-xs font-semibold text-zinc-500 transition hover:text-[#e6c76f]"
-                                    >
-                                        Have a raw METAR? Paste it instead →
-                                    </button>
+                                    <div className="mt-2 flex items-center gap-3">
+                                        <div className="relative flex items-center rounded-full border border-zinc-700 bg-black/40 p-0.5 text-[10px] font-black uppercase tracking-[0.08em]">
+                                            <span
+                                                aria-hidden="true"
+                                                className={`absolute inset-y-0.5 left-0.5 w-16 rounded-full bg-[#d6b35a] transition-transform duration-200 ease-out ${searchMode === "quiz" ? "translate-x-16" : "translate-x-0"
+                                                    }`}
+                                            />
+
+                                            <button
+                                                onClick={() => setSearchMode("decode")}
+                                                className={`relative z-10 w-16 rounded-full px-2 py-1.5 uppercase transition-colors ${searchMode === "decode" ? "text-black" : "text-zinc-400"
+                                                    }`}
+                                            >
+                                                Decode
+                                            </button>
+
+                                            <button
+                                                onClick={() => setSearchMode("quiz")}
+                                                title="Pull the current METAR for this station and quiz yourself before decoding it"
+                                                className={`relative z-10 w-16 rounded-full px-2 py-1.5 uppercase transition-colors ${searchMode === "quiz" ? "text-black" : "text-zinc-400"
+                                                    }`}
+                                            >
+                                                Quiz
+                                            </button>
+                                        </div>
+
+                                        <button
+                                            onClick={() => setActiveTab("raw")}
+                                            className="text-xs font-semibold text-zinc-500 transition hover:text-[#e6c76f]"
+                                        >
+                                            Paste raw METAR →
+                                        </button>
+                                    </div>
                                 </>
                             ) : (
                                 <>
@@ -589,16 +633,26 @@ export default function Home() {
                 )}
 
                 {metar ? (
-                    <MetarDashboard
-                        metar={metar}
-                        rawMetar={rawMetar ?? metar.raw}
-                        station={station}
-                        stationInfo={stationInfo}
-                        airportDiagram={airportDiagram}
-                        runways={runways}
-                        isFullscreenOpen={isFullscreenOpen}
-                        setIsFullscreenOpen={setIsFullscreenOpen}
-                    />
+                    quizMode ? (
+                        <QuizPanel
+                            key={rawMetar ?? metar.raw}
+                            metar={metar}
+                            rawText={rawMetar ?? metar.raw}
+                            timeZone={stationInfo?.timeZone}
+                            onContinue={() => setQuizMode(false)}
+                        />
+                    ) : (
+                        <MetarDashboard
+                            metar={metar}
+                            rawMetar={rawMetar ?? metar.raw}
+                            station={station}
+                            stationInfo={stationInfo}
+                            airportDiagram={airportDiagram}
+                            runways={runways}
+                            isFullscreenOpen={isFullscreenOpen}
+                            setIsFullscreenOpen={setIsFullscreenOpen}
+                        />
+                    )
                     ) : (
                     <EmptyState />
                 )}
@@ -5316,9 +5370,9 @@ function RemarksSection({ remarks }: { remarks: string | null }) {
             </div>
 
             <div className="space-y-3">
-                {remarkBubbles.map((remark) => (
+                {remarkBubbles.map((remark, index) => (
                     <div
-                        key={`${remark.code}-${remark.meaning}`}
+                        key={`${index}-${remark.code}`}
                         className="w-full rounded-xl border border-zinc-700 bg-zinc-950 px-4 py-3"
                     >
                         <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-zinc-400">
@@ -5346,6 +5400,906 @@ function EmptyState() {
             <p className="mt-3 text-zinc-400">
                 The decoded dashboard will appear here.
             </p>
+        </section>
+    );
+}
+
+type QuizDifficulty = "easy" | "amateur" | "expert";
+
+type QuizQuestion = {
+    id: string;
+    label: string;
+    level: QuizDifficulty;
+    kind: "text" | "select" | "clouds";
+    placeholder?: string;
+    options?: string[];
+    correctDisplay: string;
+    isCorrect: (input: string) => boolean;
+    getNote?: (input: string) => string | null;
+};
+
+const QUIZ_DIFFICULTY_ORDER: QuizDifficulty[] = ["easy", "amateur", "expert"];
+
+const QUIZ_DIFFICULTY_LABELS: Record<QuizDifficulty, string> = {
+    easy: "Beginner",
+    amateur: "Amateur",
+    expert: "Expert",
+};
+
+function parseQuizTimeInput(input: string): { hour: number; minute: number } | null {
+    const match = input.trim().match(/(\d{1,2}):?(\d{2})?\s*(AM|PM)?/i);
+    if (!match) return null;
+
+    let hour = Number(match[1]);
+    const minute = match[2] ? Number(match[2]) : 0;
+    const meridiem = match[3]?.toUpperCase();
+
+    if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
+    if (meridiem === "PM" && hour < 12) hour += 12;
+    if (meridiem === "AM" && hour === 12) hour = 0;
+
+    return { hour: hour % 24, minute };
+}
+
+function getQuizLocalHourMinute(
+    metar: NormalizedMetar,
+    timeZone: string | null | undefined
+): { hour: number; minute: number } | null {
+    const observed = getObservationDateUtc(metar);
+    if (!observed || !timeZone) return null;
+
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+    }).formatToParts(observed);
+
+    const hour = Number(parts.find((part) => part.type === "hour")?.value);
+    const minute = Number(parts.find((part) => part.type === "minute")?.value);
+
+    if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
+    return { hour, minute };
+}
+
+function getQuizLocalZoneAbbreviation(
+    metar: NormalizedMetar,
+    timeZone: string | null | undefined
+): string {
+    const observed = getObservationDateUtc(metar);
+    if (!observed || !timeZone) return "";
+
+    try {
+        const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone,
+            timeZoneName: "short",
+        }).formatToParts(observed);
+
+        return parts.find((part) => part.type === "timeZoneName")?.value ?? "";
+    } catch {
+        return "";
+    }
+}
+
+function parseQuizLocalTimeAnswer(input: string): { hour: number; minute: number } | null {
+    const [hourText, minuteText, meridiem] = input.split("|");
+    if (!hourText || !minuteText) return null;
+
+    const hour12 = Number(hourText);
+    const minute = Number(minuteText);
+    if (Number.isNaN(hour12) || Number.isNaN(minute)) return null;
+
+    const hour = (hour12 % 12) + (meridiem === "PM" ? 12 : 0);
+    return { hour, minute };
+}
+
+function parseQuizNumber(input: string): number | null {
+    const match = input.trim().match(/\d+(\.\d+)?/);
+    if (!match) return null;
+    const num = Number(match[0]);
+    return Number.isNaN(num) ? null : num;
+}
+
+function parseQuizWindDirectionInput(input: string): {
+    variable: boolean;
+    direction: number | null;
+} {
+    const cleaned = input.trim().toUpperCase();
+    if (/VRB|VARIABLE/.test(cleaned)) {
+        return { variable: true, direction: null };
+    }
+    return { variable: false, direction: parseQuizNumber(cleaned) };
+}
+
+function parseQuizSignedTemp(input: string): number | null {
+    const cleaned = input.trim().toUpperCase().replace(/^M(\d+)/, "-$1");
+    const match = cleaned.match(/-?\d+/);
+    if (!match) return null;
+    const num = Number(match[0]);
+    return Number.isNaN(num) ? null : num;
+}
+
+const QUIZ_CLOUD_COVER_OPTIONS: { value: string; label: string }[] = [
+    { value: "FEW", label: "Few" },
+    { value: "SCT", label: "Scattered" },
+    { value: "BKN", label: "Broken" },
+    { value: "OVC", label: "Overcast" },
+    { value: "VV", label: "Vertical Visibility" },
+    { value: "SKC", label: "Sky Clear" },
+    { value: "CLR", label: "Clear" },
+];
+
+type QuizCloudEntry = { cover: string; base: string };
+
+function serializeQuizCloudEntries(entries: QuizCloudEntry[]): string {
+    return entries
+        .filter((entry) => entry.cover)
+        .map((entry) => `${entry.cover}:${entry.base}`)
+        .join("|");
+}
+
+function parseQuizCloudAnswer(input: string): { cover: string; base: number | null }[] {
+    return input
+        .split("|")
+        .filter(Boolean)
+        .map((part) => {
+            const [cover, base] = part.split(":");
+            return {
+                cover: (cover ?? "").toUpperCase(),
+                base: base ? Number(base) : null,
+            };
+        });
+}
+
+function getQuizCloudLayerResults(
+    metar: NormalizedMetar,
+    userAnswerRaw: string
+): { label: string; correct: boolean }[] {
+    const entries = parseQuizCloudAnswer(userAnswerRaw);
+
+    if (metar.clouds.length === 0) {
+        return [
+            {
+                label: "CLR",
+                correct: entries.some(
+                    (entry) => entry.cover === "CLR" || entry.cover === "SKC"
+                ),
+            },
+        ];
+    }
+
+    return metar.clouds.map((cloud) => ({
+        label:
+            cloud.baseFeetAgl !== null
+                ? `${cloud.cover} ${cloud.baseFeetAgl.toLocaleString()}`
+                : cloud.cover,
+        correct: entries.some(
+            (entry) =>
+                entry.cover === cloud.cover &&
+                (cloud.baseFeetAgl === null
+                    ? entry.base === null
+                    : entry.base === cloud.baseFeetAgl)
+        ),
+    }));
+}
+
+function parseQuizAltimeterInput(input: string): number | null {
+    const cleaned = input.trim().toUpperCase().replace(/^A/, "");
+    if (!cleaned.includes(".")) return null;
+
+    const num = Number(cleaned);
+    return Number.isNaN(num) ? null : num;
+}
+
+function isQuizAltimeterMissingDecimal(input: string, correctInHg: number): boolean {
+    const cleaned = input.trim().toUpperCase().replace(/^A/, "");
+    if (cleaned.includes(".")) return false;
+
+    const digitsOnly = cleaned.replace(/[^\d]/g, "");
+    if (digitsOnly.length !== 4) return false;
+
+    return Math.abs(Number(digitsOnly) / 100 - correctInHg) < 0.005;
+}
+
+function buildQuizQuestions(
+    metar: NormalizedMetar,
+    timeZone: string | null | undefined
+): QuizQuestion[] {
+    const questions: QuizQuestion[] = [];
+
+    const { hourUtc, minuteUtc } = metar.observed;
+    if (hourUtc !== null && minuteUtc !== null) {
+        questions.push({
+            id: "zuluTime",
+            label: "Observation time (Zulu)",
+            level: "easy",
+            kind: "text",
+            placeholder: "e.g. 1453",
+            correctDisplay: formatZuluObservation(metar),
+            isCorrect: (input) => {
+                const parsed = parseQuizTimeInput(input);
+                return (
+                    parsed !== null &&
+                    parsed.hour === hourUtc &&
+                    parsed.minute === minuteUtc
+                );
+            },
+        });
+    }
+
+    const localTime = getQuizLocalHourMinute(metar, timeZone);
+    if (localTime) {
+        questions.push({
+            id: "localStationTime",
+            label: "Observation time (local)",
+            level: "expert",
+            kind: "text",
+            correctDisplay: formatLocalObservation(metar, timeZone),
+            isCorrect: (input) => {
+                const parsed = parseQuizLocalTimeAnswer(input);
+                return (
+                    parsed !== null &&
+                    parsed.hour === localTime.hour &&
+                    parsed.minute === localTime.minute
+                );
+            },
+        });
+    }
+
+    questions.push({
+        id: "windDirection",
+        label: "Wind direction (deg)",
+        level: "easy",
+        kind: "text",
+        correctDisplay: metar.wind.variable
+            ? "Variable"
+            : metar.wind.directionDeg !== null
+              ? `${metar.wind.directionDeg}°`
+              : "Not reported",
+        isCorrect: (input) => {
+            const parsed = parseQuizWindDirectionInput(input);
+
+            if (metar.wind.variable) {
+                return parsed.variable;
+            }
+
+            return (
+                metar.wind.directionDeg !== null &&
+                parsed.direction === metar.wind.directionDeg
+            );
+        },
+    });
+
+    questions.push({
+        id: "windSpeed",
+        label: "Wind speed (kt)",
+        level: "easy",
+        kind: "text",
+        correctDisplay:
+            metar.wind.speedKt === null ? "Not reported" : `${metar.wind.speedKt} kt`,
+        isCorrect: (input) => {
+            if (metar.wind.speedKt === null) return false;
+            return parseQuizNumber(input) === metar.wind.speedKt;
+        },
+    });
+
+    if (metar.wind.gustKt !== null) {
+        questions.push({
+            id: "windGust",
+            label: "Wind gust (kt)",
+            level: "easy",
+            kind: "text",
+            correctDisplay: `${metar.wind.gustKt} kt`,
+            isCorrect: (input) => parseQuizNumber(input) === metar.wind.gustKt,
+        });
+    }
+
+    questions.push({
+        id: "visibility",
+        label: "Visibility (SM)",
+        level: "amateur",
+        kind: "text",
+        correctDisplay: formatVisibility(metar),
+        isCorrect: (input) => {
+            if (metar.visibility.statuteMiles === null) return false;
+            const num = Number(input.trim().replace(/SM$/i, ""));
+            return !Number.isNaN(num) && num === metar.visibility.statuteMiles;
+        },
+    });
+
+    questions.push({
+        id: "clouds",
+        label: "Cloud layers",
+        level: "amateur",
+        kind: "clouds",
+        correctDisplay: formatClouds(metar),
+        isCorrect: (input) => {
+            const entries = parseQuizCloudAnswer(input);
+
+            if (metar.clouds.length === 0) {
+                return entries.some(
+                    (entry) => entry.cover === "CLR" || entry.cover === "SKC"
+                );
+            }
+
+            return metar.clouds.every((cloud) =>
+                entries.some(
+                    (entry) =>
+                        entry.cover === cloud.cover &&
+                        (cloud.baseFeetAgl === null
+                            ? entry.base === null
+                            : entry.base === cloud.baseFeetAgl)
+                )
+            );
+        },
+    });
+
+    questions.push({
+        id: "flightCategory",
+        label: "Flight category",
+        level: "expert",
+        kind: "select",
+        options: ["VFR", "MVFR", "IFR", "LIFR"],
+        correctDisplay: metar.flightCategory,
+        isCorrect: (input) => input === metar.flightCategory,
+    });
+
+    questions.push({
+        id: "ceiling",
+        label: "Ceiling (ft AGL)",
+        level: "expert",
+        kind: "text",
+        correctDisplay: formatCeiling(metar),
+        isCorrect: (input) => {
+            const cleaned = input.trim().toUpperCase();
+
+            if (metar.ceiling.feetAgl === null) {
+                return /N\/?A|NONE|UNLIMITED|NO CEILING|CLR|SKC/.test(cleaned);
+            }
+
+            const num = Number(cleaned.replace(/[^\d]/g, ""));
+            return !Number.isNaN(num) && num === metar.ceiling.feetAgl;
+        },
+    });
+
+    questions.push({
+        id: "temperature",
+        label: "Temperature (°C)",
+        level: "expert",
+        kind: "text",
+        correctDisplay:
+            metar.temperature.celsius !== null
+                ? `${metar.temperature.celsius} C / ${metar.temperature.fahrenheit} F`
+                : "Not reported",
+        isCorrect: (input) => {
+            if (metar.temperature.celsius === null) return false;
+            return parseQuizSignedTemp(input) === metar.temperature.celsius;
+        },
+    });
+
+    questions.push({
+        id: "dewpoint",
+        label: "Dewpoint (°C)",
+        level: "expert",
+        kind: "text",
+        correctDisplay:
+            metar.dewpoint.celsius !== null
+                ? `${metar.dewpoint.celsius} C / ${metar.dewpoint.fahrenheit} F`
+                : "Not reported",
+        isCorrect: (input) => {
+            if (metar.dewpoint.celsius === null) return false;
+            return parseQuizSignedTemp(input) === metar.dewpoint.celsius;
+        },
+    });
+
+    questions.push({
+        id: "altimeter",
+        label: "Altimeter (inHg)",
+        level: "expert",
+        kind: "text",
+        correctDisplay: formatAltimeter(metar),
+        isCorrect: (input) => {
+            const parsed = parseQuizAltimeterInput(input);
+            return (
+                parsed !== null &&
+                metar.altimeter.inHg !== null &&
+                Math.abs(parsed - metar.altimeter.inHg) < 0.005
+            );
+        },
+        getNote: (input) => {
+            if (metar.altimeter.inHg === null) return null;
+            return isQuizAltimeterMissingDecimal(input, metar.altimeter.inHg)
+                ? "Don't forget the decimal point!"
+                : null;
+        },
+    });
+
+    if (metar.weather.length > 0) {
+        questions.push({
+            id: "weather",
+            label: "Present weather",
+            level: "expert",
+            kind: "text",
+            correctDisplay: metar.weather.join(" "),
+            isCorrect: (input) => {
+                const cleaned = input.toUpperCase();
+                return metar.weather.every((code) => cleaned.includes(code.toUpperCase()));
+            },
+        });
+    }
+
+    return questions;
+}
+
+function QuizPanel({
+    metar,
+    rawText,
+    timeZone,
+    onContinue,
+}: {
+    metar: NormalizedMetar;
+    rawText: string;
+    timeZone: string | null | undefined;
+    onContinue: () => void;
+}) {
+    const [difficulty, setDifficulty] = useState<QuizDifficulty>("easy");
+    const [answers, setAnswers] = useState<Record<string, string>>({});
+    const [submitted, setSubmitted] = useState(false);
+    const [cloudEntries, setCloudEntries] = useState<QuizCloudEntry[]>([
+        { cover: "", base: "" },
+    ]);
+    const [gustAdded, setGustAdded] = useState(false);
+
+    const questions = buildQuizQuestions(metar, timeZone).filter(
+        (question) =>
+            QUIZ_DIFFICULTY_ORDER.indexOf(question.level) <=
+                QUIZ_DIFFICULTY_ORDER.indexOf(difficulty) &&
+            (question.id !== "windGust" || gustAdded || submitted)
+    );
+
+    const correctCount = questions.filter((question) =>
+        question.isCorrect((answers[question.id] ?? "").trim())
+    ).length;
+
+    function updateAnswer(id: string, value: string) {
+        setAnswers((current) => ({ ...current, [id]: value }));
+    }
+
+    function updateCloudEntry(index: number, field: "cover" | "base", value: string) {
+        setCloudEntries((current) => {
+            const next = current.map((entry, i) => {
+                if (i !== index) return entry;
+                const updated = { ...entry, [field]: value };
+                if (field === "cover" && (value === "CLR" || value === "SKC")) {
+                    updated.base = "";
+                }
+                return updated;
+            });
+            updateAnswer("clouds", serializeQuizCloudEntries(next));
+            return next;
+        });
+    }
+
+    function addCloudEntry() {
+        setCloudEntries((current) => {
+            const next = [...current, { cover: "", base: "" }];
+            updateAnswer("clouds", serializeQuizCloudEntries(next));
+            return next;
+        });
+    }
+
+    function removeCloudEntry(index: number) {
+        setCloudEntries((current) => {
+            const next = current.filter((_, i) => i !== index);
+            updateAnswer("clouds", serializeQuizCloudEntries(next));
+            return next;
+        });
+    }
+
+    function retry() {
+        setAnswers({});
+        setSubmitted(false);
+        setCloudEntries([{ cover: "", base: "" }]);
+        setGustAdded(false);
+    }
+
+    return (
+        <section className="mt-8 rounded-3xl border border-[#d6b35a]/25 bg-zinc-950/80 p-6 shadow-2xl sm:p-8">
+            <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                Quiz Mode
+                <InfoTooltip text="Read the raw METAR below, answer each question, then submit to see a graded, side-by-side comparison." />
+            </p>
+
+            <h2 className="mt-2 text-2xl font-bold text-white">
+                {submitted ? "Your results" : "Decode this METAR"}
+            </h2>
+
+            <div className="mt-4 rounded-2xl border border-zinc-800 bg-black/60 p-4">
+                <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-6 text-zinc-100">
+                    {rawText}
+                </pre>
+            </div>
+
+            <div className="mt-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                    Difficulty
+                </p>
+
+                <div
+                    className={`relative mt-2 flex items-center rounded-full border border-zinc-700 bg-black/40 p-1 text-xs font-black tracking-[0.08em] ${
+                        submitted ? "pointer-events-none opacity-50" : ""
+                    }`}
+                >
+                    <span
+                        aria-hidden="true"
+                        className="absolute inset-y-1 left-1 w-1/3 rounded-full bg-[#d6b35a] transition-transform duration-200 ease-out"
+                        style={{
+                            transform: `translateX(${QUIZ_DIFFICULTY_ORDER.indexOf(difficulty) * 100}%)`,
+                        }}
+                    />
+
+                    {QUIZ_DIFFICULTY_ORDER.map((level) => (
+                        <button
+                            key={level}
+                            onClick={() => setDifficulty(level)}
+                            className={`relative z-10 w-1/3 rounded-full py-2 uppercase transition-colors ${
+                                difficulty === level ? "text-black" : "text-zinc-400"
+                            }`}
+                        >
+                            {QUIZ_DIFFICULTY_LABELS[level]}
+                        </button>
+                    ))}
+                </div>
+            </div>
+
+            {submitted && (
+                <p
+                    className={`mt-4 text-sm font-bold ${
+                        correctCount === questions.length ? "text-emerald-300" : "text-[#e6c76f]"
+                    }`}
+                >
+                    {correctCount} / {questions.length} correct
+                </p>
+            )}
+
+            <div className="relative mt-4 grid grid-cols-2 items-start gap-x-4 gap-y-3">
+                {questions.map((question, index) => {
+                    return (
+                        <div key={question.id} style={{ gridRow: index + 1, gridColumn: 1 }}>
+                            <label className="block h-4 text-xs font-semibold text-zinc-400">
+                                {question.label}
+                            </label>
+
+                            {question.kind === "select" ? (
+                                    <select
+                                        value={answers[question.id] ?? ""}
+                                        onChange={(event) =>
+                                            updateAnswer(question.id, event.target.value)
+                                        }
+                                        disabled={submitted}
+                                        className="mt-1 h-[42px] w-full rounded-xl border border-zinc-700 bg-black px-3 text-sm text-white outline-none focus:border-[#d6b35a]/60 disabled:opacity-50"
+                                    >
+                                        <option value="" disabled>
+                                            Choose…
+                                        </option>
+                                        {question.options?.map((option) => (
+                                            <option key={option} value={option}>
+                                                {option}
+                                            </option>
+                                        ))}
+                                    </select>
+                                ) : question.kind === "clouds" ? (
+                                    <div className="mt-1 space-y-2">
+                                        {cloudEntries.map((entry, index) => (
+                                            <div key={index} className="flex items-center gap-2">
+                                                <select
+                                                    value={entry.cover}
+                                                    onChange={(event) =>
+                                                        updateCloudEntry(
+                                                            index,
+                                                            "cover",
+                                                            event.target.value
+                                                        )
+                                                    }
+                                                    disabled={submitted}
+                                                    className="h-[42px] w-40 shrink-0 rounded-xl border border-zinc-700 bg-black px-2 text-sm text-white outline-none focus:border-[#d6b35a]/60 disabled:opacity-50"
+                                                >
+                                                    <option value="" disabled>
+                                                        Cover…
+                                                    </option>
+                                                    {QUIZ_CLOUD_COVER_OPTIONS.map((option) => (
+                                                        <option key={option.value} value={option.value}>
+                                                            {option.label}
+                                                        </option>
+                                                    ))}
+                                                </select>
+
+                                                <input
+                                                    value={entry.base}
+                                                    onChange={(event) =>
+                                                        updateCloudEntry(
+                                                            index,
+                                                            "base",
+                                                            event.target.value
+                                                        )
+                                                    }
+                                                    disabled={
+                                                        submitted ||
+                                                        entry.cover === "CLR" ||
+                                                        entry.cover === "SKC"
+                                                    }
+                                                    className="h-[42px] w-full rounded-xl border border-zinc-700 bg-black px-3 text-sm text-white outline-none focus:border-[#d6b35a]/60 disabled:opacity-40"
+                                                />
+
+                                                <span className="shrink-0 text-xs text-zinc-500">
+                                                    ft AGL
+                                                </span>
+
+                                                {cloudEntries.length > 1 && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => removeCloudEntry(index)}
+                                                        disabled={submitted}
+                                                        className="shrink-0 rounded-lg px-2 py-2 text-sm font-black text-red-400 transition hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
+                                                    >
+                                                        ✕
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ))}
+
+                                        <button
+                                            type="button"
+                                            onClick={addCloudEntry}
+                                            disabled={submitted}
+                                            className="ml-2 text-xs font-black uppercase tracking-[0.08em] text-[#e6c76f] transition hover:text-white disabled:opacity-40"
+                                        >
+                                            + Add
+                                        </button>
+                                    </div>
+                                ) : question.id === "localStationTime" ? (
+                                    <div className="mt-1 flex w-full items-center gap-2">
+                                        <input
+                                            value={(answers[question.id] ?? "").split("|")[0] ?? ""}
+                                            onChange={(event) => {
+                                                const parts = (answers[question.id] ?? "").split("|");
+                                                const digits = event.target.value
+                                                    .replace(/\D/g, "")
+                                                    .slice(0, 2);
+                                                updateAnswer(
+                                                    question.id,
+                                                    `${digits}|${parts[1] ?? ""}|${parts[2] ?? ""}`
+                                                );
+                                            }}
+                                            disabled={submitted}
+                                            inputMode="numeric"
+                                            maxLength={2}
+                                            placeholder="HH"
+                                            className="h-[42px] w-14 shrink-0 rounded-xl border border-zinc-700 bg-black px-2 text-center text-sm text-white outline-none placeholder:text-zinc-600 focus:border-[#d6b35a]/60 disabled:opacity-50"
+                                        />
+
+                                        <span className="shrink-0 text-lg font-bold text-zinc-500">
+                                            :
+                                        </span>
+
+                                        <input
+                                            value={(answers[question.id] ?? "").split("|")[1] ?? ""}
+                                            onChange={(event) => {
+                                                const parts = (answers[question.id] ?? "").split("|");
+                                                const digits = event.target.value
+                                                    .replace(/\D/g, "")
+                                                    .slice(0, 2);
+                                                updateAnswer(
+                                                    question.id,
+                                                    `${parts[0] ?? ""}|${digits}|${parts[2] ?? ""}`
+                                                );
+                                            }}
+                                            disabled={submitted}
+                                            inputMode="numeric"
+                                            maxLength={2}
+                                            placeholder="MM"
+                                            className="h-[42px] w-14 shrink-0 rounded-xl border border-zinc-700 bg-black px-2 text-center text-sm text-white outline-none placeholder:text-zinc-600 focus:border-[#d6b35a]/60 disabled:opacity-50"
+                                        />
+
+                                        <select
+                                            value={(answers[question.id] ?? "").split("|")[2] ?? ""}
+                                            onChange={(event) => {
+                                                const parts = (answers[question.id] ?? "").split("|");
+                                                updateAnswer(
+                                                    question.id,
+                                                    `${parts[0] ?? ""}|${parts[1] ?? ""}|${event.target.value}`
+                                                );
+                                            }}
+                                            disabled={submitted}
+                                            className="h-[42px] w-24 shrink-0 rounded-xl border border-zinc-700 bg-black px-2 text-sm text-white outline-none focus:border-[#d6b35a]/60 disabled:opacity-50"
+                                        >
+                                            <option value="" disabled>
+                                                Select
+                                            </option>
+                                            <option value="AM">AM</option>
+                                            <option value="PM">PM</option>
+                                        </select>
+
+                                        <span className="shrink-0 text-sm font-semibold text-zinc-400">
+                                            {getQuizLocalZoneAbbreviation(metar, timeZone)}
+                                        </span>
+                                    </div>
+                                ) : question.id === "ceiling" ? (
+                                    <div className="mt-1 flex w-full items-center gap-2">
+                                        <input
+                                            value={
+                                                (answers[question.id] ?? "") === "N/A"
+                                                    ? ""
+                                                    : answers[question.id] ?? ""
+                                            }
+                                            onChange={(event) =>
+                                                updateAnswer(question.id, event.target.value)
+                                            }
+                                            disabled={
+                                                submitted || (answers[question.id] ?? "") === "N/A"
+                                            }
+                                            className="h-[42px] w-full rounded-xl border border-zinc-700 bg-black px-3 text-sm text-white outline-none focus:border-[#d6b35a]/60 disabled:opacity-50"
+                                        />
+
+                                        <label className="flex shrink-0 items-center gap-1.5 text-xs font-semibold text-zinc-400">
+                                            <input
+                                                type="checkbox"
+                                                checked={(answers[question.id] ?? "") === "N/A"}
+                                                onChange={(event) =>
+                                                    updateAnswer(
+                                                        question.id,
+                                                        event.target.checked ? "N/A" : ""
+                                                    )
+                                                }
+                                                disabled={submitted}
+                                                className="h-4 w-4 rounded border-zinc-600 bg-black accent-[#d6b35a]"
+                                            />
+                                            N/A
+                                        </label>
+                                    </div>
+                                ) : (
+                                    <input
+                                        value={answers[question.id] ?? ""}
+                                        onChange={(event) =>
+                                            updateAnswer(question.id, event.target.value)
+                                        }
+                                        disabled={submitted}
+                                        placeholder={question.placeholder}
+                                        className="mt-1 h-[42px] w-full rounded-xl border border-zinc-700 bg-black px-3 text-sm text-white outline-none placeholder:text-zinc-600 focus:border-[#d6b35a]/60 disabled:opacity-50"
+                                    />
+                                )}
+
+                                {question.id === "windSpeed" &&
+                                    metar.wind.gustKt !== null &&
+                                    !gustAdded &&
+                                    !submitted && (
+                                        <button
+                                            type="button"
+                                            onClick={() => setGustAdded(true)}
+                                            className="mt-1 block text-xs font-black uppercase tracking-[0.08em] text-[#e6c76f] transition hover:text-white"
+                                        >
+                                            + Add Gust
+                                        </button>
+                                    )}
+                        </div>
+                    );
+                })}
+
+                {questions.map((question, index) => {
+                    const userAnswer = (answers[question.id] ?? "").trim();
+                    const correct = userAnswer !== "" && question.isCorrect(userAnswer);
+
+                    return (
+                        <div
+                            key={question.id}
+                            style={{ gridRow: index + 1, gridColumn: 2 }}
+                            className={`mx-3 ${index === questions.length - 1 ? "mb-3" : ""}`}
+                        >
+                            <span aria-hidden="true" className="invisible block h-4 text-xs font-semibold">
+                                {question.label}
+                            </span>
+
+                            {question.kind === "clouds" ? (
+                                <div className="mt-1 space-y-2">
+                                    {submitted
+                                        ? getQuizCloudLayerResults(metar, userAnswer).map(
+                                              (result, layerIndex) => (
+                                                  <div
+                                                      key={layerIndex}
+                                                      className={`flex h-[42px] items-center rounded-xl border px-3 text-sm font-semibold ${
+                                                          result.correct
+                                                              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                                                              : "border-red-500/40 bg-red-500/10 text-red-300"
+                                                      }`}
+                                                  >
+                                                      {result.label}
+                                                  </div>
+                                              )
+                                          )
+                                        : cloudEntries.map((_, layerIndex) => (
+                                              <div
+                                                  key={layerIndex}
+                                                  className="h-[42px] rounded-xl border border-zinc-600 bg-zinc-800/80"
+                                              />
+                                          ))}
+                                </div>
+                            ) : (
+                                <div
+                                    className={`mt-1 flex min-h-[42px] flex-col justify-center rounded-xl border px-3 py-2 text-sm font-semibold ${
+                                        submitted
+                                            ? correct
+                                                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                                                : "border-red-500/40 bg-red-500/10 text-red-300"
+                                            : "border-zinc-600 bg-zinc-800/80"
+                                    }`}
+                                >
+                                    <span>{submitted ? question.correctDisplay : ""}</span>
+
+                                    {submitted && question.getNote?.(userAnswer) && (
+                                        <span className="mt-0.5 text-[11px] font-semibold text-amber-400">
+                                            {question.getNote(userAnswer)}
+                                        </span>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
+
+                {!submitted && (
+                    <div
+                        style={{
+                            gridRow: `1 / span ${questions.length}`,
+                            gridColumn: 2,
+                            backgroundImage:
+                                "repeating-linear-gradient(45deg, rgba(214,179,90,0.32) 0px, rgba(214,179,90,0.32) 3px, transparent 3px, transparent 11px)",
+                        }}
+                        className="mx-1 mb-1 mt-3 flex flex-col items-center justify-center self-stretch rounded-2xl border border-[#d6b35a]/40"
+                    >
+                        <button
+                            onClick={() => {
+                                if (metar.wind.gustKt !== null && !gustAdded) {
+                                    updateAnswer("windGust", "0");
+                                }
+                                setSubmitted(true);
+                            }}
+                            className="flex items-center gap-2 rounded-xl border border-[#d6b35a]/60 bg-black px-6 py-3 text-sm font-black uppercase tracking-[0.08em] text-[#e6c76f] shadow-lg shadow-black/60 transition hover:scale-[1.03] hover:bg-zinc-900"
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-4 w-4"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2.2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M4 12.5l5 5L20 6.5" />
+                            </svg>
+                            Grade
+                        </button>
+                    </div>
+                )}
+            </div>
+
+            {submitted && (
+                <div className="mt-5 flex flex-wrap gap-3">
+                    <button
+                        onClick={retry}
+                        className="rounded-xl border border-zinc-700 px-5 py-3 font-bold text-zinc-300 transition hover:border-zinc-600 hover:text-white"
+                    >
+                        Try Again
+                    </button>
+
+                    <button
+                        onClick={onContinue}
+                        className="flex items-center gap-2 rounded-xl border border-[#d6b35a]/50 bg-[#d6b35a]/10 px-5 py-3 font-bold text-[#e6c76f] transition hover:bg-[#d6b35a]/20"
+                    >
+                        Dashboard
+                        <span className="text-lg font-black">→</span>
+                    </button>
+                </div>
+            )}
         </section>
     );
 }
