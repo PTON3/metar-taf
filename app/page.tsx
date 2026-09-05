@@ -1,6 +1,13 @@
 ﻿"use client";
 
-import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import {
+    useCallback,
+    useEffect,
+    useRef,
+    useState,
+    type PointerEvent,
+    type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
 import {
@@ -10,6 +17,473 @@ import {
 import * as SunCalc from "suncalc";
 import Image from "next/image";
 import FeedbackWidget from "./FeedbackWidget";
+
+const RADAR_DEFAULT_RADIUS_NM = 50;
+const RADAR_MAX_RADIUS_NM = 250;
+const NM_TO_METERS = 1852;
+const EARTH_CIRCUMFERENCE_METERS = 40075016.686;
+const MAP_TILE_SIZE = 256;
+const RADAR_BASEMAP_TILE_URL =
+    "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}";
+const RADAR_BASEMAP_MAX_ZOOM = 16;
+const RADAR_WHEEL_ZOOM_SENSITIVITY = 0.012;
+
+// NOAA/NCEP GeoServer (opengeo.ncep.noaa.gov) serving the MRMS quality-controlled
+// CONUS base reflectivity mosaic — a direct government data source (no API key).
+const RADAR_WMS_BASE_URL = "https://opengeo.ncep.noaa.gov/geoserver/conus/wms";
+const RADAR_WMS_LAYER = "conus_bref_qcd";
+const RADAR_WMS_CAPABILITIES_URL = `${RADAR_WMS_BASE_URL}?service=WMS&version=1.1.1&request=GetCapabilities`;
+const RADAR_IMAGE_MAX_PX = 1024;
+
+// NOAA's default render style ("conus_bref_qcd") sampled from its own published
+// legend (~-20 to 70+ dBZ), paired 1:1 with our own custom output colors so the
+// live government reflectivity data is recolored entirely in-house.
+const RADAR_SOURCE_STOPS: readonly [number, number, number][] = [
+    [141, 129, 127],
+    [189, 193, 180],
+    [98, 118, 168],
+    [94, 174, 206],
+    [67, 214, 131],
+    [14, 213, 20],
+    [10, 110, 11],
+    [250, 216, 10],
+    [243, 178, 27],
+    [197, 10, 11],
+    [174, 3, 3],
+    [239, 116, 253],
+    [140, 0, 235],
+];
+
+const RADAR_CUSTOM_STOPS: readonly [number, number, number, number][] = [
+    [45, 212, 191, 0],
+    [45, 212, 191, 60],
+    [52, 211, 153, 120],
+    [132, 204, 90, 150],
+    [214, 179, 90, 175],
+    [230, 199, 111, 195],
+    [224, 150, 43, 215],
+    [224, 110, 43, 225],
+    [214, 71, 46, 235],
+    [178, 30, 30, 245],
+    [150, 20, 90, 250],
+    [155, 47, 214, 255],
+    [110, 20, 190, 255],
+];
+
+const RADAR_SCALE_NICE_VALUES_NM = [1, 2, 5, 10, 20, 25, 50, 75, 100, 150, 200, 300];
+const RADAR_SCALE_MAX_TARGET_PX = 260;
+
+type RadarWmsBounds = {
+    west: number;
+    south: number;
+    east: number;
+    north: number;
+};
+
+function buildRadarWmsUrl(bounds: RadarWmsBounds, width: number, height: number): string {
+    const params = new URLSearchParams({
+        service: "WMS",
+        version: "1.1.1",
+        request: "GetMap",
+        layers: RADAR_WMS_LAYER,
+        bbox: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
+        width: String(width),
+        height: String(height),
+        srs: "EPSG:4326",
+        format: "image/png",
+        transparent: "true",
+    });
+    return `${RADAR_WMS_BASE_URL}?${params.toString()}`;
+}
+
+async function fetchRecoloredRadarOverlay(bounds: RadarWmsBounds): Promise<string> {
+    const lonSpan = bounds.east - bounds.west;
+    const latSpan = bounds.north - bounds.south;
+    const aspect = lonSpan / latSpan;
+    const width = aspect >= 1 ? RADAR_IMAGE_MAX_PX : Math.round(RADAR_IMAGE_MAX_PX * aspect);
+    const height = aspect >= 1 ? Math.round(RADAR_IMAGE_MAX_PX / aspect) : RADAR_IMAGE_MAX_PX;
+
+    const response = await fetch(buildRadarWmsUrl(bounds, width, height));
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!response.ok || !contentType.startsWith("image/")) {
+        throw new Error("Radar imagery request failed.");
+    }
+
+    const blob = await response.blob();
+    const bitmap = await createImageBitmap(blob);
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas unavailable.");
+
+    ctx.drawImage(bitmap, 0, 0);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+
+    for (let i = 0; i < data.length; i += 4) {
+        if (data[i + 3] === 0) continue;
+
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+
+        let bestIndex = 0;
+        let bestDistance = Infinity;
+        for (let s = 0; s < RADAR_SOURCE_STOPS.length; s++) {
+            const [sr, sg, sb] = RADAR_SOURCE_STOPS[s];
+            const dr = r - sr;
+            const dg = g - sg;
+            const db = b - sb;
+            const distance = dr * dr + dg * dg + db * db;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = s;
+            }
+        }
+
+        const [cr, cg, cb, ca] = RADAR_CUSTOM_STOPS[bestIndex];
+        data[i] = cr;
+        data[i + 1] = cg;
+        data[i + 2] = cb;
+        data[i + 3] = ca;
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+
+    const outputBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((result) => {
+            if (result) resolve(result);
+            else reject(new Error("Failed to encode radar overlay."));
+        }, "image/png");
+    });
+
+    return URL.createObjectURL(outputBlob);
+}
+
+async function fetchRadarValidTime(): Promise<Date | null> {
+    const response = await fetch(RADAR_WMS_CAPABILITIES_URL);
+    if (!response.ok) return null;
+
+    const text = await response.text();
+    const layerIndex = text.indexOf(`<Name>${RADAR_WMS_LAYER}</Name>`);
+    if (layerIndex === -1) return null;
+
+    const dimensionMatch = text
+        .slice(layerIndex, layerIndex + 4000)
+        .match(/<Dimension[^>]*name="time"[^>]*default="([^"]+)"/);
+    if (!dimensionMatch) return null;
+
+    const parsed = new Date(dimensionMatch[1]);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+// ---- FAA aeronautical data (Aeronautical Information Services open data) ----
+// Both are official public FAA feature services, no API key required.
+const AIRSPACE_QUERY_URL =
+    "https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services/Class_Airspace/FeatureServer/0/query";
+const AIRPORTS_QUERY_URL =
+    "https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services/US_Airport/FeatureServer/0/query";
+
+type AirspacePolygon = {
+    airspaceClass: string;
+    name: string;
+    rings: { lat: number; lon: number }[][];
+};
+
+type AirportPoint = {
+    ident: string;
+    name: string;
+    icao: string | null;
+    lat: number;
+    lon: number;
+    flightCategory?: FlightCategory;
+};
+
+const AIRSPACE_GOLD = "rgba(230, 199, 111, 0.5)";
+const AIRSPACE_CLASS_STYLES: Record<string, { color: string; width: number; dash: number[] }> = {
+    B: { color: AIRSPACE_GOLD, width: 2, dash: [] },
+    C: { color: AIRSPACE_GOLD, width: 2, dash: [] },
+    D: { color: AIRSPACE_GOLD, width: 1.5, dash: [6, 4] },
+};
+
+// Below this per-vertex turn angle, a vertex is treated as part of a curved radius
+// (rounded off); at or above it, the vertex is a real corner and stays sharp.
+const AIRSPACE_CORNER_ANGLE_DEG = 25;
+
+function computeTurnAngleDeg(
+    prev: { x: number; y: number },
+    current: { x: number; y: number },
+    next: { x: number; y: number }
+): number {
+    const v1x = current.x - prev.x;
+    const v1y = current.y - prev.y;
+    const v2x = next.x - current.x;
+    const v2y = next.y - current.y;
+    const mag1 = Math.hypot(v1x, v1y);
+    const mag2 = Math.hypot(v2x, v2y);
+    if (mag1 === 0 || mag2 === 0) return 0;
+    const cos = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / (mag1 * mag2)));
+    return (Math.acos(cos) * 180) / Math.PI;
+}
+
+const FLIGHT_CATEGORY_MARKER_COLORS: Record<FlightCategory, string> = {
+    VFR: "#34d399",
+    MVFR: "#38bdf8",
+    IFR: "#f87171",
+    LIFR: "#e879f9",
+    UNKNOWN: "#a1a1aa",
+};
+
+async function fetchAirspacePolygons(bounds: GeoBounds): Promise<AirspacePolygon[]> {
+    const params = new URLSearchParams({
+        geometry: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
+        geometryType: "esriGeometryEnvelope",
+        inSR: "4326",
+        spatialRel: "esriSpatialRelIntersects",
+        where: "CLASS IN ('B','C','D')",
+        outFields: "CLASS,NAME",
+        returnGeometry: "true",
+        maxAllowableOffset: "0.0001",
+        geometryPrecision: "4",
+        f: "geojson",
+    });
+
+    const response = await fetch(`${AIRSPACE_QUERY_URL}?${params.toString()}`);
+    if (!response.ok) throw new Error("Airspace request failed.");
+    const data = await response.json();
+    const features = Array.isArray(data?.features) ? data.features : [];
+
+    const polygons: AirspacePolygon[] = [];
+    for (const feature of features) {
+        const geometryType = feature?.geometry?.type;
+        const coordinates = feature?.geometry?.coordinates;
+        const airspaceClass = feature?.properties?.CLASS;
+        if (!coordinates || !airspaceClass) continue;
+
+        const ringSets: number[][][] =
+            geometryType === "MultiPolygon" ? coordinates.flat() : coordinates;
+        const rings = ringSets.map((ring) =>
+            ring.map((point) => ({ lat: point[1], lon: point[0] }))
+        );
+
+        polygons.push({ airspaceClass, name: feature?.properties?.NAME ?? "", rings });
+    }
+    return polygons;
+}
+
+async function fetchAirports(bounds: GeoBounds): Promise<AirportPoint[]> {
+    const params = new URLSearchParams({
+        geometry: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
+        geometryType: "esriGeometryEnvelope",
+        inSR: "4326",
+        spatialRel: "esriSpatialRelIntersects",
+        where: "PRIVATEUSE=0 AND OPERSTATUS='OPERATIONAL' AND MIL_CODE='CIVIL'",
+        outFields: "IDENT,NAME,ICAO_ID",
+        returnGeometry: "true",
+        geometryPrecision: "5",
+        f: "geojson",
+    });
+
+    const response = await fetch(`${AIRPORTS_QUERY_URL}?${params.toString()}`);
+    if (!response.ok) throw new Error("Airports request failed.");
+    const data = await response.json();
+    const features = Array.isArray(data?.features) ? data.features : [];
+
+    const airports: AirportPoint[] = [];
+    for (const feature of features) {
+        const coordinates = feature?.geometry?.coordinates;
+        if (!Array.isArray(coordinates) || coordinates.length < 2) continue;
+        airports.push({
+            ident: feature?.properties?.IDENT ?? "",
+            name: feature?.properties?.NAME ?? "",
+            icao: feature?.properties?.ICAO_ID ?? null,
+            lon: coordinates[0],
+            lat: coordinates[1],
+        });
+    }
+    return airports;
+}
+
+const VALID_FLIGHT_CATEGORIES: readonly FlightCategory[] = ["VFR", "MVFR", "IFR", "LIFR", "UNKNOWN"];
+
+function resolveMetarStationKey(airport: AirportPoint): string | null {
+    if (airport.icao) return airport.icao;
+    if (airport.ident.length === 3) return `K${airport.ident}`;
+    if (airport.ident.length === 4) return airport.ident;
+    return null;
+}
+
+async function fetchAirportFlightCategories(bounds: GeoBounds): Promise<Map<string, FlightCategory>> {
+    const params = new URLSearchParams({
+        south: String(bounds.south),
+        west: String(bounds.west),
+        north: String(bounds.north),
+        east: String(bounds.east),
+    });
+
+    const response = await fetch(`/api/metar/bbox?${params.toString()}`);
+    if (!response.ok) throw new Error("Flight category request failed.");
+    const data = await response.json();
+    const stations = Array.isArray(data?.stations) ? data.stations : [];
+
+    const map = new Map<string, FlightCategory>();
+    for (const entry of stations) {
+        const station = entry?.station;
+        const flightCategory = entry?.flightCategory;
+        if (
+            typeof station === "string" &&
+            VALID_FLIGHT_CATEGORIES.includes(flightCategory as FlightCategory)
+        ) {
+            map.set(station, flightCategory as FlightCategory);
+        }
+    }
+    return map;
+}
+
+// ---- Minimal Web Mercator slippy-map math (replaces the Leaflet dependency) ----
+
+type MapView = { lat: number; lon: number; zoom: number };
+type GeoBounds = { west: number; south: number; east: number; north: number };
+
+function lonToWorldFrac(lon: number): number {
+    return (lon + 180) / 360;
+}
+
+function latToWorldFrac(lat: number): number {
+    const sinLat = Math.sin((lat * Math.PI) / 180);
+    return 0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI);
+}
+
+function worldFracToLon(frac: number): number {
+    return frac * 360 - 180;
+}
+
+function worldFracToLat(frac: number): number {
+    const n = Math.PI - 2 * Math.PI * frac;
+    return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+function projectToWorldPixel(lat: number, lon: number, zoom: number): { x: number; y: number } {
+    const scale = MAP_TILE_SIZE * Math.pow(2, zoom);
+    return { x: lonToWorldFrac(lon) * scale, y: latToWorldFrac(lat) * scale };
+}
+
+function unprojectFromWorldPixel(x: number, y: number, zoom: number): { lat: number; lon: number } {
+    const scale = MAP_TILE_SIZE * Math.pow(2, zoom);
+    return { lat: worldFracToLat(y / scale), lon: worldFracToLon(x / scale) };
+}
+
+function boundsForDiameterMeters(center: { lat: number; lon: number }, diameterMeters: number): GeoBounds {
+    const latDeltaDeg = (diameterMeters / 2 / 6378137) * (180 / Math.PI);
+    const lonDeltaDeg = latDeltaDeg / Math.max(0.01, Math.cos((center.lat * Math.PI) / 180));
+    return {
+        west: center.lon - lonDeltaDeg,
+        east: center.lon + lonDeltaDeg,
+        south: center.lat - latDeltaDeg,
+        north: center.lat + latDeltaDeg,
+    };
+}
+
+function computeBoundsZoom(
+    bounds: GeoBounds,
+    containerWidthPx: number,
+    containerHeightPx: number,
+    fit: "contain" | "cover" = "contain"
+): number {
+    const lonSpan = lonToWorldFrac(bounds.east) - lonToWorldFrac(bounds.west);
+    const latSpan = Math.abs(latToWorldFrac(bounds.south) - latToWorldFrac(bounds.north));
+    const zoomForWidth = Math.log2(containerWidthPx / (lonSpan * MAP_TILE_SIZE));
+    const zoomForHeight = Math.log2(containerHeightPx / (latSpan * MAP_TILE_SIZE));
+    return fit === "cover"
+        ? Math.max(zoomForWidth, zoomForHeight)
+        : Math.min(zoomForWidth, zoomForHeight);
+}
+
+// Keeps the viewport from ever panning past the given geographic bounds — once the
+// bounds are smaller than the viewport on an axis (e.g. at the 150nm zoomed-out
+// floor), that axis locks to the bounds' center instead of allowing any pan.
+function clampViewToMaxBounds(
+    view: MapView,
+    maxBounds: GeoBounds,
+    viewportWidthPx: number,
+    viewportHeightPx: number
+): MapView {
+    const scale = MAP_TILE_SIZE * Math.pow(2, view.zoom);
+    const boundsMinX = lonToWorldFrac(maxBounds.west) * scale;
+    const boundsMaxX = lonToWorldFrac(maxBounds.east) * scale;
+    const boundsMinY = latToWorldFrac(maxBounds.north) * scale;
+    const boundsMaxY = latToWorldFrac(maxBounds.south) * scale;
+
+    const centerPx = projectToWorldPixel(view.lat, view.lon, view.zoom);
+    const halfWidth = viewportWidthPx / 2;
+    const halfHeight = viewportHeightPx / 2;
+
+    const clampedX =
+        boundsMaxX - boundsMinX <= viewportWidthPx
+            ? (boundsMinX + boundsMaxX) / 2
+            : Math.min(Math.max(centerPx.x, boundsMinX + halfWidth), boundsMaxX - halfWidth);
+    const clampedY =
+        boundsMaxY - boundsMinY <= viewportHeightPx
+            ? (boundsMinY + boundsMaxY) / 2
+            : Math.min(Math.max(centerPx.y, boundsMinY + halfHeight), boundsMaxY - halfHeight);
+
+    const clampedLatLon = unprojectFromWorldPixel(clampedX, clampedY, view.zoom);
+    return { lat: clampedLatLon.lat, lon: clampedLatLon.lon, zoom: view.zoom };
+}
+
+function computeScaleForView(view: MapView, targetPx: number): { nm: number; px: number } {
+    const metersPerPixel =
+        (EARTH_CIRCUMFERENCE_METERS * Math.abs(Math.cos((view.lat * Math.PI) / 180))) /
+        (MAP_TILE_SIZE * Math.pow(2, view.zoom));
+    const maxNm = (metersPerPixel * targetPx) / NM_TO_METERS;
+
+    let chosen = RADAR_SCALE_NICE_VALUES_NM[0];
+    for (const value of RADAR_SCALE_NICE_VALUES_NM) {
+        if (value <= maxNm) chosen = value;
+        else break;
+    }
+
+    const px = (chosen * NM_TO_METERS) / metersPerPixel;
+    return { nm: chosen, px };
+}
+
+function computeScaleTargetPx(containerWidthPx: number): number {
+    return Math.max(60, Math.min(RADAR_SCALE_MAX_TARGET_PX, containerWidthPx * 0.32));
+}
+
+function computePinchMetrics(
+    points: readonly { x: number; y: number }[]
+): { distance: number; mid: { x: number; y: number } } {
+    const [a, b] = points;
+    return {
+        distance: Math.hypot(b.x - a.x, b.y - a.y),
+        mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+    };
+}
+
+const EARTH_RADIUS_NM = 3440.065;
+
+function computeBearingDistance(
+    from: { lat: number; lon: number },
+    to: { lat: number; lon: number }
+): { bearingDeg: number; distanceNm: number } {
+    const lat1 = (from.lat * Math.PI) / 180;
+    const lat2 = (to.lat * Math.PI) / 180;
+    const dLat = lat2 - lat1;
+    const dLon = ((to.lon - from.lon) * Math.PI) / 180;
+
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+    const bearingDeg = ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+
+    const a =
+        Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distanceNm = EARTH_RADIUS_NM * c;
+
+    return { bearingDeg, distanceNm };
+}
 
 type ApiResponse = {
     raw?: string;
@@ -137,7 +611,7 @@ type RemarkBubble = {
 type WindDisplayMode = "animated" | "direction" | "hidden";
 
 type DecoderTab = "lookup" | "raw";
-type DashboardTab = "weather" | "taf" | "airport";
+type DashboardTab = "weather" | "taf" | "radar" | "airport";
 
 type TafSkyCondition = {
     cover?: string | null;
@@ -987,6 +1461,13 @@ function MetarDashboard({
                             </DashboardTabButton>
 
                             <DashboardTabButton
+                                active={activeDashboardTab === "radar"}
+                                onClick={() => setActiveDashboardTab("radar")}
+                            >
+                                Radar
+                            </DashboardTabButton>
+
+                            <DashboardTabButton
                                 active={activeDashboardTab === "airport"}
                                 onClick={() => setActiveDashboardTab("airport")}
                             >
@@ -1023,6 +1504,10 @@ function MetarDashboard({
                             lastTafFetchAttempt={lastTafFetchAttempt}
                             onRefetchTaf={refetchTaf}
                         />
+                    )}
+
+                    {activeDashboardTab === "radar" && (
+                        <RadarDashboardTab stationInfo={stationInfo} runways={runways} />
                     )}
 
                     {activeDashboardTab === "airport" && (
@@ -2411,6 +2896,1035 @@ function TafDashboardTab({
                 </p>
             </div>
         </>
+    );
+}
+
+function RadarDashboardTab({
+    stationInfo,
+    runways,
+}: {
+    stationInfo: StationInfo | null;
+    runways: AirportRunway[];
+}) {
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const viewRef = useRef<MapView>({ lat: 0, lon: 0, zoom: 4 });
+    const zoomRangeRef = useRef<{ min: number; max: number }>({ min: 2, max: RADAR_BASEMAP_MAX_ZOOM });
+    const maxBoundsRef = useRef<GeoBounds | null>(null);
+    const stationMarkerPositionRef = useRef<{ lat: number; lon: number } | null>(null);
+    const airportSearchContainerRef = useRef<HTMLDivElement | null>(null);
+    const tileCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+    const radarImageRef = useRef<HTMLImageElement | null>(null);
+    const radarBoundsRef = useRef<GeoBounds | null>(null);
+    const radarObjectUrlRef = useRef<string | null>(null);
+    const airspacePolygonsRef = useRef<AirspacePolygon[]>([]);
+    const airportsRef = useRef<AirportPoint[]>([]);
+    const drawFrameRef = useRef<() => void>(() => {});
+    const rafScheduledRef = useRef(false);
+    const activePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+    const lastPointerPosRef = useRef<{ x: number; y: number } | null>(null);
+    const pinchLastRef = useRef<{ distance: number; mid: { x: number; y: number } } | null>(null);
+    const pointerDownScreenPosRef = useRef<{ x: number; y: number } | null>(null);
+    const hoveredAirportIdentRef = useRef<string | null>(null);
+    const selectedAirportIdentRef = useRef<string | null>(null);
+
+    const [radarFrameTime, setRadarFrameTime] = useState<Date | null>(null);
+    const [radarError, setRadarError] = useState<string | null>(null);
+    const [radarVisible, setRadarVisible] = useState(true);
+    const [airspaceVisible, setAirspaceVisible] = useState(true);
+    const [selectedAirport, setSelectedAirport] = useState<AirportPoint | null>(null);
+    const [stationMarkerPosition, setStationMarkerPosition] = useState<{ lat: number; lon: number } | null>(
+        null
+    );
+    const [airportSearchOpen, setAirportSearchOpen] = useState(false);
+    const [airportSearchQuery, setAirportSearchQuery] = useState("");
+    const [airportSearchError, setAirportSearchError] = useState<string | null>(null);
+    const [displayZoomPercent, setDisplayZoomPercent] = useState<number | null>(null);
+    const [displayScale, setDisplayScale] = useState<{ nm: number; px: number } | null>(null);
+
+    const latitude = stationInfo?.latitude ?? null;
+    const longitude = stationInfo?.longitude ?? null;
+
+    const scheduleDraw = useCallback(() => {
+        if (rafScheduledRef.current) return;
+        rafScheduledRef.current = true;
+        requestAnimationFrame(() => {
+            rafScheduledRef.current = false;
+            drawFrameRef.current();
+        });
+    }, []);
+
+    const applyZoomAtScreenPoint = useCallback(
+        (screenX: number, screenY: number, targetZoom: number) => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const view = viewRef.current;
+            const { min, max } = zoomRangeRef.current;
+            const clampedZoom = Math.max(min, Math.min(max, targetZoom));
+
+            const cssWidth = canvas.clientWidth;
+            const cssHeight = canvas.clientHeight;
+
+            const oldTileZoom = Math.round(view.zoom);
+            const oldScaleFactor = Math.pow(2, view.zoom - oldTileZoom);
+            const oldCenterWorldPx = projectToWorldPixel(view.lat, view.lon, oldTileZoom);
+            const pointWorldPxOld = {
+                x: oldCenterWorldPx.x + (screenX - cssWidth / 2) / oldScaleFactor,
+                y: oldCenterWorldPx.y + (screenY - cssHeight / 2) / oldScaleFactor,
+            };
+            const pointLatLon = unprojectFromWorldPixel(pointWorldPxOld.x, pointWorldPxOld.y, oldTileZoom);
+
+            const newTileZoom = Math.round(clampedZoom);
+            const newScaleFactor = Math.pow(2, clampedZoom - newTileZoom);
+            const pointWorldPxNew = projectToWorldPixel(pointLatLon.lat, pointLatLon.lon, newTileZoom);
+            const newCenterWorldPx = {
+                x: pointWorldPxNew.x - (screenX - cssWidth / 2) / newScaleFactor,
+                y: pointWorldPxNew.y - (screenY - cssHeight / 2) / newScaleFactor,
+            };
+            const newCenterLatLon = unprojectFromWorldPixel(
+                newCenterWorldPx.x,
+                newCenterWorldPx.y,
+                newTileZoom
+            );
+
+            const candidate = { lat: newCenterLatLon.lat, lon: newCenterLatLon.lon, zoom: clampedZoom };
+            const maxBounds = maxBoundsRef.current;
+            viewRef.current = maxBounds
+                ? clampViewToMaxBounds(candidate, maxBounds, cssWidth, cssHeight)
+                : candidate;
+        },
+        []
+    );
+
+    const panByScreenDelta = useCallback((dx: number, dy: number) => {
+        const view = viewRef.current;
+        const tileZoom = Math.round(view.zoom);
+        const scaleFactor = Math.pow(2, view.zoom - tileZoom);
+        const centerWorldPx = projectToWorldPixel(view.lat, view.lon, tileZoom);
+        const newWorldPx = {
+            x: centerWorldPx.x - dx / scaleFactor,
+            y: centerWorldPx.y - dy / scaleFactor,
+        };
+        const newLatLon = unprojectFromWorldPixel(newWorldPx.x, newWorldPx.y, tileZoom);
+        const candidate = { lat: newLatLon.lat, lon: newLatLon.lon, zoom: view.zoom };
+        const canvas = canvasRef.current;
+        const maxBounds = maxBoundsRef.current;
+        viewRef.current =
+            maxBounds && canvas
+                ? clampViewToMaxBounds(candidate, maxBounds, canvas.clientWidth, canvas.clientHeight)
+                : candidate;
+    }, []);
+
+    const handleZoomButtonClick = useCallback(
+        (delta: number) => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            applyZoomAtScreenPoint(
+                canvas.clientWidth / 2,
+                canvas.clientHeight / 2,
+                viewRef.current.zoom + delta
+            );
+            scheduleDraw();
+        },
+        [applyZoomAtScreenPoint, scheduleDraw]
+    );
+
+    const handleZoomPercentClick = useCallback(() => {
+        if (latitude === null || longitude === null) return;
+        const { min, max } = zoomRangeRef.current;
+        viewRef.current = { lat: latitude, lon: longitude, zoom: min + 0.25 * (max - min) };
+        scheduleDraw();
+    }, [latitude, longitude, scheduleDraw]);
+
+    function handleAirportSearchSubmit() {
+        const query = airportSearchQuery.trim().toUpperCase();
+        if (!query) return;
+
+        const mainStationKey = stationInfo?.station?.toUpperCase();
+        if (mainStationKey && (query === mainStationKey || `K${query}` === mainStationKey)) {
+            setAirportSearchError("That's the current airport.");
+            return;
+        }
+
+        const match = airportsRef.current.find(
+            (airport) =>
+                airport.ident.toUpperCase() === query || airport.icao?.toUpperCase() === query
+        );
+
+        if (!match) {
+            setAirportSearchError(`Out of range (${RADAR_MAX_RADIUS_NM} nm).`);
+            return;
+        }
+
+        selectedAirportIdentRef.current = match.ident;
+        setSelectedAirport(match);
+        scheduleDraw();
+        setAirportSearchOpen(false);
+        setAirportSearchQuery("");
+        setAirportSearchError(null);
+    }
+
+    function hitTestAirport(localX: number, localY: number): AirportPoint | null {
+        const canvas = canvasRef.current;
+        if (!canvas) return null;
+        const cssWidth = canvas.clientWidth;
+        const cssHeight = canvas.clientHeight;
+        const view = viewRef.current;
+        const tileZoom = Math.max(0, Math.min(RADAR_BASEMAP_MAX_ZOOM, Math.round(view.zoom)));
+        const scaleFactor = Math.pow(2, view.zoom - tileZoom);
+        const centerWorldPx = projectToWorldPixel(view.lat, view.lon, tileZoom);
+
+        let closest: AirportPoint | null = null;
+        let closestDistance = 10;
+        for (const airport of airportsRef.current) {
+            const world = projectToWorldPixel(airport.lat, airport.lon, tileZoom);
+            const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
+            const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
+            const distance = Math.hypot(x - localX, y - localY);
+            if (distance < closestDistance) {
+                closestDistance = distance;
+                closest = airport;
+            }
+        }
+        return closest;
+    }
+
+    function handlePointerDown(event: PointerEvent<HTMLCanvasElement>) {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        try {
+            canvas.setPointerCapture(event.pointerId);
+        } catch {
+            // Ignore — some synthetic/edge-case pointer ids can't be captured.
+        }
+        activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        pointerDownScreenPosRef.current = { x: event.clientX, y: event.clientY };
+
+        if (activePointersRef.current.size === 1) {
+            lastPointerPosRef.current = { x: event.clientX, y: event.clientY };
+            pinchLastRef.current = null;
+        } else if (activePointersRef.current.size === 2) {
+            pinchLastRef.current = computePinchMetrics(
+                Array.from(activePointersRef.current.values())
+            );
+            lastPointerPosRef.current = null;
+        }
+    }
+
+    function handlePointerMove(event: PointerEvent<HTMLCanvasElement>) {
+        if (!activePointersRef.current.has(event.pointerId)) {
+            const canvas = canvasRef.current;
+            if (canvas) {
+                const rect = canvas.getBoundingClientRect();
+                const hit = hitTestAirport(event.clientX - rect.left, event.clientY - rect.top);
+                const nextIdent = hit?.ident ?? null;
+                canvas.style.cursor = hit ? "pointer" : "grab";
+                if (hoveredAirportIdentRef.current !== nextIdent) {
+                    hoveredAirportIdentRef.current = nextIdent;
+                    scheduleDraw();
+                }
+            }
+            return;
+        }
+
+        activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        const points = Array.from(activePointersRef.current.values());
+
+        if (points.length === 1) {
+            const last = lastPointerPosRef.current;
+            lastPointerPosRef.current = points[0];
+            if (!last) return;
+            panByScreenDelta(points[0].x - last.x, points[0].y - last.y);
+            scheduleDraw();
+        } else if (points.length >= 2) {
+            const metrics = computePinchMetrics(points.slice(0, 2));
+            const last = pinchLastRef.current;
+            pinchLastRef.current = metrics;
+            if (!last) return;
+
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            const localX = metrics.mid.x - rect.left;
+            const localY = metrics.mid.y - rect.top;
+
+            panByScreenDelta(metrics.mid.x - last.mid.x, metrics.mid.y - last.mid.y);
+            const zoomDelta = Math.log2(metrics.distance / Math.max(1, last.distance));
+            applyZoomAtScreenPoint(localX, localY, viewRef.current.zoom + zoomDelta);
+            scheduleDraw();
+        }
+    }
+
+    function handlePointerUp(event: PointerEvent<HTMLCanvasElement>) {
+        const wasSinglePointer = activePointersRef.current.size === 1;
+        const downPos = pointerDownScreenPosRef.current;
+
+        activePointersRef.current.delete(event.pointerId);
+        const canvas = canvasRef.current;
+        if (canvas?.hasPointerCapture(event.pointerId)) {
+            canvas.releasePointerCapture(event.pointerId);
+        }
+
+        if (wasSinglePointer && downPos && canvas) {
+            const movedDistance = Math.hypot(event.clientX - downPos.x, event.clientY - downPos.y);
+            if (movedDistance < 6) {
+                const rect = canvas.getBoundingClientRect();
+                const hit = hitTestAirport(event.clientX - rect.left, event.clientY - rect.top);
+                if (hit) {
+                    const nextIdent = selectedAirportIdentRef.current === hit.ident ? null : hit.ident;
+                    selectedAirportIdentRef.current = nextIdent;
+                    setSelectedAirport(nextIdent ? hit : null);
+                    scheduleDraw();
+                }
+            }
+        }
+
+        if (activePointersRef.current.size === 1) {
+            lastPointerPosRef.current = Array.from(activePointersRef.current.values())[0] ?? null;
+            pinchLastRef.current = null;
+        } else if (activePointersRef.current.size === 0) {
+            lastPointerPosRef.current = null;
+            pinchLastRef.current = null;
+        }
+        pointerDownScreenPosRef.current = null;
+    }
+
+    function handlePointerLeave() {
+        if (hoveredAirportIdentRef.current !== null) {
+            hoveredAirportIdentRef.current = null;
+            scheduleDraw();
+        }
+    }
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        function onWheelNative(event: WheelEvent) {
+            // React's synthetic onWheel is attached passively and can't preventDefault
+            // (it would just log a console warning), so this listener is wired natively.
+            event.preventDefault();
+            const rect = canvas!.getBoundingClientRect();
+            const localX = event.clientX - rect.left;
+            const localY = event.clientY - rect.top;
+            const zoomDelta = -event.deltaY * RADAR_WHEEL_ZOOM_SENSITIVITY;
+            applyZoomAtScreenPoint(localX, localY, viewRef.current.zoom + zoomDelta);
+            scheduleDraw();
+        }
+
+        canvas.addEventListener("wheel", onWheelNative, { passive: false });
+        return () => canvas.removeEventListener("wheel", onWheelNative);
+    }, [applyZoomAtScreenPoint, scheduleDraw]);
+
+    useEffect(() => {
+        if (!airportSearchOpen) return;
+
+        function handlePointerDownOutside(event: globalThis.PointerEvent) {
+            if (!airportSearchContainerRef.current?.contains(event.target as Node)) {
+                setAirportSearchOpen(false);
+                setAirportSearchQuery("");
+                setAirportSearchError(null);
+            }
+        }
+
+        document.addEventListener("pointerdown", handlePointerDownOutside);
+        return () => document.removeEventListener("pointerdown", handlePointerDownOutside);
+    }, [airportSearchOpen]);
+
+    const drawFrame = () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const cssWidth = canvas.clientWidth;
+        const cssHeight = canvas.clientHeight;
+        if (cssWidth === 0 || cssHeight === 0) return;
+
+        const pixelWidth = Math.round(cssWidth * dpr);
+        const pixelHeight = Math.round(cssHeight * dpr);
+        if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+            canvas.width = pixelWidth;
+            canvas.height = pixelHeight;
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.fillStyle = "#18181b";
+        ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+        const view = viewRef.current;
+        const tileZoom = Math.max(0, Math.min(RADAR_BASEMAP_MAX_ZOOM, Math.round(view.zoom)));
+        const scaleFactor = Math.pow(2, view.zoom - tileZoom);
+        const centerWorldPx = projectToWorldPixel(view.lat, view.lon, tileZoom);
+
+        const halfWidthWorld = cssWidth / 2 / scaleFactor;
+        const halfHeightWorld = cssHeight / 2 / scaleFactor;
+        const minTileX = Math.floor((centerWorldPx.x - halfWidthWorld) / MAP_TILE_SIZE) - 1;
+        const maxTileX = Math.floor((centerWorldPx.x + halfWidthWorld) / MAP_TILE_SIZE) + 1;
+        const minTileY = Math.floor((centerWorldPx.y - halfHeightWorld) / MAP_TILE_SIZE) - 1;
+        const maxTileY = Math.floor((centerWorldPx.y + halfHeightWorld) / MAP_TILE_SIZE) + 1;
+        const tileCountAtZoom = Math.pow(2, tileZoom);
+
+        for (let tx = minTileX; tx <= maxTileX; tx++) {
+            for (let ty = minTileY; ty <= maxTileY; ty++) {
+                if (ty < 0 || ty >= tileCountAtZoom) continue;
+                const wrappedX = ((tx % tileCountAtZoom) + tileCountAtZoom) % tileCountAtZoom;
+                const key = `${tileZoom}/${wrappedX}/${ty}`;
+                let img = tileCacheRef.current.get(key);
+                if (!img) {
+                    img = new window.Image();
+                    img.src = RADAR_BASEMAP_TILE_URL.replace("{z}", String(tileZoom))
+                        .replace("{y}", String(ty))
+                        .replace("{x}", String(wrappedX));
+                    img.onload = () => scheduleDraw();
+                    tileCacheRef.current.set(key, img);
+                }
+                if (img.complete && img.naturalWidth > 0) {
+                    const screenX = cssWidth / 2 + (tx * MAP_TILE_SIZE - centerWorldPx.x) * scaleFactor;
+                    const screenY = cssHeight / 2 + (ty * MAP_TILE_SIZE - centerWorldPx.y) * scaleFactor;
+                    const size = MAP_TILE_SIZE * scaleFactor;
+                    ctx.drawImage(img, screenX, screenY, size, size);
+                }
+            }
+        }
+
+        const radarImg = radarImageRef.current;
+        const radarBounds = radarBoundsRef.current;
+        if (radarImg && radarBounds && radarVisible && radarImg.complete && radarImg.naturalWidth > 0) {
+            const topLeftWorld = projectToWorldPixel(radarBounds.north, radarBounds.west, tileZoom);
+            const bottomRightWorld = projectToWorldPixel(radarBounds.south, radarBounds.east, tileZoom);
+            const x0 = cssWidth / 2 + (topLeftWorld.x - centerWorldPx.x) * scaleFactor;
+            const y0 = cssHeight / 2 + (topLeftWorld.y - centerWorldPx.y) * scaleFactor;
+            const x1 = cssWidth / 2 + (bottomRightWorld.x - centerWorldPx.x) * scaleFactor;
+            const y1 = cssHeight / 2 + (bottomRightWorld.y - centerWorldPx.y) * scaleFactor;
+            ctx.drawImage(radarImg, x0, y0, x1 - x0, y1 - y0);
+        }
+
+        if (airspaceVisible) {
+            for (const polygon of airspacePolygonsRef.current) {
+                const style = AIRSPACE_CLASS_STYLES[polygon.airspaceClass];
+                if (!style) continue;
+
+                for (const ring of polygon.rings) {
+                    if (ring.length < 3) continue;
+                    const points = ring.map((point) => {
+                        const world = projectToWorldPixel(point.lat, point.lon, tileZoom);
+                        return {
+                            x: cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor,
+                            y: cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor,
+                        };
+                    });
+
+                    // Round off gentle bends (simplified circular radii) into smooth curves,
+                    // but keep real corners sharp — decided per vertex by its turn angle.
+                    const n = points.length;
+                    ctx.beginPath();
+                    ctx.moveTo(points[0].x, points[0].y);
+                    for (let i = 0; i < n; i++) {
+                        const prev = points[(i - 1 + n) % n];
+                        const current = points[i];
+                        const next = points[(i + 1) % n];
+                        const turnAngle = computeTurnAngleDeg(prev, current, next);
+                        if (turnAngle >= AIRSPACE_CORNER_ANGLE_DEG) {
+                            ctx.lineTo(current.x, current.y);
+                        } else {
+                            ctx.quadraticCurveTo(
+                                current.x,
+                                current.y,
+                                (current.x + next.x) / 2,
+                                (current.y + next.y) / 2
+                            );
+                        }
+                    }
+                    ctx.closePath();
+                    ctx.setLineDash(style.dash);
+                    ctx.lineWidth = style.width;
+                    ctx.strokeStyle = style.color;
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                }
+            }
+
+            const selectedIdent = selectedAirportIdentRef.current;
+            let selectedAirport: AirportPoint | null = null;
+
+            for (const airport of airportsRef.current) {
+                const world = projectToWorldPixel(airport.lat, airport.lon, tileZoom);
+                const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
+                const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
+                const isSelected = airport.ident === selectedIdent;
+                if (isSelected) selectedAirport = airport;
+
+                ctx.beginPath();
+                ctx.arc(x, y, isSelected ? 4.5 : 3, 0, Math.PI * 2);
+                ctx.fillStyle = isSelected
+                    ? "#d6b35a"
+                    : FLIGHT_CATEGORY_MARKER_COLORS[airport.flightCategory ?? "UNKNOWN"];
+                ctx.fill();
+                ctx.lineWidth = isSelected ? 2 : 1;
+                ctx.strokeStyle = isSelected ? "#ffffff" : "#18181b";
+                ctx.stroke();
+
+                const showLabel = hoveredAirportIdentRef.current === airport.ident || isSelected;
+                if (showLabel) {
+                    ctx.font = "700 11px system-ui, sans-serif";
+                    ctx.textBaseline = "middle";
+                    ctx.lineWidth = 3;
+                    ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+                    ctx.strokeText(airport.ident, x + 7, y);
+                    ctx.fillStyle = "#f4f4f5";
+                    ctx.fillText(airport.ident, x + 7, y);
+                }
+            }
+
+            const stationMarkerPosition = stationMarkerPositionRef.current;
+            if (selectedAirport && stationMarkerPosition) {
+                const originWorld = projectToWorldPixel(
+                    stationMarkerPosition.lat,
+                    stationMarkerPosition.lon,
+                    tileZoom
+                );
+                const originX = cssWidth / 2 + (originWorld.x - centerWorldPx.x) * scaleFactor;
+                const originY = cssHeight / 2 + (originWorld.y - centerWorldPx.y) * scaleFactor;
+                const destWorld = projectToWorldPixel(selectedAirport.lat, selectedAirport.lon, tileZoom);
+                const destX = cssWidth / 2 + (destWorld.x - centerWorldPx.x) * scaleFactor;
+                const destY = cssHeight / 2 + (destWorld.y - centerWorldPx.y) * scaleFactor;
+
+                ctx.beginPath();
+                ctx.moveTo(originX, originY);
+                ctx.lineTo(destX, destY);
+                ctx.setLineDash([2, 4]);
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = "rgba(230, 199, 111, 0.85)";
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+        }
+
+        for (const runway of runways) {
+            const { endA, endB } = runway;
+            if (
+                endA.latitude === null ||
+                endA.longitude === null ||
+                endB.latitude === null ||
+                endB.longitude === null
+            ) {
+                continue;
+            }
+            const aWorld = projectToWorldPixel(endA.latitude, endA.longitude, tileZoom);
+            const bWorld = projectToWorldPixel(endB.latitude, endB.longitude, tileZoom);
+            const ax = cssWidth / 2 + (aWorld.x - centerWorldPx.x) * scaleFactor;
+            const ay = cssHeight / 2 + (aWorld.y - centerWorldPx.y) * scaleFactor;
+            const bx = cssWidth / 2 + (bWorld.x - centerWorldPx.x) * scaleFactor;
+            const by = cssHeight / 2 + (bWorld.y - centerWorldPx.y) * scaleFactor;
+            ctx.beginPath();
+            ctx.moveTo(ax, ay);
+            ctx.lineTo(bx, by);
+            ctx.lineCap = "round";
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = "#f4f4f5";
+            ctx.stroke();
+        }
+
+        if (stationMarkerPositionRef.current) {
+            const { lat: markerLat, lon: markerLon } = stationMarkerPositionRef.current;
+            const markerWorld = projectToWorldPixel(markerLat, markerLon, tileZoom);
+            const mx = cssWidth / 2 + (markerWorld.x - centerWorldPx.x) * scaleFactor;
+            const my = cssHeight / 2 + (markerWorld.y - centerWorldPx.y) * scaleFactor;
+
+            ctx.beginPath();
+            ctx.arc(mx, my, 12, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(214, 179, 90, 0.2)";
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.arc(mx, my, 7, 0, Math.PI * 2);
+            ctx.fillStyle = "#d6b35a";
+            ctx.fill();
+            ctx.lineWidth = 2.5;
+            ctx.strokeStyle = "#ffffff";
+            ctx.stroke();
+
+            if (stationInfo?.station) {
+                ctx.font = "700 12px system-ui, sans-serif";
+                ctx.textBaseline = "middle";
+                ctx.lineWidth = 3;
+                ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+                ctx.strokeText(stationInfo.station, mx + 13, my);
+                ctx.fillStyle = "#f4f4f5";
+                ctx.fillText(stationInfo.station, mx + 13, my);
+            }
+        }
+
+        const { min, max } = zoomRangeRef.current;
+        setDisplayZoomPercent((prev) => {
+            const next = max > min ? Math.round(((view.zoom - min) / (max - min)) * 100) : null;
+            return prev === next ? prev : next;
+        });
+        setDisplayScale((prev) => {
+            const next = computeScaleForView(view, computeScaleTargetPx(cssWidth));
+            return prev && prev.nm === next.nm && prev.px === next.px ? prev : next;
+        });
+    };
+
+    useEffect(() => {
+        drawFrameRef.current = drawFrame;
+    });
+
+    useEffect(() => {
+        if (latitude === null || longitude === null || !containerRef.current) {
+            return;
+        }
+
+        let cancelled = false;
+        const center = { lat: latitude, lon: longitude };
+        const tileCache = tileCacheRef.current;
+
+        setRadarFrameTime(null);
+        setRadarError(null);
+        tileCache.clear();
+        radarImageRef.current = null;
+        radarBoundsRef.current = null;
+        airspacePolygonsRef.current = [];
+        airportsRef.current = [];
+        stationMarkerPositionRef.current = center;
+        setStationMarkerPosition(center);
+        hoveredAirportIdentRef.current = null;
+        selectedAirportIdentRef.current = null;
+        setSelectedAirport(null);
+        setAirportSearchOpen(false);
+        setAirportSearchQuery("");
+        setAirportSearchError(null);
+
+        function recomputeZoomRange() {
+            const container = containerRef.current;
+            if (!container) return;
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+            if (width === 0 || height === 0) return;
+            const maxZoomOutBounds = boundsForDiameterMeters(
+                center,
+                RADAR_MAX_RADIUS_NM * NM_TO_METERS * 2
+            );
+            const minZoom = computeBoundsZoom(maxZoomOutBounds, width, height, "cover");
+            zoomRangeRef.current = { min: minZoom, max: RADAR_BASEMAP_MAX_ZOOM };
+            const clampedZoomView = {
+                ...viewRef.current,
+                zoom: Math.max(viewRef.current.zoom, minZoom),
+            };
+            viewRef.current = clampViewToMaxBounds(clampedZoomView, maxZoomOutBounds, width, height);
+            scheduleDraw();
+        }
+
+        const container = containerRef.current;
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+        const defaultBounds = boundsForDiameterMeters(center, RADAR_DEFAULT_RADIUS_NM * NM_TO_METERS * 2);
+        const maxZoomOutBounds = boundsForDiameterMeters(center, RADAR_MAX_RADIUS_NM * NM_TO_METERS * 2);
+        const defaultZoom = width > 0 && height > 0 ? computeBoundsZoom(defaultBounds, width, height) : 9;
+        const minZoom =
+            width > 0 && height > 0 ? computeBoundsZoom(maxZoomOutBounds, width, height, "cover") : 4;
+
+        maxBoundsRef.current = maxZoomOutBounds;
+        viewRef.current = {
+            lat: center.lat,
+            lon: center.lon,
+            zoom: Math.min(Math.max(defaultZoom, minZoom), RADAR_BASEMAP_MAX_ZOOM),
+        };
+        zoomRangeRef.current = { min: minZoom, max: RADAR_BASEMAP_MAX_ZOOM };
+        scheduleDraw();
+
+        const resizeObserver = new ResizeObserver(() => recomputeZoomRange());
+        resizeObserver.observe(container);
+
+        (async () => {
+            try {
+                const [objectUrl, validTime] = await Promise.all([
+                    fetchRecoloredRadarOverlay(maxZoomOutBounds),
+                    fetchRadarValidTime(),
+                ]);
+
+                if (cancelled) {
+                    URL.revokeObjectURL(objectUrl);
+                    return;
+                }
+
+                radarObjectUrlRef.current = objectUrl;
+                radarBoundsRef.current = maxZoomOutBounds;
+
+                const img = new window.Image();
+                img.onload = () => scheduleDraw();
+                img.src = objectUrl;
+                radarImageRef.current = img;
+
+                setRadarFrameTime(validTime ?? new Date());
+                scheduleDraw();
+            } catch {
+                if (!cancelled) {
+                    setRadarError("Live radar imagery is unavailable right now.");
+                }
+            }
+        })();
+
+        (async () => {
+            try {
+                const [polygons, airports, flightCategories] = await Promise.all([
+                    fetchAirspacePolygons(maxZoomOutBounds),
+                    fetchAirports(maxZoomOutBounds),
+                    fetchAirportFlightCategories(maxZoomOutBounds).catch(
+                        () => new Map<string, FlightCategory>()
+                    ),
+                ]);
+                if (cancelled) return;
+                airspacePolygonsRef.current = polygons;
+
+                const mainStationEntry = airports.find(
+                    (airport) => resolveMetarStationKey(airport) === stationInfo?.station
+                );
+                if (mainStationEntry) {
+                    const correctedPosition = { lat: mainStationEntry.lat, lon: mainStationEntry.lon };
+                    stationMarkerPositionRef.current = correctedPosition;
+                    setStationMarkerPosition(correctedPosition);
+                }
+
+                airportsRef.current = airports
+                    .filter((airport) => resolveMetarStationKey(airport) !== stationInfo?.station)
+                    .map((airport) => {
+                        const key = resolveMetarStationKey(airport);
+                        const flightCategory = key ? flightCategories.get(key) : undefined;
+                        return flightCategory ? { ...airport, flightCategory } : airport;
+                    });
+                scheduleDraw();
+            } catch {
+                // Airspace/airport data is supplementary — fail silently and keep the radar working.
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+            resizeObserver.disconnect();
+            if (radarObjectUrlRef.current) {
+                URL.revokeObjectURL(radarObjectUrlRef.current);
+                radarObjectUrlRef.current = null;
+            }
+            radarImageRef.current = null;
+            radarBoundsRef.current = null;
+            tileCache.clear();
+        };
+    }, [latitude, longitude, scheduleDraw, stationInfo?.station]);
+
+    useEffect(() => {
+        scheduleDraw();
+    }, [radarVisible, airspaceVisible, scheduleDraw]);
+
+    if (latitude === null || longitude === null) {
+        return (
+            <div className="rounded-2xl border border-zinc-800 bg-black/55 p-6">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    Radar
+                </p>
+                <p className="mt-3 text-sm text-zinc-400">
+                    Radar is unavailable without station coordinates.
+                </p>
+            </div>
+        );
+    }
+
+    return (
+        <div className="rounded-2xl border border-zinc-800 bg-black/55 p-6">
+            <div className="flex items-center justify-between gap-4">
+                <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                        Radar
+                    </p>
+                    <h3 className="mt-1 text-2xl font-bold text-white">
+                        {stationInfo?.displayName ?? "Weather Radar"}
+                    </h3>
+                </div>
+                <p className="whitespace-nowrap text-[11px] text-zinc-500">
+                    {radarError
+                        ? radarError
+                        : radarFrameTime
+                            ? `Radar: ${formatFinePrintTime(radarFrameTime)}`
+                            : "Loading radar…"}
+                </p>
+            </div>
+
+            <div
+                ref={containerRef}
+                className="relative mt-5 h-[600px] w-full overflow-hidden rounded-2xl border border-zinc-700"
+            >
+                <canvas
+                    ref={canvasRef}
+                    className="absolute inset-0 h-full w-full cursor-grab"
+                    style={{ touchAction: "none" }}
+                    onPointerDown={handlePointerDown}
+                    onPointerMove={handlePointerMove}
+                    onPointerUp={handlePointerUp}
+                    onPointerCancel={handlePointerUp}
+                    onPointerLeave={handlePointerLeave}
+                />
+
+                {selectedAirport ? (() => {
+                    const origin = stationMarkerPosition ?? { lat: latitude, lon: longitude };
+                    const { bearingDeg, distanceNm } = computeBearingDistance(
+                        origin,
+                        { lat: selectedAirport.lat, lon: selectedAirport.lon }
+                    );
+                    const category = selectedAirport.flightCategory ?? "UNKNOWN";
+                    const categoryLabel = category === "UNKNOWN" ? "N/A" : category;
+                    return (
+                        <div className="absolute left-2 top-2 z-10 w-[168px] rounded-xl border border-[#d6b35a]/60 bg-black/80 p-2.5 backdrop-blur-sm">
+                            <div className="flex items-start justify-between gap-2">
+                                <div>
+                                    <p className="text-sm font-black text-[#e6c76f]">
+                                        {selectedAirport.ident}
+                                    </p>
+                                    <p className="text-[10px] leading-tight text-zinc-400">
+                                        {selectedAirport.name}
+                                    </p>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                    <span
+                                        className="rounded px-1.5 py-0.5 text-[10px] font-bold"
+                                        style={{
+                                            color: FLIGHT_CATEGORY_MARKER_COLORS[category],
+                                            backgroundColor: `${FLIGHT_CATEGORY_MARKER_COLORS[category]}22`,
+                                        }}
+                                    >
+                                        {categoryLabel}
+                                    </span>
+                                    <button
+                                        type="button"
+                                        aria-label="Deselect airport"
+                                        onClick={() => {
+                                            selectedAirportIdentRef.current = null;
+                                            setSelectedAirport(null);
+                                            scheduleDraw();
+                                        }}
+                                        className="text-zinc-500 transition hover:text-zinc-200"
+                                    >
+                                        ×
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div className="mt-2 grid grid-cols-2 gap-2 text-center">
+                                <div>
+                                    <p className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">
+                                        Heading
+                                    </p>
+                                    <p className="text-sm font-bold text-zinc-100">
+                                        {Math.round(bearingDeg)}°
+                                    </p>
+                                </div>
+                                <div>
+                                    <p className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">
+                                        Distance
+                                    </p>
+                                    <p className="text-sm font-bold text-zinc-100">
+                                        {distanceNm.toFixed(1)} nm
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })() : (
+                    <div ref={airportSearchContainerRef} className="absolute left-2 top-2 z-10">
+                        {!airportSearchOpen ? (
+                            <button
+                                type="button"
+                                title="Find airport"
+                                aria-label="Search for an airport to connect a flight path to"
+                                onClick={() => setAirportSearchOpen(true)}
+                                className="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-700 bg-black/70 text-zinc-300 backdrop-blur-sm transition hover:border-[#d6b35a]/60 hover:text-[#e6c76f]"
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-5 w-5"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                >
+                                    <circle cx="11" cy="11" r="7" />
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                                </svg>
+                            </button>
+                        ) : (
+                            <div className="w-[180px] rounded-xl border border-zinc-700 bg-black/80 p-2.5 backdrop-blur-sm">
+                                <div className="flex items-center gap-1.5">
+                                    <input
+                                        type="text"
+                                        autoFocus
+                                        value={airportSearchQuery}
+                                        onChange={(event) => {
+                                            setAirportSearchQuery(event.target.value.toUpperCase());
+                                            setAirportSearchError(null);
+                                        }}
+                                        onKeyDown={(event) => {
+                                            if (event.key === "Enter") handleAirportSearchSubmit();
+                                        }}
+                                        placeholder="ICAO code"
+                                        className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs font-semibold uppercase text-zinc-100 outline-none focus:border-[#d6b35a]/60"
+                                    />
+                                    <button
+                                        type="button"
+                                        aria-label="Search"
+                                        onClick={handleAirportSearchSubmit}
+                                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[#d6b35a]/50 text-[#e6c76f] transition hover:bg-zinc-900"
+                                    >
+                                        <svg
+                                            viewBox="0 0 24 24"
+                                            className="h-4 w-4"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            strokeWidth="2"
+                                            strokeLinecap="round"
+                                        >
+                                            <circle cx="11" cy="11" r="7" />
+                                            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                                        </svg>
+                                    </button>
+                                </div>
+                                {airportSearchError && (
+                                    <p className="mt-1.5 text-[11px] font-semibold text-red-400">
+                                        {airportSearchError}
+                                    </p>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                <div className="absolute right-2 top-2 z-10 flex flex-col gap-1.5 rounded-xl border border-zinc-700 bg-black/70 p-1.5 backdrop-blur-sm">
+                    <button
+                        type="button"
+                        title="Airspace"
+                        aria-label="Toggle airspace and airport overlay"
+                        aria-pressed={airspaceVisible}
+                        onClick={() => setAirspaceVisible((current) => !current)}
+                        className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                            airspaceVisible
+                                ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                        }`}
+                    >
+                        <svg
+                            viewBox="0 0 24 24"
+                            className="h-5 w-5"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                        >
+                            <path d="M12 3l7 4v10l-7 4-7-4V7z" />
+                            <circle cx="12" cy="12" r="2.2" fill="currentColor" stroke="none" />
+                        </svg>
+                        <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                            Airspace
+                        </span>
+                    </button>
+
+                    <button
+                        type="button"
+                        title="Radar"
+                        aria-label="Toggle radar overlay"
+                        aria-pressed={radarVisible}
+                        onClick={() => setRadarVisible((current) => !current)}
+                        className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                            radarVisible
+                                ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                        }`}
+                    >
+                        <svg
+                            viewBox="0 0 24 24"
+                            className="h-5 w-5"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                        >
+                            <circle cx="12" cy="12" r="2.6" fill="currentColor" stroke="none" />
+                            <circle cx="12" cy="12" r="6.5" strokeOpacity="0.75" />
+                            <circle cx="12" cy="12" r="10" strokeOpacity="0.4" />
+                            <line x1="12" y1="12" x2="18.5" y2="5.5" strokeWidth="2" />
+                        </svg>
+                        <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                            Radar
+                        </span>
+                    </button>
+                </div>
+
+                <div className="absolute bottom-2 right-2 z-10 flex flex-col overflow-hidden rounded-lg border border-zinc-700 bg-black/70 shadow-lg backdrop-blur-sm">
+                    <button
+                        type="button"
+                        aria-label="Zoom in"
+                        onClick={() => handleZoomButtonClick(1)}
+                        className="flex h-9 w-9 items-center justify-center text-lg font-bold text-[#e6c76f] transition hover:bg-zinc-800"
+                    >
+                        +
+                    </button>
+                    <div className="h-px w-full bg-zinc-700" />
+                    <button
+                        type="button"
+                        title="Reset to 25% and center on airport"
+                        aria-label="Reset zoom to 25 percent and center on the airport"
+                        onClick={handleZoomPercentClick}
+                        className="flex h-7 w-9 items-center justify-center text-[10px] font-semibold text-zinc-300 transition hover:bg-zinc-800"
+                    >
+                        {displayZoomPercent !== null ? `${displayZoomPercent}%` : "—"}
+                    </button>
+                    <div className="h-px w-full bg-zinc-700" />
+                    <button
+                        type="button"
+                        aria-label="Zoom out"
+                        onClick={() => handleZoomButtonClick(-1)}
+                        className="flex h-9 w-9 items-center justify-center text-lg font-bold text-[#e6c76f] transition hover:bg-zinc-800"
+                    >
+                        −
+                    </button>
+                </div>
+
+                {displayScale && (
+                    <div className="pointer-events-none absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 flex-col items-center">
+                        <p className="text-xs font-semibold text-zinc-100 [text-shadow:0_1px_3px_rgba(0,0,0,0.9)]">
+                            {displayScale.nm} nm
+                        </p>
+                        <div
+                            style={{ width: displayScale.px }}
+                            className="mt-1 h-[7px] border-b-2 border-l-2 border-r-2 border-[#e6c76f]/90"
+                        />
+                    </div>
+                )}
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-[11px] text-zinc-500">
+                <p>
+                    Scroll or pinch to zoom, drag to pan. Zoom out is limited to a{" "}
+                    {RADAR_MAX_RADIUS_NM} nm radius.
+                </p>
+                <p className="whitespace-nowrap text-[10px] text-zinc-500">
+                    Geospatial data by{" "}
+                    <a
+                        href="https://www.esri.com"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline"
+                    >
+                        Esri
+                    </a>{" "}
+                    · Radar by{" "}
+                    <a
+                        href="https://www.weather.gov/"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline"
+                    >
+                        NOAA/NWS
+                    </a>
+                </p>
+            </div>
+        </div>
     );
 }
 
