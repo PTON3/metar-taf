@@ -2110,7 +2110,7 @@ function MetarDashboard({
                                 active={activeDashboardTab === "radar"}
                                 onClick={() => setActiveDashboardTab("radar")}
                             >
-                                Radar
+                                Radar<span className="ml-1 text-[10px] font-semibold opacity-60">BETA</span>
                             </DashboardTabButton>
 
                             <DashboardTabButton
@@ -5234,6 +5234,9 @@ function RadarDashboardTab({
                 <div className="min-w-0">
                     <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
                         Radar
+                        <span className="ml-1.5 text-[9px] font-semibold tracking-normal text-zinc-500">
+                            BETA
+                        </span>
                     </p>
                     {isRadarFullscreen && stationInfo && (
                         <p className="mt-1 truncate text-xl font-bold text-white sm:text-2xl">
