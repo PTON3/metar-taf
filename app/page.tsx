@@ -1,6 +1,13 @@
 ﻿"use client";
 
-import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import {
+    useCallback,
+    useEffect,
+    useRef,
+    useState,
+    type PointerEvent,
+    type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import type { FlightCategory, NormalizedMetar } from "@/lib/metar/types";
 import {
@@ -8,8 +15,1114 @@ import {
     NIGHT_STACKING_RAMP_ELIGIBILITY,
 } from "@/lib/minimums/weatherMinimums";
 import * as SunCalc from "suncalc";
+import * as Geomagnetism from "geomagnetism";
 import Image from "next/image";
 import FeedbackWidget from "./FeedbackWidget";
+
+const RADAR_MAX_RADIUS_NM = 250;
+// Where the map opens on load, as a fraction of the pan-out-to-max-zoom-in range.
+const RADAR_DEFAULT_ZOOM_PERCENT = 0.6;
+// Below this zoom *percent* (the same 0-100 metric the on-screen zoom readout shows, not a raw
+// zoom level — raw levels map to a different visible scale depending on latitude and container
+// size, which the percent already normalizes for) minor (non-IAP) airports are hidden — only
+// major airports stay visible while zoomed out wide, so panning across the country doesn't flood
+// the map with every small grass strip in the FAA dataset. Full local detail (airspace shapes +
+// every airport, not just majors) uses the same threshold for the same reason.
+const LOCAL_DETAIL_MIN_ZOOM_PERCENT = 30;
+// Fetches cover the viewport expanded by this much — generous on purpose, so the data for
+// wherever you pan next is already loaded *before* you get there rather than popping in after
+// you arrive (still bounded by the RADAR_MAX_RADIUS_NM-based cap below, which is what actually
+// keeps each request under the ArcGIS query-size limit).
+const LOCAL_DETAIL_PADDING_FACTOR = 3;
+const LOCAL_DETAIL_DEBOUNCE_MS = 250;
+const NM_TO_METERS = 1852;
+const EARTH_CIRCUMFERENCE_METERS = 40075016.686;
+const MAP_TILE_SIZE = 256;
+const RADAR_BASEMAP_TILE_URL =
+    "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}";
+const RADAR_BOUNDARY_TILE_URL =
+    "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}";
+const RADAR_BASEMAP_MAX_ZOOM = 16;
+const RADAR_WHEEL_ZOOM_SENSITIVITY = 0.012;
+// Fraction of the zoom range (pan-out floor to 1 nm ceiling) moved per +/- button click.
+const RADAR_ZOOM_STEP_PERCENT = 0.1;
+// Wheel zoom is non-passive (it has to preventDefault), which forces the browser to dispatch
+// every event to the main thread instead of handling it on the compositor the way it does for
+// native page scrolling — so under load, events can arrive coalesced into fewer, chunkier jumps
+// no matter how continuous the input hardware is. Applying each wheel delta to a target and
+// gliding view.zoom toward that target once per animation frame (instead of snapping straight to
+// it) decouples what's rendered from how choppy the raw input turned out to be. Fraction of the
+// remaining gap to close each frame — higher feels snappier/more direct, lower feels smoother.
+const RADAR_WHEEL_ZOOM_EASE = 0.35;
+
+// NOAA/NCEP GeoServer (opengeo.ncep.noaa.gov) serving the MRMS quality-controlled
+// CONUS base reflectivity mosaic — a direct government data source (no API key).
+const RADAR_WMS_BASE_URL = "https://opengeo.ncep.noaa.gov/geoserver/conus/wms";
+const RADAR_WMS_LAYER = "conus_bref_qcd";
+// "conus_bref_qcd" only covers the continental US and publishes a queryable time
+// history (what powers the animation loop). "regions_bref_qcd" is the broader NOAA
+// mosaic covering CONUS + Alaska + Hawaii + Caribbean + Guam, but it's latest-frame
+// only — no time dimension — so stations outside CONUS get a static radar image.
+const RADAR_WMS_REGIONS_LAYER = "regions_bref_qcd";
+const RADAR_CONUS_BOUNDS: RadarWmsBounds = { west: -130, south: 20, east: -60, north: 55 };
+const RADAR_WMS_CAPABILITIES_URL = `${RADAR_WMS_BASE_URL}?service=WMS&version=1.1.1&request=GetCapabilities`;
+const RADAR_IMAGE_MAX_PX = 1024;
+// The layer publishes observations roughly every 2 minutes; stepping by 5 spaces
+// animation frames about 10 minutes apart so storm motion actually reads.
+const RADAR_ANIMATION_FRAME_COUNT = 6;
+const RADAR_ANIMATION_FRAME_STEP = 5;
+const RADAR_ANIMATION_FRAME_MS = 500;
+const RADAR_ANIMATION_LAST_FRAME_HOLD_MS = 3000;
+// Refetch at least this often so a screen left open on the radar tab still
+// picks up newly published scans, even with no pan/zoom/station change.
+const RADAR_RESYNC_INTERVAL_MS = 60_000;
+
+// Iowa Environmental Mesonet's public GOES CONUS IR composite — already rendered in
+// an enhanced IR color curve server-side, so unlike the reflectivity radar above this
+// needs no client-side recoloring: just fetch and draw the PNG as-is.
+const SATELLITE_WMS_BASE_URL = "https://mesonet.agron.iastate.edu/cgi-bin/wms/goes/conus_ir.cgi";
+const SATELLITE_WMS_LAYER = "conus_ir_4km";
+// The source layer's own advertised extent — outside this box it doesn't return blank/
+// transparent, it returns a solid white rectangle, so this must be checked before ever
+// requesting the layer (see isWithinSatelliteCoverage below).
+const SATELLITE_CONUS_BOUNDS: RadarWmsBounds = { west: -126, south: 24, east: -66, north: 50 };
+// New GOES scans land roughly every 5-10 minutes; no point resyncing faster than that.
+const SATELLITE_RESYNC_INTERVAL_MS = 5 * 60_000;
+// A rough approximation of the source's enhanced-IR curve (dark/warm surface up
+// through white cloud tops into the blue/green/yellow/red coldest convective tops),
+// used only for the legend swatch — the actual overlay pixels come straight from IEM.
+const SATELLITE_LEGEND_GRADIENT =
+    "linear-gradient(to top, #050505, #4b4b4b, #b8b8b8, #ffffff, #4fd6ff, #33cc55, #f5e642, #ff4d2e)";
+
+// NOAA's default render style ("conus_bref_qcd") sampled from its own published
+// legend (~-20 to 70+ dBZ), paired 1:1 with our own custom output colors so the
+// live government reflectivity data is recolored entirely in-house.
+const RADAR_SOURCE_STOPS: readonly [number, number, number][] = [
+    [141, 129, 127],
+    [189, 193, 180],
+    [98, 118, 168],
+    [94, 174, 206],
+    [67, 214, 131],
+    [14, 213, 20],
+    [10, 110, 11],
+    [250, 216, 10],
+    [243, 178, 27],
+    [197, 10, 11],
+    [174, 3, 3],
+    [239, 116, 253],
+    [140, 0, 235],
+];
+
+const RADAR_CUSTOM_STOPS: readonly [number, number, number, number][] = [
+    [45, 212, 191, 0],
+    [45, 212, 191, 60],
+    [52, 211, 153, 120],
+    [132, 204, 90, 150],
+    [214, 179, 90, 175],
+    [230, 199, 111, 195],
+    [224, 150, 43, 215],
+    [224, 110, 43, 225],
+    [214, 71, 46, 235],
+    [178, 30, 30, 245],
+    [150, 20, 90, 250],
+    [155, 47, 214, 255],
+    [110, 20, 190, 255],
+];
+
+// Legend gradient (light -> heavy), skipping the fully-transparent no-echo stop.
+const RADAR_LEGEND_GRADIENT = `linear-gradient(to top, ${RADAR_CUSTOM_STOPS.slice(1)
+    .map(([r, g, b, a]) => `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(2)})`)
+    .join(", ")})`;
+
+const RADAR_SCALE_NICE_VALUES_NM = [
+    1, 2, 5, 10, 20, 25, 50, 75, 100, 150, 200, 300, 400, 500, 750, 1000, 1500, 2000, 3000, 5000,
+];
+const RADAR_SCALE_MIN_NM = RADAR_SCALE_NICE_VALUES_NM[0];
+const RADAR_SCALE_MAX_TARGET_PX = 340;
+const RADAR_SCALE_STEP_COUNT = 4;
+
+type RadarWmsBounds = {
+    west: number;
+    south: number;
+    east: number;
+    north: number;
+};
+
+// Panning/zooming out is deliberately decoupled from the data-fetch radius above
+// (RADAR_MAX_RADIUS_NM): aviation data (radar, hazards, PIREPs, airports) only ever
+// covers a 250nm circle around the loaded station, but the basemap itself is free to
+// pan anywhere — nearly the full globe, clamped just shy of the poles where Web
+// Mercator breaks down. Panning far from the station simply shows bare basemap.
+// Used only to size the zoomed-all-the-way-out "whole world fits" view — a normal,
+// finite (non-wrapping) box is correct for that one computation.
+const GLOBAL_PAN_BOUNDS: RadarWmsBounds = { west: -179.9, south: -85, east: 179.9, north: 85 };
+
+// The actual pan clamp, by contrast, leaves longitude unbounded so the map can be
+// dragged past +/-180 without hitting a wall — combined with the basemap tile loop's
+// existing mod-wrap on tile-x (and wrapLonNear for everything else drawn on top), this
+// is what makes crossing the antimeridian (e.g. through Alaska's Aleutian chain) a
+// seamless continuation instead of a hard edge. Latitude still clamps just shy of the
+// poles, where Mercator itself breaks down.
+const PAN_CLAMP_BOUNDS: RadarWmsBounds = { west: -Infinity, south: -85, east: Infinity, north: 85 };
+
+// A broad North America box (CONUS, Alaska's mainland, Hawaii, Puerto Rico/Caribbean) used to
+// fetch the lightweight vector layers (TFRs, hazards, PIREPs, majors) and the radar mosaic up
+// front, so panning anywhere in the country actually shows data instead of bare basemap.
+// Satellite uses its own, narrower SATELLITE_CONUS_BOUNDS instead — the source layer's real
+// extent, which doesn't reach Alaska/Hawaii/the Caribbean at all.
+const AMERICAS_BOUNDS: RadarWmsBounds = { west: -170, south: 15, east: -50, north: 75 };
+
+function buildRadarWmsUrl(
+    bounds: RadarWmsBounds,
+    width: number,
+    height: number,
+    time?: string,
+    layer: string = RADAR_WMS_LAYER
+): string {
+    const params = new URLSearchParams({
+        service: "WMS",
+        version: "1.1.1",
+        request: "GetMap",
+        layers: layer,
+        bbox: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
+        width: String(width),
+        height: String(height),
+        srs: "EPSG:4326",
+        format: "image/png",
+        transparent: "true",
+    });
+    if (time) params.set("time", time);
+    return `${RADAR_WMS_BASE_URL}?${params.toString()}`;
+}
+
+function buildSatelliteWmsUrl(bounds: RadarWmsBounds, width: number, height: number): string {
+    const params = new URLSearchParams({
+        service: "WMS",
+        version: "1.1.1",
+        request: "GetMap",
+        layers: SATELLITE_WMS_LAYER,
+        bbox: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
+        width: String(width),
+        height: String(height),
+        srs: "EPSG:4326",
+        format: "image/png",
+        transparent: "true",
+    });
+    return `${SATELLITE_WMS_BASE_URL}?${params.toString()}`;
+}
+
+async function fetchRecoloredRadarOverlay(
+    bounds: RadarWmsBounds,
+    time?: string,
+    layer: string = RADAR_WMS_LAYER
+): Promise<string> {
+    const lonSpan = bounds.east - bounds.west;
+    const latSpan = bounds.north - bounds.south;
+    const aspect = lonSpan / latSpan;
+    const width = aspect >= 1 ? RADAR_IMAGE_MAX_PX : Math.round(RADAR_IMAGE_MAX_PX * aspect);
+    const height = aspect >= 1 ? Math.round(RADAR_IMAGE_MAX_PX / aspect) : RADAR_IMAGE_MAX_PX;
+
+    const response = await fetch(buildRadarWmsUrl(bounds, width, height, time, layer));
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!response.ok || !contentType.startsWith("image/")) {
+        throw new Error("Radar imagery request failed.");
+    }
+
+    const blob = await response.blob();
+    const bitmap = await createImageBitmap(blob);
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas unavailable.");
+
+    ctx.drawImage(bitmap, 0, 0);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+
+    for (let i = 0; i < data.length; i += 4) {
+        if (data[i + 3] === 0) continue;
+
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+
+        let bestIndex = 0;
+        let bestDistance = Infinity;
+        for (let s = 0; s < RADAR_SOURCE_STOPS.length; s++) {
+            const [sr, sg, sb] = RADAR_SOURCE_STOPS[s];
+            const dr = r - sr;
+            const dg = g - sg;
+            const db = b - sb;
+            const distance = dr * dr + dg * dg + db * db;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = s;
+            }
+        }
+
+        const [cr, cg, cb, ca] = RADAR_CUSTOM_STOPS[bestIndex];
+        data[i] = cr;
+        data[i + 1] = cg;
+        data[i + 2] = cb;
+        data[i + 3] = ca;
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+
+    const outputBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((result) => {
+            if (result) resolve(result);
+            else reject(new Error("Failed to encode radar overlay."));
+        }, "image/png");
+    });
+
+    return URL.createObjectURL(outputBlob);
+}
+
+async function fetchRadarTimeExtent(): Promise<Date[]> {
+    const response = await fetch(RADAR_WMS_CAPABILITIES_URL);
+    if (!response.ok) return [];
+
+    const text = await response.text();
+    const layerIndex = text.indexOf(`<Name>${RADAR_WMS_LAYER}</Name>`);
+    if (layerIndex === -1) return [];
+
+    const extentMatch = text
+        .slice(layerIndex, layerIndex + 8000)
+        .match(/<Extent name="time"[^>]*>([^<]+)<\/Extent>/);
+    if (!extentMatch) return [];
+
+    return extentMatch[1]
+        .split(",")
+        .map((value) => new Date(value.trim()))
+        .filter((date) => !Number.isNaN(date.getTime()))
+        .sort((a, b) => a.getTime() - b.getTime());
+}
+
+// Picks a handful of frames spaced a few steps apart, newest last, so looping
+// them shows storm motion instead of a near-static blur of near-identical scans.
+function selectRadarAnimationFrames(times: Date[]): Date[] {
+    if (times.length === 0) return [];
+    const selected: Date[] = [];
+    for (
+        let i = times.length - 1;
+        i >= 0 && selected.length < RADAR_ANIMATION_FRAME_COUNT;
+        i -= RADAR_ANIMATION_FRAME_STEP
+    ) {
+        selected.push(times[i]);
+    }
+    return selected.reverse();
+}
+
+function isWithinConusRadarCoverage(lat: number, lon: number): boolean {
+    return (
+        lat >= RADAR_CONUS_BOUNDS.south &&
+        lat <= RADAR_CONUS_BOUNDS.north &&
+        lon >= RADAR_CONUS_BOUNDS.west &&
+        lon <= RADAR_CONUS_BOUNDS.east
+    );
+}
+
+function isWithinSatelliteCoverage(lat: number, lon: number): boolean {
+    return (
+        lat >= SATELLITE_CONUS_BOUNDS.south &&
+        lat <= SATELLITE_CONUS_BOUNDS.north &&
+        lon >= SATELLITE_CONUS_BOUNDS.west &&
+        lon <= SATELLITE_CONUS_BOUNDS.east
+    );
+}
+
+// ---- FAA aeronautical data (Aeronautical Information Services open data) ----
+// Both are official public FAA feature services, no API key required.
+const AIRSPACE_QUERY_URL =
+    "https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services/Class_Airspace/FeatureServer/0/query";
+const AIRPORTS_QUERY_URL =
+    "https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services/US_Airport/FeatureServer/0/query";
+
+type AirspacePolygon = {
+    airspaceClass: string;
+    name: string;
+    rings: { lat: number; lon: number }[][];
+};
+
+type AirportPoint = {
+    ident: string;
+    name: string;
+    icao: string | null;
+    lat: number;
+    lon: number;
+    flightCategory?: FlightCategory;
+    // FAA FAR91 flag — empirically this is exactly the ~30 largest US hub airports (ATL, LAX,
+    // ORD, JFK, DFW, ...), not just "has an instrument approach" (IAPEXISTS, which is true for
+    // ~3000 airports — way too many to read as "major"). Used to declutter zoomed-out views:
+    // major airports always render, everything else only once zoomed in close enough to matter.
+    isMajor: boolean;
+};
+
+const AIRSPACE_GOLD = "rgba(230, 199, 111, 0.5)";
+const AIRSPACE_CLASS_STYLES: Record<string, { color: string; width: number; dash: number[] }> = {
+    B: { color: AIRSPACE_GOLD, width: 2, dash: [] },
+    C: { color: AIRSPACE_GOLD, width: 2, dash: [] },
+    D: { color: AIRSPACE_GOLD, width: 1.5, dash: [6, 4] },
+};
+
+// Below this per-vertex turn angle, a vertex is treated as part of a curved radius
+// (rounded off); at or above it, the vertex is a real corner and stays sharp.
+const AIRSPACE_CORNER_ANGLE_DEG = 25;
+
+function computeTurnAngleDeg(
+    prev: { x: number; y: number },
+    current: { x: number; y: number },
+    next: { x: number; y: number }
+): number {
+    const v1x = current.x - prev.x;
+    const v1y = current.y - prev.y;
+    const v2x = next.x - current.x;
+    const v2y = next.y - current.y;
+    const mag1 = Math.hypot(v1x, v1y);
+    const mag2 = Math.hypot(v2x, v2y);
+    if (mag1 === 0 || mag2 === 0) return 0;
+    const cos = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / (mag1 * mag2)));
+    return (Math.acos(cos) * 180) / Math.PI;
+}
+
+// Standard ray-casting point-in-polygon test, used for hover/click hit-testing
+// against TFR and G-AIRMET zones (both drawn as simple closed rings).
+function pointInRing(x: number, y: number, ring: { x: number; y: number }[]): boolean {
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const xi = ring[i].x;
+        const yi = ring[i].y;
+        const xj = ring[j].x;
+        const yj = ring[j].y;
+        const intersects = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+        if (intersects) inside = !inside;
+    }
+    return inside;
+}
+
+// More saturated than a straight Tailwind-400 pastel — those read as washed-out and blend into
+// a busy dark map (radar colors, terrain) instead of popping at a glance.
+const FLIGHT_CATEGORY_MARKER_COLORS: Record<FlightCategory, string> = {
+    VFR: "#16d16f",
+    MVFR: "#2563eb",
+    IFR: "#ef4444",
+    LIFR: "#d946ef",
+    UNKNOWN: "#71717a",
+};
+
+async function fetchAirspacePolygons(bounds: GeoBounds, signal?: AbortSignal): Promise<AirspacePolygon[]> {
+    const params = new URLSearchParams({
+        geometry: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
+        geometryType: "esriGeometryEnvelope",
+        inSR: "4326",
+        spatialRel: "esriSpatialRelIntersects",
+        where: "CLASS IN ('B','C','D')",
+        outFields: "CLASS,NAME",
+        returnGeometry: "true",
+        maxAllowableOffset: "0.0001",
+        geometryPrecision: "4",
+        f: "geojson",
+    });
+
+    const response = await fetch(`${AIRSPACE_QUERY_URL}?${params.toString()}`, { signal });
+    if (!response.ok) throw new Error("Airspace request failed.");
+    const data = await response.json();
+    const features = Array.isArray(data?.features) ? data.features : [];
+
+    const polygons: AirspacePolygon[] = [];
+    for (const feature of features) {
+        const geometryType = feature?.geometry?.type;
+        const coordinates = feature?.geometry?.coordinates;
+        const airspaceClass = feature?.properties?.CLASS;
+        if (!coordinates || !airspaceClass) continue;
+
+        const ringSets: number[][][] =
+            geometryType === "MultiPolygon" ? coordinates.flat() : coordinates;
+        const rings = ringSets.map((ring) =>
+            ring.map((point) => ({ lat: point[1], lon: point[0] }))
+        );
+
+        polygons.push({ airspaceClass, name: feature?.properties?.NAME ?? "", rings });
+    }
+    return polygons;
+}
+
+type TfrPolygon = {
+    notamKey: string;
+    type: string;
+    title: string;
+    rings: { lat: number; lon: number }[][];
+};
+
+const TFR_STYLE = {
+    fill: "rgba(239, 68, 68, 0.16)",
+    stroke: "rgba(239, 68, 68, 0.9)",
+    width: 2,
+};
+
+async function fetchTfrPolygons(bounds: GeoBounds): Promise<TfrPolygon[]> {
+    const params = new URLSearchParams({
+        south: String(bounds.south),
+        west: String(bounds.west),
+        north: String(bounds.north),
+        east: String(bounds.east),
+    });
+
+    const response = await fetch(`/api/tfr?${params.toString()}`);
+    if (!response.ok) throw new Error("TFR request failed.");
+    const data = await response.json();
+    return Array.isArray(data?.tfrs) ? data.tfrs : [];
+}
+
+type GairmetZone = {
+    hazard: string;
+    severity: string | null;
+    validTime: string | null;
+    issueTime: string | null;
+    dueTo: string | null;
+    base: string | null;
+    top: string | null;
+    ring: { lat: number; lon: number }[];
+};
+
+// Colors matched to aviationweather.gov's own G-AIRMET map (sampled from its live
+// rendering — IFR magenta, icing purple, mountain obscuration maroon, turbulence
+// orange/red-orange, LLWS blue). TS/VA/MTW/TC (below) are international-SIGMET-only
+// hazards with no G-AIRMET equivalent, styled to fit the same palette.
+const GAIRMET_HAZARD_STYLES: Record<string, { fill: string; stroke: string }> = {
+    IFR: { fill: "rgba(255, 0, 255, 0.22)", stroke: "rgba(255, 51, 255, 0.95)" },
+    ICE: { fill: "rgba(0, 0, 255, 0.2)", stroke: "rgba(70, 70, 255, 0.95)" },
+    MT_OBSC: { fill: "rgba(153, 0, 153, 0.24)", stroke: "rgba(193, 40, 193, 0.95)" },
+    "TURB-HI": { fill: "rgba(255, 102, 0, 0.2)", stroke: "rgba(255, 132, 40, 0.95)" },
+    "TURB-LO": { fill: "rgba(204, 51, 0, 0.2)", stroke: "rgba(224, 81, 30, 0.95)" },
+    TURB: { fill: "rgba(255, 102, 0, 0.2)", stroke: "rgba(255, 132, 40, 0.95)" },
+    LLWS: { fill: "rgba(153, 51, 51, 0.26)", stroke: "rgba(193, 81, 81, 0.95)" },
+    TS: { fill: "rgba(220, 20, 20, 0.22)", stroke: "rgba(255, 60, 60, 0.95)" },
+    VA: { fill: "rgba(120, 113, 108, 0.28)", stroke: "rgba(168, 158, 150, 0.95)" },
+    MTW: { fill: "rgba(45, 212, 191, 0.2)", stroke: "rgba(94, 234, 212, 0.95)" },
+    TC: { fill: "rgba(190, 18, 60, 0.24)", stroke: "rgba(244, 63, 94, 0.95)" },
+};
+
+const GAIRMET_HAZARD_LABELS: Record<string, string> = {
+    IFR: "IFR (Ceiling/Visibility)",
+    ICE: "Icing",
+    MT_OBSC: "Mountain Obscuration",
+    "TURB-HI": "Turbulence (High)",
+    "TURB-LO": "Turbulence (Low)",
+    TURB: "Turbulence",
+    LLWS: "Low-Level Wind Shear",
+    TS: "Thunderstorms",
+    VA: "Volcanic Ash",
+    MTW: "Mountain Wave",
+    TC: "Tropical Cyclone",
+};
+
+// Minimal legend keys — short labels, one row per hazard the layer can show.
+const GAIRMET_LEGEND_ENTRIES: readonly [string, string][] = [
+    ["IFR", "IFR"],
+    ["ICE", "Icing"],
+    ["MT_OBSC", "Mtn Obsc"],
+    ["TURB-HI", "Turb Hi"],
+    ["TURB-LO", "Turb Lo"],
+    ["LLWS", "LLWS"],
+];
+
+const SIGMET_LEGEND_ENTRIES: readonly [string, string][] = [
+    ["TS", "T-Storms"],
+    ["TURB", "Turb"],
+    ["ICE", "Icing"],
+    ["VA", "Volc Ash"],
+    ["MTW", "Mtn Wave"],
+    ["TC", "Trop Cyc"],
+];
+
+type PirepSeverity = "SEVERE" | "MODERATE" | "LIGHT" | "NONE";
+
+type PirepReport = {
+    id: string;
+    lat: number;
+    lon: number;
+    aircraftType: string | null;
+    flightLevel: number | null;
+    obsTime: string | null;
+    isUrgent: boolean;
+    severity: PirepSeverity;
+    turbulenceIntensity: string | null;
+    turbulenceType: string | null;
+    icingIntensity: string | null;
+    icingType: string | null;
+    skyCover: string | null;
+    tempC: number | null;
+    windDir: number | null;
+    windSpeed: number | null;
+    wxString: string | null;
+    rawText: string | null;
+};
+
+const PIREP_SEVERITY_COLORS: Record<PirepSeverity, string> = {
+    SEVERE: "#ff3b30",
+    MODERATE: "#fb923c",
+    LIGHT: "#4ade80",
+    NONE: "#a1a1aa",
+};
+
+const PIREP_LEGEND_ENTRIES: readonly [PirepSeverity, string][] = [
+    ["SEVERE", "Severe"],
+    ["MODERATE", "Moderate"],
+    ["LIGHT", "Light"],
+    ["NONE", "None"],
+];
+
+// A simple top-down airplane silhouette (Material-style "flight" glyph) in a 24x24
+// box, pointing north — reused for every PIREP marker so they all read at a glance
+// as pilot reports, same size regardless of severity (only the fill color changes).
+// Built lazily (not at module scope) because Path2D doesn't exist during Next.js's
+// server-side render pass of this client component.
+const AIRPLANE_ICON_PATH_D =
+    "M12 2 L14 9 L21 13 L21 15 L14 13 L14 18 L17 20 L17 21.5 L12 20.5 L7 21.5 L7 20 L10 18 L10 13 L3 15 L3 13 L10 9 Z";
+let airplaneIconPathCache: Path2D | null = null;
+
+function getAirplaneIconPath(): Path2D {
+    if (!airplaneIconPathCache) {
+        airplaneIconPathCache = new Path2D(AIRPLANE_ICON_PATH_D);
+    }
+    return airplaneIconPathCache;
+}
+
+function drawAirplaneMarker(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    size: number,
+    color: string,
+    isUrgent: boolean
+) {
+    const path = getAirplaneIconPath();
+    ctx.save();
+    ctx.translate(x, y);
+    const scale = size / 24;
+    ctx.scale(scale, scale);
+    ctx.translate(-12, -12);
+    ctx.fillStyle = color;
+    ctx.fill(path);
+    ctx.lineWidth = (isUrgent ? 2.2 : 1.4) / scale;
+    ctx.strokeStyle = isUrgent ? "#ffffff" : "#18181b";
+    ctx.stroke(path);
+    ctx.restore();
+}
+
+async function fetchGairmetZones(bounds: GeoBounds): Promise<GairmetZone[]> {
+    const params = new URLSearchParams({
+        south: String(bounds.south),
+        west: String(bounds.west),
+        north: String(bounds.north),
+        east: String(bounds.east),
+    });
+
+    const response = await fetch(`/api/gairmet?${params.toString()}`);
+    if (!response.ok) throw new Error("G-AIRMET request failed.");
+    const data = await response.json();
+    return Array.isArray(data?.zones) ? data.zones : [];
+}
+
+// International SIGMETs — cover Alaska, Hawaii, and other regions outside the
+// CONUS-only G-AIRMET product. Same shape, so it draws through the same code path.
+async function fetchIsigmetZones(bounds: GeoBounds): Promise<GairmetZone[]> {
+    const params = new URLSearchParams({
+        south: String(bounds.south),
+        west: String(bounds.west),
+        north: String(bounds.north),
+        east: String(bounds.east),
+    });
+
+    const response = await fetch(`/api/isigmet?${params.toString()}`);
+    if (!response.ok) throw new Error("International SIGMET request failed.");
+    const data = await response.json();
+    return Array.isArray(data?.zones) ? data.zones : [];
+}
+
+// Domestic (CONUS) SIGMETs — convective, icing, turbulence.
+async function fetchAirsigmetZones(bounds: GeoBounds): Promise<GairmetZone[]> {
+    const params = new URLSearchParams({
+        south: String(bounds.south),
+        west: String(bounds.west),
+        north: String(bounds.north),
+        east: String(bounds.east),
+    });
+
+    const response = await fetch(`/api/airsigmet?${params.toString()}`);
+    if (!response.ok) throw new Error("Domestic SIGMET request failed.");
+    const data = await response.json();
+    return Array.isArray(data?.zones) ? data.zones : [];
+}
+
+async function fetchPirepReports(bounds: GeoBounds): Promise<PirepReport[]> {
+    const params = new URLSearchParams({
+        south: String(bounds.south),
+        west: String(bounds.west),
+        north: String(bounds.north),
+        east: String(bounds.east),
+    });
+
+    const response = await fetch(`/api/pirep?${params.toString()}`);
+    if (!response.ok) throw new Error("PIREP request failed.");
+    const data = await response.json();
+    return Array.isArray(data?.reports) ? data.reports : [];
+}
+
+async function fetchAirports(
+    bounds: GeoBounds,
+    majorOnly = false,
+    signal?: AbortSignal
+): Promise<AirportPoint[]> {
+    const baseWhere = "PRIVATEUSE=0 AND OPERSTATUS='OPERATIONAL' AND MIL_CODE='CIVIL'";
+    const params = new URLSearchParams({
+        geometry: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
+        geometryType: "esriGeometryEnvelope",
+        inSR: "4326",
+        spatialRel: "esriSpatialRelIntersects",
+        where: majorOnly ? `${baseWhere} AND FAR91=1` : baseWhere,
+        outFields: "IDENT,NAME,ICAO_ID,FAR91",
+        returnGeometry: "true",
+        geometryPrecision: "5",
+        f: "geojson",
+    });
+
+    const response = await fetch(`${AIRPORTS_QUERY_URL}?${params.toString()}`, { signal });
+    if (!response.ok) throw new Error("Airports request failed.");
+    const data = await response.json();
+    const features = Array.isArray(data?.features) ? data.features : [];
+
+    const airports: AirportPoint[] = [];
+    for (const feature of features) {
+        const coordinates = feature?.geometry?.coordinates;
+        if (!Array.isArray(coordinates) || coordinates.length < 2) continue;
+        airports.push({
+            ident: feature?.properties?.IDENT ?? "",
+            name: feature?.properties?.NAME ?? "",
+            icao: feature?.properties?.ICAO_ID ?? null,
+            lon: coordinates[0],
+            lat: coordinates[1],
+            isMajor: majorOnly || feature?.properties?.FAR91 === 1,
+        });
+    }
+    return airports;
+}
+
+const VALID_FLIGHT_CATEGORIES: readonly FlightCategory[] = ["VFR", "MVFR", "IFR", "LIFR", "UNKNOWN"];
+
+function resolveMetarStationKey(airport: AirportPoint): string | null {
+    if (airport.icao) return airport.icao;
+    if (airport.ident.length === 3) return `K${airport.ident}`;
+    if (airport.ident.length === 4) return airport.ident;
+    return null;
+}
+
+async function fetchAirportFlightCategories(bounds: GeoBounds): Promise<Map<string, FlightCategory>> {
+    const params = new URLSearchParams({
+        south: String(bounds.south),
+        west: String(bounds.west),
+        north: String(bounds.north),
+        east: String(bounds.east),
+    });
+
+    const response = await fetch(`/api/metar/bbox?${params.toString()}`);
+    if (!response.ok) throw new Error("Flight category request failed.");
+    const data = await response.json();
+    const stations = Array.isArray(data?.stations) ? data.stations : [];
+
+    const map = new Map<string, FlightCategory>();
+    for (const entry of stations) {
+        const station = entry?.station;
+        const flightCategory = entry?.flightCategory;
+        if (
+            typeof station === "string" &&
+            VALID_FLIGHT_CATEGORIES.includes(flightCategory as FlightCategory)
+        ) {
+            map.set(station, flightCategory as FlightCategory);
+        }
+    }
+    return map;
+}
+
+// ---- Minimal Web Mercator slippy-map math (replaces the Leaflet dependency) ----
+
+type MapView = { lat: number; lon: number; zoom: number };
+type GeoBounds = { west: number; south: number; east: number; north: number };
+
+function lonToWorldFrac(lon: number): number {
+    return (lon + 180) / 360;
+}
+
+function latToWorldFrac(lat: number): number {
+    const sinLat = Math.sin((lat * Math.PI) / 180);
+    return 0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI);
+}
+
+function worldFracToLon(frac: number): number {
+    return frac * 360 - 180;
+}
+
+function worldFracToLat(frac: number): number {
+    const n = Math.PI - 2 * Math.PI * frac;
+    return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+function projectToWorldPixel(lat: number, lon: number, zoom: number): { x: number; y: number } {
+    const scale = MAP_TILE_SIZE * Math.pow(2, zoom);
+    return { x: lonToWorldFrac(lon) * scale, y: latToWorldFrac(lat) * scale };
+}
+
+// With continuous (unclamped) panning, view.lon can drift past +/-180 as the map wraps
+// around the world — a real longitude like -170 and its wrapped twin +190 are the same
+// physical point, but projectToWorldPixel treats them as a full world-width apart. This
+// picks whichever +/-360 multiple of a feature's longitude lands closest to the current
+// view, so every marker/polygon/image bound projects to the copy of the world actually
+// on screen instead of potentially a world away.
+function wrapLonNear(lon: number, refLon: number): number {
+    return lon + 360 * Math.round((refLon - lon) / 360);
+}
+
+function unprojectFromWorldPixel(x: number, y: number, zoom: number): { lat: number; lon: number } {
+    const scale = MAP_TILE_SIZE * Math.pow(2, zoom);
+    return { lat: worldFracToLat(y / scale), lon: worldFracToLon(x / scale) };
+}
+
+// Screen-space pixel size of the decluttering grid used by computeVisibleAirports below.
+const AIRPORT_DECLUTTER_CELL_PX = 56;
+
+// At low zoom (majors-only mode) a hard isMajor filter is either too sparse (the FAA's FAR91
+// "major hub" flag is only ~30 airports nationwide — a near-empty map) or, with a looser
+// definition, too dense (thousands of IAP-having fields crowd the view). Grid decimation sits
+// between the two: bucket every candidate into a screen-space grid and keep only the single best
+// one per cell (majors first, then anything with a METAR-derived category, then whatever's
+// left), so the view always reads as "a reasonable, evenly-spread set of airports" regardless of
+// how dense the underlying data actually is. Shared by drawing and hit-testing so a click always
+// lands on whatever's actually visible. Returns every airport unfiltered once zoomed in enough
+// that minors are meant to show.
+function computeVisibleAirports(
+    airports: readonly AirportPoint[],
+    view: MapView,
+    tileZoom: number,
+    centerWorldPx: { x: number; y: number },
+    scaleFactor: number,
+    cssWidth: number,
+    cssHeight: number,
+    selectedIdent: string | null,
+    showMinorAirports: boolean
+): AirportPoint[] {
+    if (showMinorAirports) return airports as AirportPoint[];
+
+    const cellSize = AIRPORT_DECLUTTER_CELL_PX;
+    const bestByCell = new Map<string, { airport: AirportPoint; score: number }>();
+    let selected: AirportPoint | null = null;
+    for (const airport of airports) {
+        if (airport.ident === selectedIdent) {
+            selected = airport;
+            continue;
+        }
+        const world = projectToWorldPixel(airport.lat, wrapLonNear(airport.lon, view.lon), tileZoom);
+        const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
+        const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
+        if (x < -cellSize || x > cssWidth + cellSize || y < -cellSize || y > cssHeight + cellSize) continue;
+        // Having a category wins the cell first — a colored dot is more useful than an
+        // uncategorized major — with isMajor only breaking ties between two colored candidates.
+        const score = (airport.flightCategory ? 2 : 0) + (airport.isMajor ? 1 : 0);
+        // The cell key is built from world-space position (scaled by the current zoom), not
+        // screen-space x/y — an airport's own lat/lon never moves, so its cell only changes when
+        // the zoom does. Keying off screen position instead made every airport's cell shift as
+        // the view panned, so the "winner" of each cell — and thus which dots were visible —
+        // changed continuously, reading as airports strobing in and out while panning.
+        const key = `${Math.floor((world.x * scaleFactor) / cellSize)},${Math.floor((world.y * scaleFactor) / cellSize)}`;
+        const existing = bestByCell.get(key);
+        if (!existing || score > existing.score) {
+            bestByCell.set(key, { airport, score });
+        }
+    }
+    const result = Array.from(bestByCell.values(), (entry) => entry.airport);
+    if (selected) result.push(selected);
+    return result;
+}
+
+function boundsForDiameterMeters(center: { lat: number; lon: number }, diameterMeters: number): GeoBounds {
+    const latDeltaDeg = (diameterMeters / 2 / 6378137) * (180 / Math.PI);
+    const lonDeltaDeg = latDeltaDeg / Math.max(0.01, Math.cos((center.lat * Math.PI) / 180));
+    return {
+        west: center.lon - lonDeltaDeg,
+        east: center.lon + lonDeltaDeg,
+        south: center.lat - latDeltaDeg,
+        north: center.lat + latDeltaDeg,
+    };
+}
+
+// The lat/lon box currently on screen. Returns null for a viewport straddling the antimeridian
+// (west > east) — a rare edge case for a US-focused layer that isn't worth handling correctly;
+// callers just skip the reactive fetch for that one frame.
+function computeViewportBounds(view: MapView, cssWidth: number, cssHeight: number): GeoBounds | null {
+    const centerWorldPx = projectToWorldPixel(view.lat, view.lon, view.zoom);
+    const topLeft = unprojectFromWorldPixel(
+        centerWorldPx.x - cssWidth / 2,
+        centerWorldPx.y - cssHeight / 2,
+        view.zoom
+    );
+    const bottomRight = unprojectFromWorldPixel(
+        centerWorldPx.x + cssWidth / 2,
+        centerWorldPx.y + cssHeight / 2,
+        view.zoom
+    );
+    if (topLeft.lon > bottomRight.lon) return null;
+    return { west: topLeft.lon, east: bottomRight.lon, north: topLeft.lat, south: bottomRight.lat };
+}
+
+function boundsContains(outer: GeoBounds, inner: GeoBounds): boolean {
+    return (
+        outer.west <= inner.west &&
+        outer.east >= inner.east &&
+        outer.south <= inner.south &&
+        outer.north >= inner.north
+    );
+}
+
+function padBounds(bounds: GeoBounds, factor: number): GeoBounds {
+    const lonPad = ((bounds.east - bounds.west) * (factor - 1)) / 2;
+    const latPad = ((bounds.north - bounds.south) * (factor - 1)) / 2;
+    return {
+        west: bounds.west - lonPad,
+        east: bounds.east + lonPad,
+        south: bounds.south - latPad,
+        north: bounds.north + latPad,
+    };
+}
+
+function intersectBounds(a: GeoBounds, b: GeoBounds): GeoBounds {
+    return {
+        west: Math.max(a.west, b.west),
+        east: Math.min(a.east, b.east),
+        south: Math.max(a.south, b.south),
+        north: Math.min(a.north, b.north),
+    };
+}
+
+// Tiles a bounding box into a grid of smaller boxes, each small enough to stay under the ArcGIS
+// service's 1000-record cap even in the densest tile — AMERICAS_BOUNDS as a whole has ~5,200
+// airports and ~1,500 Class B/C/D shapes nationwide (confirmed live), so a 4x4 grid keeps even an
+// unevenly-dense tile (the Northeast corridor, say) comfortably under the cap.
+function tileBounds(bounds: GeoBounds, cols: number, rows: number): GeoBounds[] {
+    const lonStep = (bounds.east - bounds.west) / cols;
+    const latStep = (bounds.north - bounds.south) / rows;
+    const tiles: GeoBounds[] = [];
+    for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+            tiles.push({
+                west: bounds.west + col * lonStep,
+                east: bounds.west + (col + 1) * lonStep,
+                south: bounds.south + row * latStep,
+                north: bounds.south + (row + 1) * latStep,
+            });
+        }
+    }
+    return tiles;
+}
+
+// Runs async tasks with bounded concurrency instead of firing them all at once — a full-country
+// tiled fetch is a couple dozen requests, and the ArcGIS services behind fetchAirports/
+// fetchAirspacePolygons share a request-unit quota across every user of this app (a burst has
+// hit a 429 "quota exceeded" in testing), so this spreads the load out instead of bursting it.
+async function runWithConcurrency<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+    const results: T[] = new Array(tasks.length);
+    let nextIndex = 0;
+    async function worker() {
+        for (;;) {
+            const index = nextIndex++;
+            if (index >= tasks.length) return;
+            results[index] = await tasks[index]();
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+    return results;
+}
+
+const NATIONWIDE_TILE_COLS = 4;
+const NATIONWIDE_TILE_ROWS = 4;
+const NATIONWIDE_FETCH_CONCURRENCY = 4;
+// Keeps flight categories current (weather changes) and picks up any airport/airspace data a
+// tile happened to miss. Airport/airspace boundaries themselves are effectively static, so this
+// interval is really about the METAR-derived colors, not the underlying geometry.
+const NATIONWIDE_REFRESH_INTERVAL_MS = 7 * 60_000;
+
+// Full airport + airspace detail for the whole AMERICAS_BOUNDS area, not just near the selected
+// station — tiled because a single request that size errors out on the ArcGIS side (reported by
+// the browser as a CORS failure). Runs once on load and again on NATIONWIDE_REFRESH_INTERVAL_MS
+// so the whole country is populated up front instead of only filling in reactively as panned to.
+// Each tile fetches its airports and airspace together so onZoneDone can report one tick per
+// tile — that's what drives the "loading zone N" progress text on first load.
+async function loadNationwideAirportsAndAirspace(
+    signal: AbortSignal,
+    onZoneDone?: (zoneIndex: number, zoneCount: number) => void
+): Promise<{ airports: AirportPoint[]; polygons: AirspacePolygon[] }> {
+    const tiles = tileBounds(AMERICAS_BOUNDS, NATIONWIDE_TILE_COLS, NATIONWIDE_TILE_ROWS);
+    const tileResults = await runWithConcurrency(
+        tiles.map((tile, index) => async () => {
+            const [airports, polygons] = await Promise.all([
+                fetchAirports(tile, false, signal).catch(() => [] as AirportPoint[]),
+                fetchAirspacePolygons(tile, signal).catch(() => [] as AirspacePolygon[]),
+            ]);
+            onZoneDone?.(index, tiles.length);
+            return { airports, polygons };
+        }),
+        NATIONWIDE_FETCH_CONCURRENCY
+    );
+
+    const airportMap = new Map<string, AirportPoint>();
+    const polygonMap = new Map<string, AirspacePolygon>();
+    for (const result of tileResults) {
+        for (const airport of result.airports) airportMap.set(airport.ident, airport);
+        for (const polygon of result.polygons) {
+            const key = `${polygon.airspaceClass}|${polygon.name}|${polygon.rings[0]?.[0]?.lat}|${polygon.rings[0]?.[0]?.lon}`;
+            polygonMap.set(key, polygon);
+        }
+    }
+
+    return { airports: Array.from(airportMap.values()), polygons: Array.from(polygonMap.values()) };
+}
+
+function computeBoundsZoom(
+    bounds: GeoBounds,
+    containerWidthPx: number,
+    containerHeightPx: number,
+    fit: "contain" | "cover" = "contain"
+): number {
+    const lonSpan = lonToWorldFrac(bounds.east) - lonToWorldFrac(bounds.west);
+    const latSpan = Math.abs(latToWorldFrac(bounds.south) - latToWorldFrac(bounds.north));
+    const zoomForWidth = Math.log2(containerWidthPx / (lonSpan * MAP_TILE_SIZE));
+    const zoomForHeight = Math.log2(containerHeightPx / (latSpan * MAP_TILE_SIZE));
+    return fit === "cover"
+        ? Math.max(zoomForWidth, zoomForHeight)
+        : Math.min(zoomForWidth, zoomForHeight);
+}
+
+// Keeps the viewport from ever panning past the given geographic bounds — once the
+// bounds are smaller than the viewport on an axis (e.g. at the 150nm zoomed-out
+// floor), that axis locks to the bounds' center instead of allowing any pan.
+function clampViewToMaxBounds(
+    view: MapView,
+    maxBounds: GeoBounds,
+    viewportWidthPx: number,
+    viewportHeightPx: number
+): MapView {
+    const scale = MAP_TILE_SIZE * Math.pow(2, view.zoom);
+    const boundsMinX = lonToWorldFrac(maxBounds.west) * scale;
+    const boundsMaxX = lonToWorldFrac(maxBounds.east) * scale;
+    const boundsMinY = latToWorldFrac(maxBounds.north) * scale;
+    const boundsMaxY = latToWorldFrac(maxBounds.south) * scale;
+
+    const centerPx = projectToWorldPixel(view.lat, view.lon, view.zoom);
+    const halfWidth = viewportWidthPx / 2;
+    const halfHeight = viewportHeightPx / 2;
+
+    const clampedX =
+        boundsMaxX - boundsMinX <= viewportWidthPx
+            ? (boundsMinX + boundsMaxX) / 2
+            : Math.min(Math.max(centerPx.x, boundsMinX + halfWidth), boundsMaxX - halfWidth);
+    const clampedY =
+        boundsMaxY - boundsMinY <= viewportHeightPx
+            ? (boundsMinY + boundsMaxY) / 2
+            : Math.min(Math.max(centerPx.y, boundsMinY + halfHeight), boundsMaxY - halfHeight);
+
+    const clampedLatLon = unprojectFromWorldPixel(clampedX, clampedY, view.zoom);
+    return { lat: clampedLatLon.lat, lon: clampedLatLon.lon, zoom: view.zoom };
+}
+
+function computeScaleForView(view: MapView, targetPx: number): { nm: number; px: number } {
+    const metersPerPixel =
+        (EARTH_CIRCUMFERENCE_METERS * Math.abs(Math.cos((view.lat * Math.PI) / 180))) /
+        (MAP_TILE_SIZE * Math.pow(2, view.zoom));
+    const maxNm = (metersPerPixel * targetPx) / NM_TO_METERS;
+
+    let chosen = RADAR_SCALE_NICE_VALUES_NM[0];
+    for (const value of RADAR_SCALE_NICE_VALUES_NM) {
+        if (value <= maxNm) chosen = value;
+        else break;
+    }
+
+    const px = (chosen * NM_TO_METERS) / metersPerPixel;
+    return { nm: chosen, px };
+}
+
+// The scale bar's smallest nice value is RADAR_SCALE_MIN_NM (1 nm) — zooming in past the point
+// where that value would represent less than one target-width's worth of real distance makes
+// the bar balloon past its intended width to keep showing "1 nm" at a real scale under 1 nm. This
+// finds the zoom level where the bar exactly reads RADAR_SCALE_MIN_NM, so callers can clamp there.
+function computeMaxZoomForMinScale(lat: number, targetPx: number): number {
+    const metersPerPixelAtZoom0 =
+        EARTH_CIRCUMFERENCE_METERS * Math.max(Math.abs(Math.cos((lat * Math.PI) / 180)), 0.01);
+    const ratio = (metersPerPixelAtZoom0 * targetPx) / (MAP_TILE_SIZE * NM_TO_METERS * RADAR_SCALE_MIN_NM);
+    return Math.log2(Math.max(ratio, 1));
+}
+
+function computeScaleTargetPx(containerWidthPx: number): number {
+    return Math.max(90, Math.min(RADAR_SCALE_MAX_TARGET_PX, containerWidthPx * 0.38));
+}
+
+function computeEffectiveMaxZoom(rangeMax: number, lat: number, containerWidthPx: number): number {
+    return Math.min(rangeMax, computeMaxZoomForMinScale(lat, computeScaleTargetPx(containerWidthPx)));
+}
+
+// Matches the on-screen zoom readout's own math — see displayZoomPercent — so a threshold
+// expressed as "N% zoom" means the same thing everywhere it's checked.
+function computeZoomPercent(zoom: number, min: number, effectiveMax: number): number {
+    return effectiveMax > min ? ((zoom - min) / (effectiveMax - min)) * 100 : 0;
+}
+
+function computePinchMetrics(
+    points: readonly { x: number; y: number }[]
+): { distance: number; mid: { x: number; y: number } } {
+    const [a, b] = points;
+    return {
+        distance: Math.hypot(b.x - a.x, b.y - a.y),
+        mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+    };
+}
+
+const EARTH_RADIUS_NM = 3440.065;
+
+// Built once (parsing the WMM coefficient tables isn't free) and reused for every lookup —
+// declination drifts slowly enough (secular variation) that a per-session model is plenty fresh.
+const MAGNETIC_MODEL = Geomagnetism.model();
+
+// True bearing/great-circle distance between two points — already curvature-correct at any range
+// via spherical trig (haversine distance, initial great-circle bearing) rather than flat-plane
+// approximation, which would drift increasingly wrong as distance grows.
+function computeBearingDistance(
+    from: { lat: number; lon: number },
+    to: { lat: number; lon: number }
+): { bearingDeg: number; distanceNm: number } {
+    const lat1 = (from.lat * Math.PI) / 180;
+    const lat2 = (to.lat * Math.PI) / 180;
+    const dLat = lat2 - lat1;
+    const dLon = ((to.lon - from.lon) * Math.PI) / 180;
+
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+    const bearingDeg = ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+
+    const a =
+        Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distanceNm = EARTH_RADIUS_NM * c;
+
+    return { bearingDeg, distanceNm };
+}
+
+// Converts a true bearing to magnetic using the WMM declination at the reference point (the
+// convention pilots use: local variation at the station, not some blend along the course) —
+// "variation east, magnetic least": magnetic = true - declination (east-positive).
+function trueToMagneticBearing(trueBearingDeg: number, at: { lat: number; lon: number }): number {
+    const declination = MAGNETIC_MODEL.point([at.lat, at.lon]).decl;
+    return ((trueBearingDeg - declination) % 360 + 360) % 360;
+}
 
 type ApiResponse = {
     raw?: string;
@@ -137,7 +1250,7 @@ type RemarkBubble = {
 type WindDisplayMode = "animated" | "direction" | "hidden";
 
 type DecoderTab = "lookup" | "raw";
-type DashboardTab = "weather" | "taf" | "airport";
+type DashboardTab = "weather" | "taf" | "radar" | "airport";
 
 type TafSkyCondition = {
     cover?: string | null;
@@ -275,6 +1388,7 @@ export default function Home() {
     const [activeTab, setActiveTab] = useState<DecoderTab>("lookup");
     const [station, setStation] = useState("KFCM");
     const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
+    const [isRadarFullscreen, setIsRadarFullscreen] = useState(false);
     const [rawInput, setRawInput] = useState("");
     const [searchMode, setSearchMode] = useState<"decode" | "quiz">("decode");
     const [quizMode, setQuizMode] = useState(false);
@@ -654,6 +1768,8 @@ export default function Home() {
                             runways={runways}
                             isFullscreenOpen={isFullscreenOpen}
                             setIsFullscreenOpen={setIsFullscreenOpen}
+                            isRadarFullscreen={isRadarFullscreen}
+                            setIsRadarFullscreen={setIsRadarFullscreen}
                             lastMetarFetchAttempt={lastMetarFetchAttempt}
                             onRefetchMetar={() => fetchLiveMetar()}
                         />
@@ -671,7 +1787,7 @@ export default function Home() {
 
             </div>
 
-            <FeedbackWidget currentStation={station} hidden={isFullscreenOpen} />
+            <FeedbackWidget currentStation={station} hidden={isFullscreenOpen || isRadarFullscreen} />
         </main>
     );
 }
@@ -685,6 +1801,8 @@ function MetarDashboard({
     runways,
     isFullscreenOpen,
     setIsFullscreenOpen,
+    isRadarFullscreen,
+    setIsRadarFullscreen,
     lastMetarFetchAttempt,
     onRefetchMetar,
 }: {
@@ -696,6 +1814,8 @@ function MetarDashboard({
     runways: AirportRunway[];
     isFullscreenOpen: boolean;
     setIsFullscreenOpen: (value: boolean) => void;
+    isRadarFullscreen: boolean;
+    setIsRadarFullscreen: (value: boolean) => void;
     lastMetarFetchAttempt: Date | null;
     onRefetchMetar: () => void;
 }) {
@@ -987,6 +2107,13 @@ function MetarDashboard({
                             </DashboardTabButton>
 
                             <DashboardTabButton
+                                active={activeDashboardTab === "radar"}
+                                onClick={() => setActiveDashboardTab("radar")}
+                            >
+                                Radar
+                            </DashboardTabButton>
+
+                            <DashboardTabButton
                                 active={activeDashboardTab === "airport"}
                                 onClick={() => setActiveDashboardTab("airport")}
                             >
@@ -1022,6 +2149,15 @@ function MetarDashboard({
                             error={tafError}
                             lastTafFetchAttempt={lastTafFetchAttempt}
                             onRefetchTaf={refetchTaf}
+                        />
+                    )}
+
+                    {activeDashboardTab === "radar" && (
+                        <RadarDashboardTab
+                            stationInfo={stationInfo}
+                            runways={runways}
+                            isRadarFullscreen={isRadarFullscreen}
+                            setIsRadarFullscreen={setIsRadarFullscreen}
                         />
                     )}
 
@@ -2414,6 +3550,2726 @@ function TafDashboardTab({
     );
 }
 
+function RadarDashboardTab({
+    stationInfo,
+    runways,
+    isRadarFullscreen,
+    setIsRadarFullscreen,
+}: {
+    stationInfo: StationInfo | null;
+    runways: AirportRunway[];
+    isRadarFullscreen: boolean;
+    setIsRadarFullscreen: (value: boolean) => void;
+}) {
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const viewRef = useRef<MapView>({ lat: 0, lon: 0, zoom: 4 });
+    const zoomRangeRef = useRef<{ min: number; max: number }>({ min: 2, max: RADAR_BASEMAP_MAX_ZOOM });
+    const maxBoundsRef = useRef<GeoBounds | null>(null);
+    const stationMarkerPositionRef = useRef<{ lat: number; lon: number } | null>(null);
+    const airportSearchContainerRef = useRef<HTMLDivElement | null>(null);
+    const tileCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+    const boundaryTileCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+    const radarFrameImagesRef = useRef<HTMLImageElement[]>([]);
+    const radarBoundsRef = useRef<GeoBounds | null>(null);
+    const radarObjectUrlsRef = useRef<string[]>([]);
+    const satelliteImageRef = useRef<HTMLImageElement | null>(null);
+    const satelliteBoundsRef = useRef<GeoBounds | null>(null);
+    const airspacePolygonsRef = useRef<AirspacePolygon[]>([]);
+    const tfrPolygonsRef = useRef<TfrPolygon[]>([]);
+    const gairmetZonesRef = useRef<GairmetZone[]>([]);
+    const sigmetZonesRef = useRef<GairmetZone[]>([]);
+    const pirepsRef = useRef<PirepReport[]>([]);
+    const airportsRef = useRef<AirportPoint[]>([]);
+    const localDetailCoverageBoundsRef = useRef<GeoBounds | null>(null);
+    const localDetailDebounceRef = useRef<number | null>(null);
+    const localDetailAbortRef = useRef<AbortController | null>(null);
+    const lastLocalDetailCheckRef = useRef(0);
+    const nationwideAbortRef = useRef<AbortController | null>(null);
+    const drawFrameRef = useRef<() => void>(() => {});
+    const rafScheduledRef = useRef(false);
+    const activePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+    const lastPointerPosRef = useRef<{ x: number; y: number } | null>(null);
+    const pinchLastRef = useRef<{ distance: number; mid: { x: number; y: number } } | null>(null);
+    const wheelZoomTargetRef = useRef<number | null>(null);
+    const wheelZoomAnchorRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+    const wheelZoomAnimRef = useRef<number | null>(null);
+    const pointerDownScreenPosRef = useRef<{ x: number; y: number } | null>(null);
+    const hoveredAirportIdentRef = useRef<string | null>(null);
+    const selectedAirportIdentRef = useRef<string | null>(null);
+    const zoneInfoPinnedRef = useRef(false);
+
+    const [radarFrameTimes, setRadarFrameTimes] = useState<Date[]>([]);
+    const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
+    const [radarFrameGeneration, setRadarFrameGeneration] = useState(0);
+    const [radarError, setRadarError] = useState<string | null>(null);
+    const [radarVisible, setRadarVisible] = useState(true);
+    const [satelliteVisible, setSatelliteVisible] = useState(false);
+    const [satelliteCoverageAvailable, setSatelliteCoverageAvailable] = useState(true);
+    const [airspaceVisible, setAirspaceVisible] = useState(true);
+    const [tfrVisible, setTfrVisible] = useState(true);
+    const [gairmetVisible, setGairmetVisible] = useState(true);
+    const [sigmetVisible, setSigmetVisible] = useState(true);
+    const [pirepVisible, setPirepVisible] = useState(true);
+    const [boundaryVisible, setBoundaryVisible] = useState(false);
+    const [selectedAirport, setSelectedAirport] = useState<AirportPoint | null>(null);
+    const [zoneInfo, setZoneInfo] = useState<{
+        x: number;
+        y: number;
+        pinned: boolean;
+        tfrs: TfrPolygon[];
+        gairmets: GairmetZone[];
+        pireps: PirepReport[];
+    } | null>(null);
+    const [stationMarkerPosition, setStationMarkerPosition] = useState<{ lat: number; lon: number } | null>(
+        null
+    );
+    const [airportSearchOpen, setAirportSearchOpen] = useState(false);
+    const [airportSearchQuery, setAirportSearchQuery] = useState("");
+    const [airportSearchError, setAirportSearchError] = useState<string | null>(null);
+    const [displayZoomPercent, setDisplayZoomPercent] = useState<number | null>(null);
+    const [displayScale, setDisplayScale] = useState<{ nm: number; px: number } | null>(null);
+    const [mobileControlsOpen, setMobileControlsOpen] = useState(false);
+    const [mobileLegendOpen, setMobileLegendOpen] = useState(false);
+    // Gates the radar bubble behind a loading screen until every first-load fetch (radar imagery,
+    // satellite, hazards/local data, and every nationwide zone) has finished — see the loading
+    // block inside the main data-loading effect. Only the very first load for a station is gated
+    // this way; the periodic background refreshes that follow update silently.
+    const [radarLoadProgress, setRadarLoadProgress] = useState<{
+        ready: boolean;
+        completed: number;
+        total: number;
+        label: string;
+    }>({ ready: false, completed: 0, total: 1, label: "Loading radar…" });
+    const radarBubbleRef = useRef<HTMLDivElement | null>(null);
+
+    const latitude = stationInfo?.latitude ?? null;
+    const longitude = stationInfo?.longitude ?? null;
+
+    // Precipitation and satellite are two views of the same "live weather" slot —
+    // toggling one on swaps the other off, rather than layering both at once.
+    function togglePrecipitation() {
+        setRadarVisible((current) => {
+            const next = !current;
+            if (next) setSatelliteVisible(false);
+            return next;
+        });
+    }
+
+    function toggleSatellite() {
+        if (!satelliteCoverageAvailable) return;
+        setSatelliteVisible((current) => {
+            const next = !current;
+            if (next) setRadarVisible(false);
+            return next;
+        });
+    }
+
+    const scheduleDraw = useCallback(() => {
+        if (rafScheduledRef.current) return;
+        rafScheduledRef.current = true;
+        requestAnimationFrame(() => {
+            rafScheduledRef.current = false;
+            drawFrameRef.current();
+        });
+    }, []);
+
+    const applyZoomAtScreenPoint = useCallback(
+        (screenX: number, screenY: number, targetZoom: number) => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const view = viewRef.current;
+            const cssWidth = canvas.clientWidth;
+            const cssHeight = canvas.clientHeight;
+
+            const { min, max } = zoomRangeRef.current;
+            const effectiveMax = computeEffectiveMaxZoom(max, view.lat, cssWidth);
+            const clampedZoom = Math.max(min, Math.min(effectiveMax, targetZoom));
+
+            const oldTileZoom = Math.round(view.zoom);
+            const oldScaleFactor = Math.pow(2, view.zoom - oldTileZoom);
+            const oldCenterWorldPx = projectToWorldPixel(view.lat, view.lon, oldTileZoom);
+            const pointWorldPxOld = {
+                x: oldCenterWorldPx.x + (screenX - cssWidth / 2) / oldScaleFactor,
+                y: oldCenterWorldPx.y + (screenY - cssHeight / 2) / oldScaleFactor,
+            };
+            const pointLatLon = unprojectFromWorldPixel(pointWorldPxOld.x, pointWorldPxOld.y, oldTileZoom);
+
+            const newTileZoom = Math.round(clampedZoom);
+            const newScaleFactor = Math.pow(2, clampedZoom - newTileZoom);
+            const pointWorldPxNew = projectToWorldPixel(pointLatLon.lat, pointLatLon.lon, newTileZoom);
+            const newCenterWorldPx = {
+                x: pointWorldPxNew.x - (screenX - cssWidth / 2) / newScaleFactor,
+                y: pointWorldPxNew.y - (screenY - cssHeight / 2) / newScaleFactor,
+            };
+            const newCenterLatLon = unprojectFromWorldPixel(
+                newCenterWorldPx.x,
+                newCenterWorldPx.y,
+                newTileZoom
+            );
+
+            const candidate = { lat: newCenterLatLon.lat, lon: newCenterLatLon.lon, zoom: clampedZoom };
+            const maxBounds = maxBoundsRef.current;
+            viewRef.current = maxBounds
+                ? clampViewToMaxBounds(candidate, maxBounds, cssWidth, cssHeight)
+                : candidate;
+        },
+        []
+    );
+
+    const panByScreenDelta = useCallback((dx: number, dy: number) => {
+        const view = viewRef.current;
+        const tileZoom = Math.round(view.zoom);
+        const scaleFactor = Math.pow(2, view.zoom - tileZoom);
+        const centerWorldPx = projectToWorldPixel(view.lat, view.lon, tileZoom);
+        const newWorldPx = {
+            x: centerWorldPx.x - dx / scaleFactor,
+            y: centerWorldPx.y - dy / scaleFactor,
+        };
+        const newLatLon = unprojectFromWorldPixel(newWorldPx.x, newWorldPx.y, tileZoom);
+        const candidate = { lat: newLatLon.lat, lon: newLatLon.lon, zoom: view.zoom };
+        const canvas = canvasRef.current;
+        const maxBounds = maxBoundsRef.current;
+        viewRef.current =
+            maxBounds && canvas
+                ? clampViewToMaxBounds(candidate, maxBounds, canvas.clientWidth, canvas.clientHeight)
+                : candidate;
+    }, []);
+
+    const handleZoomButtonClick = useCallback(
+        (direction: 1 | -1) => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const view = viewRef.current;
+            const { min, max } = zoomRangeRef.current;
+            const effectiveMax = computeEffectiveMaxZoom(max, view.lat, canvas.clientWidth);
+            const step = RADAR_ZOOM_STEP_PERCENT * (effectiveMax - min);
+            applyZoomAtScreenPoint(canvas.clientWidth / 2, canvas.clientHeight / 2, view.zoom + direction * step);
+            scheduleDraw();
+        },
+        [applyZoomAtScreenPoint, scheduleDraw]
+    );
+
+    const handleZoomPercentClick = useCallback(() => {
+        if (latitude === null || longitude === null) return;
+        const canvas = canvasRef.current;
+        const { min, max } = zoomRangeRef.current;
+        const effectiveMax = canvas ? computeEffectiveMaxZoom(max, latitude, canvas.clientWidth) : max;
+        viewRef.current = {
+            lat: latitude,
+            lon: longitude,
+            zoom: min + RADAR_DEFAULT_ZOOM_PERCENT * (effectiveMax - min),
+        };
+        scheduleDraw();
+    }, [latitude, longitude, scheduleDraw]);
+
+    function handleAirportSearchSubmit() {
+        const query = airportSearchQuery.trim().toUpperCase();
+        if (!query) return;
+
+        const mainStationKey = stationInfo?.station?.toUpperCase();
+        if (mainStationKey && (query === mainStationKey || `K${query}` === mainStationKey)) {
+            setAirportSearchError("That's the current airport.");
+            return;
+        }
+
+        const match = airportsRef.current.find(
+            (airport) =>
+                airport.ident.toUpperCase() === query || airport.icao?.toUpperCase() === query
+        );
+
+        if (!match) {
+            setAirportSearchError(`Out of range (${RADAR_MAX_RADIUS_NM} nm).`);
+            return;
+        }
+
+        selectedAirportIdentRef.current = match.ident;
+        setSelectedAirport(match);
+        scheduleDraw();
+        setAirportSearchOpen(false);
+        setAirportSearchQuery("");
+        setAirportSearchError(null);
+    }
+
+    // Airspace shapes and full (not just major) airport detail load reactively as the user pans
+    // and zooms, instead of being limited to a fixed radius around the selected station — each
+    // fetch is still capped to a safe request size (the ArcGIS services these hit error out past
+    // roughly RADAR_MAX_RADIUS_NM), it's just re-centered on wherever the view currently is.
+    function maybeFetchLocalDetail() {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const view = viewRef.current;
+
+        const cssWidth = canvas.clientWidth;
+        const cssHeight = canvas.clientHeight;
+        if (cssWidth === 0 || cssHeight === 0) return;
+
+        const { min, max } = zoomRangeRef.current;
+        // Station latitude, not view.lat — see the matching comment in drawFrame.
+        const effectiveMax = computeEffectiveMaxZoom(max, latitude ?? view.lat, cssWidth);
+        if (computeZoomPercent(view.zoom, min, effectiveMax) < LOCAL_DETAIL_MIN_ZOOM_PERCENT) return;
+
+        const viewportBounds = computeViewportBounds(view, cssWidth, cssHeight);
+        if (!viewportBounds) return;
+
+        const covered = localDetailCoverageBoundsRef.current;
+        if (covered && boundsContains(covered, viewportBounds)) return;
+
+        // Only arm the timer if one isn't already pending — resetting it on every check would
+        // let a long, continuous pan defer the fetch forever instead of ever settling.
+        if (localDetailDebounceRef.current !== null) return;
+
+        localDetailDebounceRef.current = window.setTimeout(() => {
+            localDetailDebounceRef.current = null;
+
+            const latestCanvas = canvasRef.current;
+            const latestView = viewRef.current;
+            if (!latestCanvas) return;
+            const { min: latestMin, max: latestMax } = zoomRangeRef.current;
+            const latestEffectiveMax = computeEffectiveMaxZoom(
+                latestMax,
+                latitude ?? latestView.lat,
+                latestCanvas.clientWidth
+            );
+            if (
+                computeZoomPercent(latestView.zoom, latestMin, latestEffectiveMax) <
+                LOCAL_DETAIL_MIN_ZOOM_PERCENT
+            ) {
+                return;
+            }
+            const freshViewport = computeViewportBounds(
+                latestView,
+                latestCanvas.clientWidth,
+                latestCanvas.clientHeight
+            );
+            if (!freshViewport) return;
+
+            const requestBounds = intersectBounds(
+                padBounds(freshViewport, LOCAL_DETAIL_PADDING_FACTOR),
+                boundsForDiameterMeters(
+                    { lat: latestView.lat, lon: latestView.lon },
+                    RADAR_MAX_RADIUS_NM * NM_TO_METERS * 2
+                )
+            );
+
+            localDetailAbortRef.current?.abort();
+            const controller = new AbortController();
+            localDetailAbortRef.current = controller;
+
+            Promise.all([
+                fetchAirspacePolygons(requestBounds, controller.signal).catch(() => null),
+                fetchAirports(requestBounds, false, controller.signal).catch(() => null),
+                fetchAirportFlightCategories(requestBounds).catch(() => null),
+            ]).then(([polygons, airports, flightCategories]) => {
+                if (controller.signal.aborted) return;
+
+                if (polygons) {
+                    const polygonKey = (polygon: AirspacePolygon) =>
+                        `${polygon.airspaceClass}|${polygon.name}|${polygon.rings[0]?.[0]?.lat}|${polygon.rings[0]?.[0]?.lon}`;
+                    const existingKeys = new Set(airspacePolygonsRef.current.map(polygonKey));
+                    const merged = airspacePolygonsRef.current.slice();
+                    for (const polygon of polygons) {
+                        const key = polygonKey(polygon);
+                        if (!existingKeys.has(key)) {
+                            existingKeys.add(key);
+                            merged.push(polygon);
+                        }
+                    }
+                    airspacePolygonsRef.current = merged;
+                }
+
+                if (airports) {
+                    const mergedAirports = new Map<string, AirportPoint>();
+                    for (const airport of airportsRef.current) mergedAirports.set(airport.ident, airport);
+                    for (const airport of airports) {
+                        if (resolveMetarStationKey(airport) === stationInfo?.station) continue;
+                        // A fresh fetch has no flightCategory of its own — carry over whatever the
+                        // existing entry already had so re-fetching an area (e.g. a small pan)
+                        // doesn't strip color that was already resolved for it.
+                        const previous = mergedAirports.get(airport.ident);
+                        mergedAirports.set(airport.ident, {
+                            ...airport,
+                            flightCategory: previous?.flightCategory,
+                        });
+                    }
+                    // One more pass applies (or refreshes) categories from this fetch's own bbox
+                    // METAR query across every airport now in range, new or previously loaded.
+                    if (flightCategories) {
+                        for (const [ident, airport] of mergedAirports) {
+                            const key = resolveMetarStationKey(airport);
+                            const flightCategory = key ? flightCategories.get(key) : undefined;
+                            if (flightCategory && airport.flightCategory !== flightCategory) {
+                                mergedAirports.set(ident, { ...airport, flightCategory });
+                            }
+                        }
+                    }
+                    airportsRef.current = Array.from(mergedAirports.values());
+                }
+
+                localDetailCoverageBoundsRef.current = requestBounds;
+                scheduleDraw();
+            });
+        }, LOCAL_DETAIL_DEBOUNCE_MS);
+    }
+
+    function hitTestAirport(localX: number, localY: number): AirportPoint | null {
+        const canvas = canvasRef.current;
+        if (!canvas) return null;
+        const cssWidth = canvas.clientWidth;
+        const cssHeight = canvas.clientHeight;
+        const view = viewRef.current;
+        const tileZoom = Math.max(0, Math.min(RADAR_BASEMAP_MAX_ZOOM, Math.round(view.zoom)));
+        const scaleFactor = Math.pow(2, view.zoom - tileZoom);
+        const centerWorldPx = projectToWorldPixel(view.lat, view.lon, tileZoom);
+
+        const { min: hitTestMin, max: hitTestMax } = zoomRangeRef.current;
+        const hitTestEffectiveMax = computeEffectiveMaxZoom(hitTestMax, latitude ?? view.lat, cssWidth);
+        const showMinorAirports =
+            computeZoomPercent(view.zoom, hitTestMin, hitTestEffectiveMax) >= LOCAL_DETAIL_MIN_ZOOM_PERCENT;
+        const candidates = computeVisibleAirports(
+            airportsRef.current,
+            view,
+            tileZoom,
+            centerWorldPx,
+            scaleFactor,
+            cssWidth,
+            cssHeight,
+            selectedAirportIdentRef.current,
+            showMinorAirports
+        );
+        let closest: AirportPoint | null = null;
+        let closestDistance = 14;
+        for (const airport of candidates) {
+            const world = projectToWorldPixel(airport.lat, wrapLonNear(airport.lon, view.lon), tileZoom);
+            const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
+            const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
+            const distance = Math.hypot(x - localX, y - localY);
+            if (distance < closestDistance) {
+                closestDistance = distance;
+                closest = airport;
+            }
+        }
+        return closest;
+    }
+
+    function hitTestOverlayZones(
+        localX: number,
+        localY: number
+    ): { tfrs: TfrPolygon[]; gairmets: GairmetZone[]; pireps: PirepReport[] } {
+        const canvas = canvasRef.current;
+        if (!canvas) return { tfrs: [], gairmets: [], pireps: [] };
+        const cssWidth = canvas.clientWidth;
+        const cssHeight = canvas.clientHeight;
+        const view = viewRef.current;
+        const tileZoom = Math.max(0, Math.min(RADAR_BASEMAP_MAX_ZOOM, Math.round(view.zoom)));
+        const scaleFactor = Math.pow(2, view.zoom - tileZoom);
+        const centerWorldPx = projectToWorldPixel(view.lat, view.lon, tileZoom);
+
+        // Ring points are shifted by one offset computed from the ring's own first point
+        // (not wrapped individually) so a ring near the antimeridian doesn't tear into a
+        // garbage shape when its vertices straddle the +/-360 rounding boundary.
+        const toScreen = (point: { lat: number; lon: number }, lonOffset: number) => {
+            const world = projectToWorldPixel(point.lat, point.lon + lonOffset, tileZoom);
+            return {
+                x: cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor,
+                y: cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor,
+            };
+        };
+        const ringOffset = (ring: { lat: number; lon: number }[]) =>
+            wrapLonNear(ring[0].lon, view.lon) - ring[0].lon;
+
+        const tfrs: TfrPolygon[] = [];
+        if (tfrVisible) {
+            for (const tfr of tfrPolygonsRef.current) {
+                const hit = tfr.rings.some(
+                    (ring) =>
+                        ring.length >= 3 &&
+                        pointInRing(localX, localY, ring.map((p) => toScreen(p, ringOffset(ring))))
+                );
+                if (hit) tfrs.push(tfr);
+            }
+        }
+
+        const gairmets: GairmetZone[] = [];
+        if (gairmetVisible) {
+            for (const zone of gairmetZonesRef.current) {
+                const offset = ringOffset(zone.ring);
+                if (
+                    zone.ring.length >= 3 &&
+                    pointInRing(localX, localY, zone.ring.map((p) => toScreen(p, offset)))
+                ) {
+                    gairmets.push(zone);
+                }
+            }
+        }
+        if (sigmetVisible) {
+            for (const zone of sigmetZonesRef.current) {
+                const offset = ringOffset(zone.ring);
+                if (
+                    zone.ring.length >= 3 &&
+                    pointInRing(localX, localY, zone.ring.map((p) => toScreen(p, offset)))
+                ) {
+                    gairmets.push(zone);
+                }
+            }
+        }
+
+        const pireps: PirepReport[] = [];
+        if (pirepVisible) {
+            for (const report of pirepsRef.current) {
+                const point = toScreen(report, wrapLonNear(report.lon, view.lon) - report.lon);
+                if (Math.hypot(point.x - localX, point.y - localY) < 10) {
+                    pireps.push(report);
+                }
+            }
+        }
+
+        return { tfrs, gairmets, pireps };
+    }
+
+    function handlePointerDown(event: PointerEvent<HTMLCanvasElement>) {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        try {
+            canvas.setPointerCapture(event.pointerId);
+        } catch {
+            // Ignore — some synthetic/edge-case pointer ids can't be captured.
+        }
+        activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        pointerDownScreenPosRef.current = { x: event.clientX, y: event.clientY };
+
+        if (activePointersRef.current.size === 1) {
+            lastPointerPosRef.current = { x: event.clientX, y: event.clientY };
+            pinchLastRef.current = null;
+        } else if (activePointersRef.current.size === 2) {
+            pinchLastRef.current = computePinchMetrics(
+                Array.from(activePointersRef.current.values())
+            );
+            lastPointerPosRef.current = null;
+        }
+    }
+
+    function handlePointerMove(event: PointerEvent<HTMLCanvasElement>) {
+        if (!activePointersRef.current.has(event.pointerId)) {
+            const canvas = canvasRef.current;
+            if (canvas) {
+                const rect = canvas.getBoundingClientRect();
+                const localX = event.clientX - rect.left;
+                const localY = event.clientY - rect.top;
+                const hit = hitTestAirport(localX, localY);
+                const nextIdent = hit?.ident ?? null;
+                if (hoveredAirportIdentRef.current !== nextIdent) {
+                    hoveredAirportIdentRef.current = nextIdent;
+                    scheduleDraw();
+                }
+
+                let overlayHit = false;
+                if (!zoneInfoPinnedRef.current) {
+                    const { tfrs, gairmets, pireps } = hitTestOverlayZones(localX, localY);
+                    if (tfrs.length > 0 || gairmets.length > 0 || pireps.length > 0) {
+                        overlayHit = true;
+                        setZoneInfo({ x: localX, y: localY, pinned: false, tfrs, gairmets, pireps });
+                    } else {
+                        setZoneInfo((current) => (current && !current.pinned ? null : current));
+                    }
+                }
+
+                canvas.style.cursor = hit || overlayHit ? "pointer" : "grab";
+            }
+            return;
+        }
+
+        activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        const points = Array.from(activePointersRef.current.values());
+
+        if (points.length === 1) {
+            const last = lastPointerPosRef.current;
+            lastPointerPosRef.current = points[0];
+            if (!last) return;
+            panByScreenDelta(points[0].x - last.x, points[0].y - last.y);
+            scheduleDraw();
+        } else if (points.length >= 2) {
+            const metrics = computePinchMetrics(points.slice(0, 2));
+            const last = pinchLastRef.current;
+            pinchLastRef.current = metrics;
+            if (!last) return;
+
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            const localX = metrics.mid.x - rect.left;
+            const localY = metrics.mid.y - rect.top;
+
+            panByScreenDelta(metrics.mid.x - last.mid.x, metrics.mid.y - last.mid.y);
+            const zoomDelta = Math.log2(metrics.distance / Math.max(1, last.distance));
+            applyZoomAtScreenPoint(localX, localY, viewRef.current.zoom + zoomDelta);
+            scheduleDraw();
+        }
+    }
+
+    function handlePointerUp(event: PointerEvent<HTMLCanvasElement>) {
+        const wasSinglePointer = activePointersRef.current.size === 1;
+        const downPos = pointerDownScreenPosRef.current;
+
+        activePointersRef.current.delete(event.pointerId);
+        const canvas = canvasRef.current;
+        if (canvas?.hasPointerCapture(event.pointerId)) {
+            canvas.releasePointerCapture(event.pointerId);
+        }
+
+        if (wasSinglePointer && downPos && canvas) {
+            const movedDistance = Math.hypot(event.clientX - downPos.x, event.clientY - downPos.y);
+            if (movedDistance < 6) {
+                const rect = canvas.getBoundingClientRect();
+                const localX = event.clientX - rect.left;
+                const localY = event.clientY - rect.top;
+                const hit = hitTestAirport(localX, localY);
+                if (hit) {
+                    const nextIdent = selectedAirportIdentRef.current === hit.ident ? null : hit.ident;
+                    selectedAirportIdentRef.current = nextIdent;
+                    setSelectedAirport(nextIdent ? hit : null);
+                    scheduleDraw();
+                }
+
+                // Checked regardless of the airport hit above — a PIREP (or TFR/hazard
+                // zone) can sit right on top of an airport marker, and both should stay
+                // reachable rather than the airport silently winning every click there.
+                const { tfrs, gairmets, pireps } = hitTestOverlayZones(localX, localY);
+                if (tfrs.length > 0 || gairmets.length > 0 || pireps.length > 0) {
+                    zoneInfoPinnedRef.current = true;
+                    setZoneInfo({ x: localX, y: localY, pinned: true, tfrs, gairmets, pireps });
+                } else if (zoneInfoPinnedRef.current) {
+                    zoneInfoPinnedRef.current = false;
+                    setZoneInfo(null);
+                }
+            }
+        }
+
+        if (activePointersRef.current.size === 1) {
+            lastPointerPosRef.current = Array.from(activePointersRef.current.values())[0] ?? null;
+            pinchLastRef.current = null;
+        } else if (activePointersRef.current.size === 0) {
+            lastPointerPosRef.current = null;
+            pinchLastRef.current = null;
+        }
+        pointerDownScreenPosRef.current = null;
+    }
+
+    function handlePointerLeave() {
+        if (hoveredAirportIdentRef.current !== null) {
+            hoveredAirportIdentRef.current = null;
+            scheduleDraw();
+        }
+        if (!zoneInfoPinnedRef.current) {
+            setZoneInfo(null);
+        }
+    }
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        function stepWheelZoom() {
+            wheelZoomAnimRef.current = null;
+            const target = wheelZoomTargetRef.current;
+            if (target === null) return;
+            const anchor = wheelZoomAnchorRef.current;
+            const current = viewRef.current.zoom;
+            const diff = target - current;
+            if (Math.abs(diff) < 0.001) {
+                applyZoomAtScreenPoint(anchor.x, anchor.y, target);
+                wheelZoomTargetRef.current = null;
+            } else {
+                applyZoomAtScreenPoint(anchor.x, anchor.y, current + diff * RADAR_WHEEL_ZOOM_EASE);
+                wheelZoomAnimRef.current = requestAnimationFrame(stepWheelZoom);
+            }
+            scheduleDraw();
+        }
+
+        function onWheelNative(event: WheelEvent) {
+            // React's synthetic onWheel is attached passively and can't preventDefault
+            // (it would just log a console warning), so this listener is wired natively.
+            event.preventDefault();
+            const rect = canvas!.getBoundingClientRect();
+            wheelZoomAnchorRef.current = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+            // Every wheel event nudges a target zoom (uncapped in how often it can move — always
+            // continuous, never snapped to a fixed step). A separate animation loop glides the
+            // actual view toward that target once per frame, so rendering stays smooth even if the
+            // browser ends up delivering wheel events in irregular or coalesced bursts.
+            const view = viewRef.current;
+            const { min, max } = zoomRangeRef.current;
+            const effectiveMax = computeEffectiveMaxZoom(max, view.lat, canvas!.clientWidth);
+            const base = wheelZoomTargetRef.current ?? view.zoom;
+            const zoomDelta = -event.deltaY * RADAR_WHEEL_ZOOM_SENSITIVITY;
+            wheelZoomTargetRef.current = Math.max(min, Math.min(effectiveMax, base + zoomDelta));
+            if (wheelZoomAnimRef.current === null) {
+                wheelZoomAnimRef.current = requestAnimationFrame(stepWheelZoom);
+            }
+        }
+
+        canvas.addEventListener("wheel", onWheelNative, { passive: false });
+        return () => {
+            canvas.removeEventListener("wheel", onWheelNative);
+            if (wheelZoomAnimRef.current !== null) cancelAnimationFrame(wheelZoomAnimRef.current);
+            wheelZoomAnimRef.current = null;
+            wheelZoomTargetRef.current = null;
+        };
+    }, [applyZoomAtScreenPoint, scheduleDraw]);
+
+    useEffect(() => {
+        if (!airportSearchOpen) return;
+
+        function handlePointerDownOutside(event: globalThis.PointerEvent) {
+            if (!airportSearchContainerRef.current?.contains(event.target as Node)) {
+                setAirportSearchOpen(false);
+                setAirportSearchQuery("");
+                setAirportSearchError(null);
+            }
+        }
+
+        document.addEventListener("pointerdown", handlePointerDownOutside);
+        return () => document.removeEventListener("pointerdown", handlePointerDownOutside);
+    }, [airportSearchOpen]);
+
+    const drawFrame = () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const cssWidth = canvas.clientWidth;
+        const cssHeight = canvas.clientHeight;
+        if (cssWidth === 0 || cssHeight === 0) return;
+
+        const pixelWidth = Math.round(cssWidth * dpr);
+        const pixelHeight = Math.round(cssHeight * dpr);
+        if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+            canvas.width = pixelWidth;
+            canvas.height = pixelHeight;
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.fillStyle = "#18181b";
+        ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+        const view = viewRef.current;
+        const { min: zoomRangeMin, max: zoomRangeMax } = zoomRangeRef.current;
+        const effectiveMaxZoom = computeEffectiveMaxZoom(zoomRangeMax, view.lat, cssWidth);
+        const zoomPercent = computeZoomPercent(view.zoom, zoomRangeMin, effectiveMaxZoom);
+        // The airport/airspace LOD threshold uses the station's fixed latitude, not the current
+        // view's — effectiveMaxZoom depends on latitude (Mercator distortion), so keying it to
+        // view.lat meant panning north/south at an unchanged zoom level could nudge the percent
+        // across the threshold on its own, making minor airports flicker in and out mid-pan.
+        const lodEffectiveMaxZoom = computeEffectiveMaxZoom(zoomRangeMax, latitude ?? view.lat, cssWidth);
+        const lodZoomPercent = computeZoomPercent(view.zoom, zoomRangeMin, lodEffectiveMaxZoom);
+        const showMinorAirports = lodZoomPercent >= LOCAL_DETAIL_MIN_ZOOM_PERCENT;
+
+        const nowMs = performance.now();
+        if (nowMs - lastLocalDetailCheckRef.current > 200) {
+            lastLocalDetailCheckRef.current = nowMs;
+            maybeFetchLocalDetail();
+        }
+
+        const tileZoom = Math.max(0, Math.min(RADAR_BASEMAP_MAX_ZOOM, Math.round(view.zoom)));
+        const scaleFactor = Math.pow(2, view.zoom - tileZoom);
+        const centerWorldPx = projectToWorldPixel(view.lat, view.lon, tileZoom);
+
+        const halfWidthWorld = cssWidth / 2 / scaleFactor;
+        const halfHeightWorld = cssHeight / 2 / scaleFactor;
+        const minTileX = Math.floor((centerWorldPx.x - halfWidthWorld) / MAP_TILE_SIZE) - 1;
+        const maxTileX = Math.floor((centerWorldPx.x + halfWidthWorld) / MAP_TILE_SIZE) + 1;
+        const minTileY = Math.floor((centerWorldPx.y - halfHeightWorld) / MAP_TILE_SIZE) - 1;
+        const maxTileY = Math.floor((centerWorldPx.y + halfHeightWorld) / MAP_TILE_SIZE) + 1;
+        const tileCountAtZoom = Math.pow(2, tileZoom);
+
+        for (let tx = minTileX; tx <= maxTileX; tx++) {
+            for (let ty = minTileY; ty <= maxTileY; ty++) {
+                if (ty < 0 || ty >= tileCountAtZoom) continue;
+                const wrappedX = ((tx % tileCountAtZoom) + tileCountAtZoom) % tileCountAtZoom;
+                const key = `${tileZoom}/${wrappedX}/${ty}`;
+                let img = tileCacheRef.current.get(key);
+                if (!img) {
+                    img = new window.Image();
+                    img.src = RADAR_BASEMAP_TILE_URL.replace("{z}", String(tileZoom))
+                        .replace("{y}", String(ty))
+                        .replace("{x}", String(wrappedX));
+                    img.onload = () => scheduleDraw();
+                    tileCacheRef.current.set(key, img);
+                }
+                if (img.complete && img.naturalWidth > 0) {
+                    const screenX = cssWidth / 2 + (tx * MAP_TILE_SIZE - centerWorldPx.x) * scaleFactor;
+                    const screenY = cssHeight / 2 + (ty * MAP_TILE_SIZE - centerWorldPx.y) * scaleFactor;
+                    const size = MAP_TILE_SIZE * scaleFactor;
+                    ctx.drawImage(img, screenX, screenY, size, size);
+                }
+            }
+        }
+
+        const radarImg = radarFrameImagesRef.current[currentFrameIndex] ?? null;
+        const radarBounds = radarBoundsRef.current;
+        if (radarImg && radarBounds && radarVisible && radarImg.complete && radarImg.naturalWidth > 0) {
+            const radarLonOffset = wrapLonNear(radarBounds.west, view.lon) - radarBounds.west;
+            const topLeftWorld = projectToWorldPixel(radarBounds.north, radarBounds.west + radarLonOffset, tileZoom);
+            const bottomRightWorld = projectToWorldPixel(
+                radarBounds.south,
+                radarBounds.east + radarLonOffset,
+                tileZoom
+            );
+            const x0 = cssWidth / 2 + (topLeftWorld.x - centerWorldPx.x) * scaleFactor;
+            const y0 = cssHeight / 2 + (topLeftWorld.y - centerWorldPx.y) * scaleFactor;
+            const x1 = cssWidth / 2 + (bottomRightWorld.x - centerWorldPx.x) * scaleFactor;
+            const y1 = cssHeight / 2 + (bottomRightWorld.y - centerWorldPx.y) * scaleFactor;
+            ctx.drawImage(radarImg, x0, y0, x1 - x0, y1 - y0);
+        }
+
+        const satelliteImg = satelliteImageRef.current;
+        const satelliteBounds = satelliteBoundsRef.current;
+        if (
+            satelliteImg &&
+            satelliteBounds &&
+            satelliteVisible &&
+            satelliteImg.complete &&
+            satelliteImg.naturalWidth > 0
+        ) {
+            const satelliteLonOffset = wrapLonNear(satelliteBounds.west, view.lon) - satelliteBounds.west;
+            const topLeftWorld = projectToWorldPixel(
+                satelliteBounds.north,
+                satelliteBounds.west + satelliteLonOffset,
+                tileZoom
+            );
+            const bottomRightWorld = projectToWorldPixel(
+                satelliteBounds.south,
+                satelliteBounds.east + satelliteLonOffset,
+                tileZoom
+            );
+            const x0 = cssWidth / 2 + (topLeftWorld.x - centerWorldPx.x) * scaleFactor;
+            const y0 = cssHeight / 2 + (topLeftWorld.y - centerWorldPx.y) * scaleFactor;
+            const x1 = cssWidth / 2 + (bottomRightWorld.x - centerWorldPx.x) * scaleFactor;
+            const y1 = cssHeight / 2 + (bottomRightWorld.y - centerWorldPx.y) * scaleFactor;
+            ctx.drawImage(satelliteImg, x0, y0, x1 - x0, y1 - y0);
+        }
+
+        if (boundaryVisible) {
+            for (let tx = minTileX; tx <= maxTileX; tx++) {
+                for (let ty = minTileY; ty <= maxTileY; ty++) {
+                    if (ty < 0 || ty >= tileCountAtZoom) continue;
+                    const wrappedX = ((tx % tileCountAtZoom) + tileCountAtZoom) % tileCountAtZoom;
+                    const key = `${tileZoom}/${wrappedX}/${ty}`;
+                    let img = boundaryTileCacheRef.current.get(key);
+                    if (!img) {
+                        img = new window.Image();
+                        img.src = RADAR_BOUNDARY_TILE_URL.replace("{z}", String(tileZoom))
+                            .replace("{y}", String(ty))
+                            .replace("{x}", String(wrappedX));
+                        img.onload = () => scheduleDraw();
+                        boundaryTileCacheRef.current.set(key, img);
+                    }
+                    if (img.complete && img.naturalWidth > 0) {
+                        const screenX = cssWidth / 2 + (tx * MAP_TILE_SIZE - centerWorldPx.x) * scaleFactor;
+                        const screenY = cssHeight / 2 + (ty * MAP_TILE_SIZE - centerWorldPx.y) * scaleFactor;
+                        const size = MAP_TILE_SIZE * scaleFactor;
+                        ctx.drawImage(img, screenX, screenY, size, size);
+                    }
+                }
+            }
+        }
+
+        const drawHazardZones = (zones: GairmetZone[]) => {
+            for (const zone of zones) {
+                const style = GAIRMET_HAZARD_STYLES[zone.hazard];
+                if (!style || zone.ring.length < 3) continue;
+
+                // Wrapped once for the whole ring (not per-vertex) — wrapping each point
+                // independently can pick different +/-360 multiples for vertices that sit
+                // right at the rounding boundary, tearing the shape into a seam that
+                // stretches across the map.
+                const lonOffset = wrapLonNear(zone.ring[0].lon, view.lon) - zone.ring[0].lon;
+                const points = zone.ring.map((point) => {
+                    const world = projectToWorldPixel(point.lat, point.lon + lonOffset, tileZoom);
+                    return {
+                        x: cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor,
+                        y: cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor,
+                    };
+                });
+
+                ctx.beginPath();
+                ctx.moveTo(points[0].x, points[0].y);
+                for (let i = 1; i < points.length; i++) {
+                    ctx.lineTo(points[i].x, points[i].y);
+                }
+                ctx.closePath();
+                ctx.fillStyle = style.fill;
+                ctx.fill();
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = style.stroke;
+                ctx.stroke();
+            }
+        };
+
+        if (gairmetVisible) drawHazardZones(gairmetZonesRef.current);
+        if (sigmetVisible) drawHazardZones(sigmetZonesRef.current);
+
+        // Below LOCAL_DETAIL_MIN_ZOOM_PERCENT, skip drawing airspace shapes even if some are
+        // already loaded (from exploring a zoomed-in area earlier in the session) — a wide
+        // zoomed-out view showing every Class B/C/D ring visited so far would just be clutter.
+        if (airspaceVisible && showMinorAirports) {
+            for (const polygon of airspacePolygonsRef.current) {
+                const style = AIRSPACE_CLASS_STYLES[polygon.airspaceClass];
+                if (!style) continue;
+
+                for (const ring of polygon.rings) {
+                    if (ring.length < 3) continue;
+                    const lonOffset = wrapLonNear(ring[0].lon, view.lon) - ring[0].lon;
+                    const points = ring.map((point) => {
+                        const world = projectToWorldPixel(point.lat, point.lon + lonOffset, tileZoom);
+                        return {
+                            x: cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor,
+                            y: cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor,
+                        };
+                    });
+
+                    // Round off gentle bends (simplified circular radii) into smooth curves,
+                    // but keep real corners sharp — decided per vertex by its turn angle.
+                    const n = points.length;
+                    ctx.beginPath();
+                    ctx.moveTo(points[0].x, points[0].y);
+                    for (let i = 0; i < n; i++) {
+                        const prev = points[(i - 1 + n) % n];
+                        const current = points[i];
+                        const next = points[(i + 1) % n];
+                        const turnAngle = computeTurnAngleDeg(prev, current, next);
+                        if (turnAngle >= AIRSPACE_CORNER_ANGLE_DEG) {
+                            ctx.lineTo(current.x, current.y);
+                        } else {
+                            ctx.quadraticCurveTo(
+                                current.x,
+                                current.y,
+                                (current.x + next.x) / 2,
+                                (current.y + next.y) / 2
+                            );
+                        }
+                    }
+                    ctx.closePath();
+                    ctx.setLineDash(style.dash);
+                    ctx.lineWidth = style.width;
+                    ctx.strokeStyle = style.color;
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                }
+            }
+        }
+
+        if (tfrVisible) {
+            for (const tfr of tfrPolygonsRef.current) {
+                for (const ring of tfr.rings) {
+                    if (ring.length < 3) continue;
+                    const lonOffset = wrapLonNear(ring[0].lon, view.lon) - ring[0].lon;
+                    const points = ring.map((point) => {
+                        const world = projectToWorldPixel(point.lat, point.lon + lonOffset, tileZoom);
+                        return {
+                            x: cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor,
+                            y: cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor,
+                        };
+                    });
+
+                    ctx.beginPath();
+                    ctx.moveTo(points[0].x, points[0].y);
+                    for (let i = 1; i < points.length; i++) {
+                        ctx.lineTo(points[i].x, points[i].y);
+                    }
+                    ctx.closePath();
+                    ctx.fillStyle = TFR_STYLE.fill;
+                    ctx.fill();
+                    ctx.lineWidth = TFR_STYLE.width;
+                    ctx.strokeStyle = TFR_STYLE.stroke;
+                    ctx.stroke();
+                }
+            }
+        }
+
+        if (airspaceVisible) {
+            const selectedIdent = selectedAirportIdentRef.current;
+            let selectedAirport: AirportPoint | null = null;
+            const visibleAirports = computeVisibleAirports(
+                airportsRef.current,
+                view,
+                tileZoom,
+                centerWorldPx,
+                scaleFactor,
+                cssWidth,
+                cssHeight,
+                selectedIdent,
+                showMinorAirports
+            );
+
+            for (const airport of visibleAirports) {
+                const world = projectToWorldPixel(airport.lat, wrapLonNear(airport.lon, view.lon), tileZoom);
+                const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
+                const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
+                const isSelected = airport.ident === selectedIdent;
+                if (isSelected) selectedAirport = airport;
+
+                // Airports with a real flight category get the big, easy-to-read dot; an N/A
+                // (no METAR/no computable category) airport is only ever a minor supporting
+                // detail, so it stays small regardless of major/minor status.
+                const hasCategory = airport.flightCategory !== undefined;
+                const radius = isSelected ? 9 : hasCategory ? (airport.isMajor ? 8 : 6) : 4;
+                ctx.beginPath();
+                ctx.arc(x, y, radius, 0, Math.PI * 2);
+                ctx.fillStyle = isSelected
+                    ? "#d6b35a"
+                    : FLIGHT_CATEGORY_MARKER_COLORS[airport.flightCategory ?? "UNKNOWN"];
+                ctx.fill();
+                // A light ring around every dot (not just the selected one) is what makes the
+                // fill color actually pop against a busy dark map instead of blending into it.
+                ctx.lineWidth = isSelected ? 2.5 : 1.5;
+                ctx.strokeStyle = isSelected ? "#ffffff" : "rgba(255, 255, 255, 0.75)";
+                ctx.stroke();
+
+                const showLabel = hoveredAirportIdentRef.current === airport.ident || isSelected;
+                if (showLabel) {
+                    ctx.font = "700 11px system-ui, sans-serif";
+                    ctx.textBaseline = "middle";
+                    ctx.lineWidth = 3;
+                    ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+                    ctx.strokeText(airport.ident, x + radius + 4, y);
+                    ctx.fillStyle = "#f4f4f5";
+                    ctx.fillText(airport.ident, x + radius + 4, y);
+                }
+            }
+
+            const stationMarkerPosition = stationMarkerPositionRef.current;
+            if (selectedAirport && stationMarkerPosition) {
+                const originWorld = projectToWorldPixel(
+                    stationMarkerPosition.lat,
+                    wrapLonNear(stationMarkerPosition.lon, view.lon),
+                    tileZoom
+                );
+                const originX = cssWidth / 2 + (originWorld.x - centerWorldPx.x) * scaleFactor;
+                const originY = cssHeight / 2 + (originWorld.y - centerWorldPx.y) * scaleFactor;
+                const destWorld = projectToWorldPixel(
+                    selectedAirport.lat,
+                    wrapLonNear(selectedAirport.lon, view.lon),
+                    tileZoom
+                );
+                const destX = cssWidth / 2 + (destWorld.x - centerWorldPx.x) * scaleFactor;
+                const destY = cssHeight / 2 + (destWorld.y - centerWorldPx.y) * scaleFactor;
+
+                ctx.beginPath();
+                ctx.moveTo(originX, originY);
+                ctx.lineTo(destX, destY);
+                ctx.setLineDash([2, 4]);
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = "rgba(230, 199, 111, 0.85)";
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+        }
+
+        if (pirepVisible) {
+            for (const report of pirepsRef.current) {
+                const world = projectToWorldPixel(report.lat, wrapLonNear(report.lon, view.lon), tileZoom);
+                const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
+                const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
+                drawAirplaneMarker(ctx, x, y, 14, PIREP_SEVERITY_COLORS[report.severity], report.isUrgent);
+            }
+        }
+
+        for (const runway of runways) {
+            const { endA, endB } = runway;
+            if (
+                endA.latitude === null ||
+                endA.longitude === null ||
+                endB.latitude === null ||
+                endB.longitude === null
+            ) {
+                continue;
+            }
+            const aWorld = projectToWorldPixel(endA.latitude, wrapLonNear(endA.longitude, view.lon), tileZoom);
+            const bWorld = projectToWorldPixel(endB.latitude, wrapLonNear(endB.longitude, view.lon), tileZoom);
+            const ax = cssWidth / 2 + (aWorld.x - centerWorldPx.x) * scaleFactor;
+            const ay = cssHeight / 2 + (aWorld.y - centerWorldPx.y) * scaleFactor;
+            const bx = cssWidth / 2 + (bWorld.x - centerWorldPx.x) * scaleFactor;
+            const by = cssHeight / 2 + (bWorld.y - centerWorldPx.y) * scaleFactor;
+            ctx.beginPath();
+            ctx.moveTo(ax, ay);
+            ctx.lineTo(bx, by);
+            ctx.lineCap = "round";
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = "#f4f4f5";
+            ctx.stroke();
+        }
+
+        if (stationMarkerPositionRef.current) {
+            const { lat: markerLat, lon: markerLon } = stationMarkerPositionRef.current;
+            const markerWorld = projectToWorldPixel(markerLat, wrapLonNear(markerLon, view.lon), tileZoom);
+            const mx = cssWidth / 2 + (markerWorld.x - centerWorldPx.x) * scaleFactor;
+            const my = cssHeight / 2 + (markerWorld.y - centerWorldPx.y) * scaleFactor;
+
+            ctx.beginPath();
+            ctx.arc(mx, my, 12, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(214, 179, 90, 0.2)";
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.arc(mx, my, 7, 0, Math.PI * 2);
+            ctx.fillStyle = "#d6b35a";
+            ctx.fill();
+            ctx.lineWidth = 2.5;
+            ctx.strokeStyle = "#ffffff";
+            ctx.stroke();
+
+            if (stationInfo?.station) {
+                ctx.font = "700 12px system-ui, sans-serif";
+                ctx.textBaseline = "middle";
+                ctx.lineWidth = 3;
+                ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+                ctx.strokeText(stationInfo.station, mx + 13, my);
+                ctx.fillStyle = "#f4f4f5";
+                ctx.fillText(stationInfo.station, mx + 13, my);
+            }
+        }
+
+        setDisplayZoomPercent((prev) => {
+            const next = effectiveMaxZoom > zoomRangeMin ? Math.round(zoomPercent) : null;
+            return prev === next ? prev : next;
+        });
+        setDisplayScale((prev) => {
+            const next = computeScaleForView(view, computeScaleTargetPx(cssWidth));
+            return prev && prev.nm === next.nm && prev.px === next.px ? prev : next;
+        });
+    };
+
+    useEffect(() => {
+        drawFrameRef.current = drawFrame;
+    });
+
+    useEffect(() => {
+        if (latitude === null || longitude === null || !containerRef.current) {
+            return;
+        }
+
+        let cancelled = false;
+        const center = { lat: latitude, lon: longitude };
+        const tileCache = tileCacheRef.current;
+        const boundaryTileCache = boundaryTileCacheRef.current;
+
+        setRadarFrameTimes([]);
+        setCurrentFrameIndex(0);
+        setRadarFrameGeneration(0);
+        setRadarError(null);
+        tileCache.clear();
+        boundaryTileCache.clear();
+        radarFrameImagesRef.current = [];
+        radarBoundsRef.current = null;
+        satelliteImageRef.current = null;
+        satelliteBoundsRef.current = null;
+        airspacePolygonsRef.current = [];
+        tfrPolygonsRef.current = [];
+        gairmetZonesRef.current = [];
+        sigmetZonesRef.current = [];
+        pirepsRef.current = [];
+        airportsRef.current = [];
+        stationMarkerPositionRef.current = center;
+        setStationMarkerPosition(center);
+        hoveredAirportIdentRef.current = null;
+        selectedAirportIdentRef.current = null;
+        setSelectedAirport(null);
+        zoneInfoPinnedRef.current = false;
+        setZoneInfo(null);
+        setAirportSearchOpen(false);
+        setAirportSearchQuery("");
+        setAirportSearchError(null);
+
+        function recomputeZoomRange() {
+            const container = containerRef.current;
+            if (!container) return;
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+            if (width === 0 || height === 0) return;
+            const minZoom = computeBoundsZoom(GLOBAL_PAN_BOUNDS, width, height, "cover");
+            zoomRangeRef.current = { min: minZoom, max: RADAR_BASEMAP_MAX_ZOOM };
+            const clampedZoomView = {
+                ...viewRef.current,
+                zoom: Math.max(viewRef.current.zoom, minZoom),
+            };
+            viewRef.current = clampViewToMaxBounds(clampedZoomView, PAN_CLAMP_BOUNDS, width, height);
+            scheduleDraw();
+        }
+
+        const container = containerRef.current;
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+        // Airspace/airport ArcGIS queries error out (reported as a CORS failure) past roughly
+        // this size, so their initial fetch — and every later viewport-driven refetch as the
+        // user pans — stays capped at this radius. Radar/satellite imagery has no such limit
+        // (it's a single raster, not a feature query), so those use imageryBounds instead —
+        // nationwide from the start rather than clipped to the station.
+        const maxZoomOutBounds = boundsForDiameterMeters(center, RADAR_MAX_RADIUS_NM * NM_TO_METERS * 2);
+        const imageryBounds = AMERICAS_BOUNDS;
+        const minZoom =
+            width > 0 && height > 0 ? computeBoundsZoom(GLOBAL_PAN_BOUNDS, width, height, "cover") : 2;
+        const defaultMaxZoom =
+            width > 0 ? computeEffectiveMaxZoom(RADAR_BASEMAP_MAX_ZOOM, center.lat, width) : RADAR_BASEMAP_MAX_ZOOM;
+        const defaultZoom = minZoom + RADAR_DEFAULT_ZOOM_PERCENT * (defaultMaxZoom - minZoom);
+
+        maxBoundsRef.current = PAN_CLAMP_BOUNDS;
+        viewRef.current = {
+            lat: center.lat,
+            lon: center.lon,
+            zoom: Math.min(Math.max(defaultZoom, minZoom), RADAR_BASEMAP_MAX_ZOOM),
+        };
+        zoomRangeRef.current = { min: minZoom, max: RADAR_BASEMAP_MAX_ZOOM };
+        scheduleDraw();
+
+        const resizeObserver = new ResizeObserver(() => recomputeZoomRange());
+        resizeObserver.observe(container);
+
+        const useAnimatedRadar = isWithinConusRadarCoverage(center.lat, center.lon);
+        const radarLayer = useAnimatedRadar ? RADAR_WMS_LAYER : RADAR_WMS_REGIONS_LAYER;
+        const satelliteAvailable = isWithinSatelliteCoverage(center.lat, center.lon);
+
+        // The loading screen is only shown for the very first load of a station — steps: radar,
+        // satellite (if this location has coverage), the hazards/local-area bundle, one per
+        // nationwide zone, and flight categories. Background refreshes (resync intervals, the
+        // periodic nationwide reload) update silently and never touch this state.
+        let radarLoadStepsCompleted = 0;
+        const radarLoadTotalSteps =
+            1 + (satelliteAvailable ? 1 : 0) + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS + 1;
+        setRadarLoadProgress({
+            ready: false,
+            completed: 0,
+            total: radarLoadTotalSteps,
+            label: "Loading radar imagery…",
+        });
+        function reportRadarLoadStep(label: string) {
+            radarLoadStepsCompleted += 1;
+            setRadarLoadProgress({
+                ready: radarLoadStepsCompleted >= radarLoadTotalSteps,
+                completed: radarLoadStepsCompleted,
+                total: radarLoadTotalSteps,
+                label,
+            });
+        }
+
+        const loadRadarFrames = async () => {
+            try {
+                // Outside CONUS (Alaska, Hawaii, Caribbean, Guam) there's no time-series
+                // API to query — just fetch the one current mosaic frame for that layer.
+                const frameTimes = useAnimatedRadar
+                    ? selectRadarAnimationFrames(await fetchRadarTimeExtent())
+                    : [new Date()];
+                if (frameTimes.length === 0) throw new Error("No radar frames available.");
+
+                const objectUrls = await Promise.all(
+                    frameTimes.map((frameTime) =>
+                        fetchRecoloredRadarOverlay(
+                            imageryBounds,
+                            useAnimatedRadar ? frameTime.toISOString() : undefined,
+                            radarLayer
+                        )
+                    )
+                );
+
+                if (cancelled) {
+                    objectUrls.forEach((url) => URL.revokeObjectURL(url));
+                    return;
+                }
+
+                const images = await Promise.all(
+                    objectUrls.map(
+                        (url) =>
+                            new Promise<HTMLImageElement>((resolve, reject) => {
+                                const img = new window.Image();
+                                img.onload = () => resolve(img);
+                                img.onerror = () => reject(new Error("Failed to load radar frame."));
+                                img.src = url;
+                            })
+                    )
+                );
+
+                if (cancelled) {
+                    objectUrls.forEach((url) => URL.revokeObjectURL(url));
+                    return;
+                }
+
+                const previousObjectUrls = radarObjectUrlsRef.current;
+                radarObjectUrlsRef.current = objectUrls;
+                radarBoundsRef.current = imageryBounds;
+                radarFrameImagesRef.current = images;
+                previousObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+
+                setRadarFrameTimes(frameTimes);
+                setCurrentFrameIndex(frameTimes.length - 1);
+                setRadarFrameGeneration((generation) => generation + 1);
+                setRadarError(null);
+                scheduleDraw();
+            } catch {
+                if (!cancelled) {
+                    setRadarError("Live radar imagery is unavailable right now.");
+                }
+            }
+        };
+
+        loadRadarFrames().then(() => reportRadarLoadStep("Loading radar imagery"));
+        const radarResyncId = window.setInterval(loadRadarFrames, RADAR_RESYNC_INTERVAL_MS);
+
+        // Outside the source layer's own extent it doesn't return blank — it returns a
+        // solid white rectangle that would paper over the whole map — so this is gated
+        // on real coverage rather than just always fetching like the radar/hazard layers.
+        setSatelliteCoverageAvailable(satelliteAvailable);
+        if (!satelliteAvailable) {
+            setSatelliteVisible(false);
+        }
+
+        const loadSatelliteImage = (): Promise<void> => {
+            // The source's own real extent (SATELLITE_CONUS_BOUNDS) rather than imageryBounds —
+            // it doesn't cover Alaska/Hawaii/the Caribbean, so requesting the wider box would
+            // just waste resolution on area with no data to show.
+            const bounds = SATELLITE_CONUS_BOUNDS;
+            const lonSpan = bounds.east - bounds.west;
+            const latSpan = bounds.north - bounds.south;
+            const aspect = lonSpan / latSpan;
+            const width = aspect >= 1 ? RADAR_IMAGE_MAX_PX : Math.round(RADAR_IMAGE_MAX_PX * aspect);
+            const height = aspect >= 1 ? Math.round(RADAR_IMAGE_MAX_PX / aspect) : RADAR_IMAGE_MAX_PX;
+
+            return new Promise((resolve) => {
+                const img = new window.Image();
+                img.onload = () => {
+                    if (!cancelled) {
+                        satelliteImageRef.current = img;
+                        satelliteBoundsRef.current = bounds;
+                        scheduleDraw();
+                    }
+                    resolve();
+                };
+                img.onerror = () => resolve();
+                img.src = buildSatelliteWmsUrl(bounds, width, height);
+            });
+        };
+
+        let satelliteResyncId: number | undefined;
+        if (satelliteAvailable) {
+            loadSatelliteImage().then(() => reportRadarLoadStep("Loading satellite imagery"));
+            satelliteResyncId = window.setInterval(loadSatelliteImage, SATELLITE_RESYNC_INTERVAL_MS);
+        }
+
+        (async () => {
+            try {
+                const [
+                    polygons,
+                    tfrs,
+                    gairmetZones,
+                    isigmetZones,
+                    airsigmetZones,
+                    pireps,
+                    localAirports,
+                    majorAirports,
+                    flightCategories,
+                ] = await Promise.all([
+                    // Kept at the local radius, not AMERICAS_BOUNDS — a nationwide query
+                    // for these polygon shapes (far more vertices than a point layer)
+                    // errors out on the ArcGIS side, which the browser reports as a CORS
+                    // failure. Class B/C/D airspace is also most relevant near the
+                    // station anyway, so this isn't a real loss of "all the data".
+                    fetchAirspacePolygons(maxZoomOutBounds).catch(() => [] as AirspacePolygon[]),
+                    fetchTfrPolygons(AMERICAS_BOUNDS).catch(() => [] as TfrPolygon[]),
+                    fetchGairmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
+                    fetchIsigmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
+                    fetchAirsigmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
+                    fetchPirepReports(AMERICAS_BOUNDS).catch(() => [] as PirepReport[]),
+                    fetchAirports(maxZoomOutBounds).catch(() => [] as AirportPoint[]),
+                    // Nationwide, but filtered to airports with a published instrument
+                    // approach — keeps the result well under the ArcGIS service's 1000-
+                    // record cap and is what makes "major airports everywhere" possible
+                    // without flooding the map (or the shared API quota) with every
+                    // grass strip in the country. Failure here just means minor-only
+                    // coverage outside the local radius, not a broken map.
+                    fetchAirports(AMERICAS_BOUNDS, true).catch(() => [] as AirportPoint[]),
+                    fetchAirportFlightCategories(AMERICAS_BOUNDS).catch(
+                        () => new Map<string, FlightCategory>()
+                    ),
+                ]);
+                if (cancelled) return;
+                airspacePolygonsRef.current = polygons;
+                tfrPolygonsRef.current = tfrs;
+                gairmetZonesRef.current = gairmetZones;
+                sigmetZonesRef.current = [...isigmetZones, ...airsigmetZones];
+                pirepsRef.current = pireps;
+
+                const mainStationEntry = localAirports.find(
+                    (airport) => resolveMetarStationKey(airport) === stationInfo?.station
+                );
+                if (mainStationEntry) {
+                    const correctedPosition = { lat: mainStationEntry.lat, lon: mainStationEntry.lon };
+                    stationMarkerPositionRef.current = correctedPosition;
+                    setStationMarkerPosition(correctedPosition);
+                }
+
+                // Local (full detail, within the station's data radius) and nationwide
+                // majors overlap near the station — merge by ident, preferring the local
+                // copy since it's the fresher/more complete of the two.
+                const merged = new Map<string, AirportPoint>();
+                for (const airport of majorAirports) merged.set(airport.ident, airport);
+                for (const airport of localAirports) merged.set(airport.ident, airport);
+
+                airportsRef.current = Array.from(merged.values())
+                    .filter((airport) => resolveMetarStationKey(airport) !== stationInfo?.station)
+                    .map((airport) => {
+                        const key = resolveMetarStationKey(airport);
+                        const flightCategory = key ? flightCategories.get(key) : undefined;
+                        return flightCategory ? { ...airport, flightCategory } : airport;
+                    });
+                // The station's own local fetch already covers this radius — seed coverage with
+                // it so the reactive fetcher doesn't immediately redo the same request on the
+                // first frame.
+                localDetailCoverageBoundsRef.current = maxZoomOutBounds;
+                scheduleDraw();
+            } catch {
+                // Airspace/airport data is supplementary — fail silently and keep the radar working.
+            } finally {
+                reportRadarLoadStep("Loading local area");
+            }
+        })();
+
+        // Runs alongside (not after) the fetch above — full nationwide airport + airspace detail,
+        // tiled to stay under the ArcGIS per-request cap, so the rest of the country is populated
+        // within a few seconds of load rather than only filling in reactively as panned to. Repeats
+        // periodically to keep flight-category colors current.
+        const nationwideController = new AbortController();
+        nationwideAbortRef.current = nationwideController;
+
+        const loadNationwideDetail = async (isInitial: boolean) => {
+            try {
+                const [{ airports: tiledAirports, polygons: tiledPolygons }, flightCategories] =
+                    await Promise.all([
+                        loadNationwideAirportsAndAirspace(
+                            nationwideController.signal,
+                            isInitial
+                                ? (zoneIndex, zoneCount) =>
+                                      reportRadarLoadStep(`Loading zone ${zoneIndex + 1} of ${zoneCount}`)
+                                : undefined
+                        ),
+                        fetchAirportFlightCategories(AMERICAS_BOUNDS).catch(
+                            () => new Map<string, FlightCategory>()
+                        ),
+                    ]);
+                if (isInitial) reportRadarLoadStep("Loading flight categories");
+                if (cancelled || nationwideController.signal.aborted) return;
+
+                const mergedAirports = new Map<string, AirportPoint>();
+                for (const airport of airportsRef.current) mergedAirports.set(airport.ident, airport);
+                for (const airport of tiledAirports) {
+                    if (resolveMetarStationKey(airport) === stationInfo?.station) continue;
+                    const key = resolveMetarStationKey(airport);
+                    const flightCategory = key ? flightCategories.get(key) : undefined;
+                    mergedAirports.set(
+                        airport.ident,
+                        flightCategory ? { ...airport, flightCategory } : airport
+                    );
+                }
+                airportsRef.current = Array.from(mergedAirports.values());
+
+                const polygonKey = (polygon: AirspacePolygon) =>
+                    `${polygon.airspaceClass}|${polygon.name}|${polygon.rings[0]?.[0]?.lat}|${polygon.rings[0]?.[0]?.lon}`;
+                const existingPolygonKeys = new Set(airspacePolygonsRef.current.map(polygonKey));
+                const mergedPolygons = airspacePolygonsRef.current.slice();
+                for (const polygon of tiledPolygons) {
+                    const key = polygonKey(polygon);
+                    if (!existingPolygonKeys.has(key)) {
+                        existingPolygonKeys.add(key);
+                        mergedPolygons.push(polygon);
+                    }
+                }
+                airspacePolygonsRef.current = mergedPolygons;
+
+                // The whole country is loaded now — the viewport-reactive fetcher (kept around as
+                // a fallback for anything a tile happened to truncate) has nothing left to add
+                // anywhere inside this box.
+                localDetailCoverageBoundsRef.current = AMERICAS_BOUNDS;
+                scheduleDraw();
+            } catch {
+                // Supplementary — a failed refresh just leaves the previous data in place. On the
+                // initial load, force the gate open anyway rather than leaving the loading screen
+                // stuck if some step's progress ticks never fired.
+                if (isInitial) setRadarLoadProgress((prev) => ({ ...prev, ready: true }));
+            }
+        };
+
+        loadNationwideDetail(true);
+        const nationwideRefreshId = window.setInterval(
+            () => loadNationwideDetail(false),
+            NATIONWIDE_REFRESH_INTERVAL_MS
+        );
+
+        return () => {
+            cancelled = true;
+            resizeObserver.disconnect();
+            window.clearInterval(radarResyncId);
+            window.clearInterval(satelliteResyncId);
+            window.clearInterval(nationwideRefreshId);
+            nationwideAbortRef.current?.abort();
+            nationwideAbortRef.current = null;
+            radarObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+            radarObjectUrlsRef.current = [];
+            radarFrameImagesRef.current = [];
+            radarBoundsRef.current = null;
+            satelliteImageRef.current = null;
+            satelliteBoundsRef.current = null;
+            tileCache.clear();
+            boundaryTileCache.clear();
+            localDetailCoverageBoundsRef.current = null;
+            if (localDetailDebounceRef.current !== null) {
+                window.clearTimeout(localDetailDebounceRef.current);
+                localDetailDebounceRef.current = null;
+            }
+            localDetailAbortRef.current?.abort();
+            localDetailAbortRef.current = null;
+        };
+    }, [latitude, longitude, scheduleDraw, stationInfo?.station]);
+
+    useEffect(() => {
+        scheduleDraw();
+        // currentFrameIndex is included so the redraw is scheduled from *this* effect —
+        // which runs after the drawFrameRef reassignment effect above — rather than from
+        // inside the animation timer's setTimeout, where requestAnimationFrame could fire
+        // before React re-renders and the canvas would paint one frame behind the dot.
+    }, [
+        radarVisible,
+        satelliteVisible,
+        airspaceVisible,
+        tfrVisible,
+        gairmetVisible,
+        sigmetVisible,
+        pirepVisible,
+        boundaryVisible,
+        currentFrameIndex,
+        scheduleDraw,
+    ]);
+
+    useEffect(() => {
+        if (radarFrameTimes.length < 2) return;
+        let cancelled = false;
+        let timeoutId: number;
+
+        const tick = (index: number) => {
+            const isLastFrame = index === radarFrameTimes.length - 1;
+            const delay = isLastFrame ? RADAR_ANIMATION_LAST_FRAME_HOLD_MS : RADAR_ANIMATION_FRAME_MS;
+            timeoutId = window.setTimeout(() => {
+                if (cancelled) return;
+                const next = (index + 1) % radarFrameTimes.length;
+                setCurrentFrameIndex(next);
+                tick(next);
+            }, delay);
+        };
+
+        tick(radarFrameTimes.length - 1);
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timeoutId);
+        };
+        // Keyed on radarFrameGeneration (not currentFrameIndex) so every resync — even
+        // when the frame count is unchanged — restarts the loop cleanly from the newest frame.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [radarFrameGeneration, scheduleDraw]);
+
+    useEffect(() => {
+        if (!isRadarFullscreen) return;
+
+        const frame = window.requestAnimationFrame(() => {
+            void radarBubbleRef.current?.requestFullscreen?.().catch(() => {
+                // Browser fullscreen can fail if blocked, but the expanded layout still applies.
+            });
+        });
+
+        function handleFullscreenChange() {
+            if (!document.fullscreenElement) {
+                setIsRadarFullscreen(false);
+            }
+        }
+
+        document.addEventListener("fullscreenchange", handleFullscreenChange);
+
+        return () => {
+            window.cancelAnimationFrame(frame);
+            document.removeEventListener("fullscreenchange", handleFullscreenChange);
+        };
+    }, [isRadarFullscreen]);
+
+    async function toggleRadarFullscreen() {
+        if (isRadarFullscreen) {
+            if (document.fullscreenElement) {
+                await document.exitFullscreen().catch(() => {});
+            }
+            setIsRadarFullscreen(false);
+            return;
+        }
+        setIsRadarFullscreen(true);
+    }
+
+    if (latitude === null || longitude === null) {
+        return (
+            <div className="rounded-2xl border border-zinc-800 bg-black/55 p-6">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                    Radar
+                </p>
+                <p className="mt-3 text-sm text-zinc-400">
+                    Radar is unavailable without station coordinates.
+                </p>
+            </div>
+        );
+    }
+
+    const latestRadarTime = radarFrameTimes[radarFrameTimes.length - 1] ?? null;
+
+    const legendCards = (
+        <>
+            {gairmetVisible && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="mb-0.5 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        G-AIRMET
+                    </p>
+                    <div className="space-y-0.5">
+                        {GAIRMET_LEGEND_ENTRIES.map(([key, label]) => (
+                            <div key={key} className="flex items-center gap-1">
+                                <span
+                                    className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                    style={{ background: GAIRMET_HAZARD_STYLES[key].stroke }}
+                                />
+                                <span className="whitespace-nowrap text-[9px] text-zinc-300">
+                                    {label}
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+            {sigmetVisible && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="mb-0.5 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        SIGMET
+                    </p>
+                    <div className="space-y-0.5">
+                        {SIGMET_LEGEND_ENTRIES.map(([key, label]) => (
+                            <div key={key} className="flex items-center gap-1">
+                                <span
+                                    className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                    style={{ background: GAIRMET_HAZARD_STYLES[key].stroke }}
+                                />
+                                <span className="whitespace-nowrap text-[9px] text-zinc-300">
+                                    {label}
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+            {pirepVisible && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="mb-0.5 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        PIREPs
+                    </p>
+                    <div className="space-y-0.5">
+                        {PIREP_LEGEND_ENTRIES.map(([key, label]) => (
+                            <div key={key} className="flex items-center gap-1">
+                                <span
+                                    className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                    style={{ background: PIREP_SEVERITY_COLORS[key] }}
+                                />
+                                <span className="whitespace-nowrap text-[9px] text-zinc-300">
+                                    {label}
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+            {radarVisible && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Precip
+                    </p>
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Heavy
+                    </p>
+                    <div
+                        className="mx-auto mt-1 h-20 w-2 rounded-full"
+                        style={{ background: RADAR_LEGEND_GRADIENT }}
+                    />
+                    <p className="mt-1 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Light
+                    </p>
+                </div>
+            )}
+            {satelliteVisible && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Satellite
+                    </p>
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Cold
+                    </p>
+                    <div
+                        className="mx-auto mt-1 h-20 w-2 rounded-full"
+                        style={{ background: SATELLITE_LEGEND_GRADIENT }}
+                    />
+                    <p className="mt-1 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Warm
+                    </p>
+                </div>
+            )}
+        </>
+    );
+
+    return (
+        <div
+            ref={radarBubbleRef}
+            className={
+                isRadarFullscreen
+                    ? "fixed inset-0 z-50 flex h-screen w-screen flex-col overflow-y-auto bg-[#050505] p-4 text-zinc-100 sm:p-6"
+                    : "rounded-2xl border border-zinc-800 bg-black/55 p-6"
+            }
+        >
+            <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                        Radar
+                    </p>
+                    {isRadarFullscreen && stationInfo && (
+                        <p className="mt-1 truncate text-xl font-bold text-white sm:text-2xl">
+                            {stationInfo.displayName}
+                        </p>
+                    )}
+                </div>
+                {radarVisible && (
+                    <div className="flex flex-col items-end gap-1.5">
+                        <p className="whitespace-nowrap text-[11px] text-zinc-500">
+                            {radarError
+                                ? radarError
+                                : latestRadarTime
+                                    ? `Radar: ${formatFinePrintTime(latestRadarTime)}`
+                                    : "Loading radar…"}
+                        </p>
+                        {radarFrameTimes.length > 1 && (
+                            <div className={`flex items-center ${isRadarFullscreen ? "gap-2" : "gap-1.5"}`}>
+                                {radarFrameTimes.map((_, index) => (
+                                    <span
+                                        key={index}
+                                        className={`rounded-full transition ${
+                                            isRadarFullscreen ? "h-2.5 w-2.5" : "h-2 w-2"
+                                        } ${index === currentFrameIndex ? "bg-[#e6c76f]" : "bg-zinc-700"}`}
+                                    />
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            <div
+                ref={containerRef}
+                className={
+                    isRadarFullscreen
+                        ? "relative mt-5 min-h-0 w-full flex-1 overflow-hidden rounded-2xl border border-zinc-700"
+                        : "relative mt-5 h-[600px] w-full overflow-hidden rounded-2xl border border-zinc-700 sm:h-[720px]"
+                }
+            >
+                <canvas
+                    ref={canvasRef}
+                    className="absolute inset-0 h-full w-full cursor-grab"
+                    style={{ touchAction: "none" }}
+                    onPointerDown={handlePointerDown}
+                    onPointerMove={handlePointerMove}
+                    onPointerUp={handlePointerUp}
+                    onPointerCancel={handlePointerUp}
+                    onPointerLeave={handlePointerLeave}
+                />
+
+                {/* Covers the canvas/controls (which mount and start loading underneath
+                    immediately) until every first-load fetch reports done, so the bubble only
+                    ever appears once it's fully populated instead of drawing in piecemeal. */}
+                {!radarLoadProgress.ready && (
+                    <div className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-4 bg-[#0a0a0a] px-8 text-center">
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                            Radar
+                        </p>
+                        <div className="w-full max-w-xs">
+                            <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                                <div
+                                    className="h-full rounded-full bg-[#e6c76f] transition-[width] duration-300 ease-out"
+                                    style={{
+                                        width: `${Math.min(
+                                            100,
+                                            (radarLoadProgress.completed / radarLoadProgress.total) * 100
+                                        )}%`,
+                                    }}
+                                />
+                            </div>
+                        </div>
+                        <p className="text-sm font-medium text-zinc-300">{radarLoadProgress.label}</p>
+                        <p className="text-[11px] tabular-nums text-zinc-600">
+                            {radarLoadProgress.completed} / {radarLoadProgress.total}
+                        </p>
+                    </div>
+                )}
+
+                {selectedAirport ? (() => {
+                    const origin = stationMarkerPosition ?? { lat: latitude, lon: longitude };
+                    const { bearingDeg, distanceNm } = computeBearingDistance(
+                        origin,
+                        { lat: selectedAirport.lat, lon: selectedAirport.lon }
+                    );
+                    const magneticBearingDeg = trueToMagneticBearing(bearingDeg, origin);
+                    const category = selectedAirport.flightCategory ?? "UNKNOWN";
+                    const categoryLabel = category === "UNKNOWN" ? "N/A" : category;
+                    return (
+                        <div className="absolute left-2 top-2 z-10 w-[168px] rounded-xl border border-[#d6b35a]/60 bg-black/80 p-2.5 backdrop-blur-sm">
+                            <div className="flex items-start justify-between gap-2">
+                                <div>
+                                    <p className="text-sm font-black text-[#e6c76f]">
+                                        {selectedAirport.ident}
+                                    </p>
+                                    <p className="text-[10px] leading-tight text-zinc-400">
+                                        {selectedAirport.name}
+                                    </p>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                    <span
+                                        className="rounded px-1.5 py-0.5 text-[10px] font-bold"
+                                        style={{
+                                            color: FLIGHT_CATEGORY_MARKER_COLORS[category],
+                                            backgroundColor: `${FLIGHT_CATEGORY_MARKER_COLORS[category]}22`,
+                                        }}
+                                    >
+                                        {categoryLabel}
+                                    </span>
+                                    <button
+                                        type="button"
+                                        aria-label="Deselect airport"
+                                        onClick={() => {
+                                            selectedAirportIdentRef.current = null;
+                                            setSelectedAirport(null);
+                                            scheduleDraw();
+                                        }}
+                                        className="text-zinc-500 transition hover:text-zinc-200"
+                                    >
+                                        ×
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div className="mt-2 grid grid-cols-2 gap-2 text-center">
+                                <div>
+                                    <p className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">
+                                        Heading
+                                    </p>
+                                    <p className="text-sm font-bold text-zinc-100">
+                                        {String(Math.round(magneticBearingDeg) % 360).padStart(3, "0")}°M
+                                    </p>
+                                </div>
+                                <div>
+                                    <p className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">
+                                        Distance
+                                    </p>
+                                    <p className="text-sm font-bold text-zinc-100">
+                                        {distanceNm.toFixed(1)} nm
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })() : (
+                    <div ref={airportSearchContainerRef} className="absolute left-2 top-2 z-10">
+                        {!airportSearchOpen ? (
+                            <button
+                                type="button"
+                                title="Find airport"
+                                aria-label="Search for an airport to connect a flight path to"
+                                onClick={() => setAirportSearchOpen(true)}
+                                className="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-700 bg-black/70 text-zinc-300 backdrop-blur-sm transition hover:border-[#d6b35a]/60 hover:text-[#e6c76f]"
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-5 w-5"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                >
+                                    <circle cx="11" cy="11" r="7" />
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                                </svg>
+                            </button>
+                        ) : (
+                            <div className="w-[180px] rounded-xl border border-zinc-700 bg-black/80 p-2.5 backdrop-blur-sm">
+                                <div className="flex items-center gap-1.5">
+                                    <input
+                                        type="text"
+                                        autoFocus
+                                        value={airportSearchQuery}
+                                        onChange={(event) => {
+                                            setAirportSearchQuery(event.target.value.toUpperCase());
+                                            setAirportSearchError(null);
+                                        }}
+                                        onKeyDown={(event) => {
+                                            if (event.key === "Enter") handleAirportSearchSubmit();
+                                        }}
+                                        placeholder="ICAO code"
+                                        className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs font-semibold uppercase text-zinc-100 outline-none focus:border-[#d6b35a]/60"
+                                    />
+                                    <button
+                                        type="button"
+                                        aria-label="Search"
+                                        onClick={handleAirportSearchSubmit}
+                                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[#d6b35a]/50 text-[#e6c76f] transition hover:bg-zinc-900"
+                                    >
+                                        <svg
+                                            viewBox="0 0 24 24"
+                                            className="h-4 w-4"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            strokeWidth="2"
+                                            strokeLinecap="round"
+                                        >
+                                            <circle cx="11" cy="11" r="7" />
+                                            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                                        </svg>
+                                    </button>
+                                </div>
+                                {airportSearchError && (
+                                    <p className="mt-1.5 text-[11px] font-semibold text-red-400">
+                                        {airportSearchError}
+                                    </p>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                <button
+                    type="button"
+                    title={isRadarFullscreen ? "Exit fullscreen" : "Fullscreen"}
+                    aria-label={isRadarFullscreen ? "Exit fullscreen radar view" : "View radar in fullscreen"}
+                    onClick={() => void toggleRadarFullscreen()}
+                    className="group absolute right-2 top-2 z-10 hidden h-9 w-9 items-center justify-center rounded-xl border border-zinc-700 bg-black/70 text-zinc-400 backdrop-blur-sm transition hover:border-zinc-500 hover:text-zinc-200 sm:flex"
+                >
+                    <svg
+                        viewBox="0 0 24 24"
+                        className="h-5 w-5"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                    >
+                        {isRadarFullscreen ? (
+                            <>
+                                <path d="M4 14h6v6" />
+                                <path d="M20 10h-6V4" />
+                                <path d="M14 10l7-7" />
+                                <path d="M3 21l7-7" />
+                            </>
+                        ) : (
+                            <>
+                                <path d="M15 3h6v6" />
+                                <path d="M9 21H3v-6" />
+                                <path d="M21 3l-7 7" />
+                                <path d="M3 21l7-7" />
+                            </>
+                        )}
+                    </svg>
+                    <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                        {isRadarFullscreen ? "Exit fullscreen" : "Fullscreen"}
+                    </span>
+                </button>
+
+                <div className="absolute right-2 top-14 z-10 hidden flex-col gap-1.5 rounded-xl border border-zinc-700 bg-black/70 p-1.5 backdrop-blur-sm sm:flex">
+                    <div className="flex flex-col gap-1.5">
+                        <button
+                            type="button"
+                            title="Airspace"
+                            aria-label="Toggle airspace and airport overlay"
+                            aria-pressed={airspaceVisible}
+                            onClick={() => setAirspaceVisible((current) => !current)}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                airspaceVisible
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                            >
+                                <path d="M12 3l7 4v10l-7 4-7-4V7z" />
+                                <circle cx="12" cy="12" r="2.2" fill="currentColor" stroke="none" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                Airspace
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            title="Borders"
+                            aria-label="Toggle state and county border overlay"
+                            aria-pressed={boundaryVisible}
+                            onClick={() => setBoundaryVisible((current) => !current)}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                boundaryVisible
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                            >
+                                <rect x="4" y="4" width="16" height="16" rx="1" strokeDasharray="3 2.5" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                Borders
+                            </span>
+                        </button>
+                    </div>
+
+                    <div className="h-px w-full bg-zinc-700" />
+
+                    <div className="flex flex-col gap-1.5">
+                        <button
+                            type="button"
+                            title="TFRs"
+                            aria-label="Toggle temporary flight restriction overlay"
+                            aria-pressed={tfrVisible}
+                            onClick={() => setTfrVisible((current) => !current)}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                tfrVisible
+                                    ? "border-red-400 bg-red-400/20 text-red-300"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                                <line x1="12" y1="9" x2="12" y2="13" />
+                                <line x1="12" y1="17" x2="12.01" y2="17" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                TFRs
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            title="G-AIRMET"
+                            aria-label="Toggle G-AIRMET hazard overlay"
+                            aria-pressed={gairmetVisible}
+                            onClick={() => setGairmetVisible((current) => !current)}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                gairmetVisible
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M12 3.7 L21.3 20.3 L2.7 20.3 Z" />
+                                <line x1="12" y1="9.3" x2="12" y2="14.3" />
+                                <circle cx="12" cy="17.4" r="0.6" fill="currentColor" stroke="none" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                G-AIRMET
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            title="SIGMETs"
+                            aria-label="Toggle SIGMET hazard overlay"
+                            aria-pressed={sigmetVisible}
+                            onClick={() => setSigmetVisible((current) => !current)}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                sigmetVisible
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M12 3.7 L21.3 20.3 L2.7 20.3 Z" />
+                                <path
+                                    d="M13.1 8.6l-3.4 5.3h2.6l-1.3 4.3 4.5-5.9h-2.7z"
+                                    fill="currentColor"
+                                    stroke="none"
+                                />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                SIGMETs
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            title="PIREPs"
+                            aria-label="Toggle pilot report overlay"
+                            aria-pressed={pirepVisible}
+                            onClick={() => setPirepVisible((current) => !current)}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                pirepVisible
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg viewBox="0 0 24 24" className="h-5 w-5" fill="currentColor" stroke="none">
+                                <path d="M12 2 L14 9 L21 13 L21 15 L14 13 L14 18 L17 20 L17 21.5 L12 20.5 L7 21.5 L7 20 L10 18 L10 13 L3 15 L3 13 L10 9 Z" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                PIREPs
+                            </span>
+                        </button>
+                    </div>
+
+                    <div className="h-px w-full bg-zinc-700" />
+
+                    <div className="flex flex-col gap-1.5">
+                        <button
+                            type="button"
+                            title="Precipitation"
+                            aria-label="Show precipitation radar (swaps out satellite)"
+                            aria-pressed={radarVisible}
+                            onClick={togglePrecipitation}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                radarVisible
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M12 3.2c3 4.1 6 8.1 6 11.3a6 6 0 1 1-12 0c0-3.2 3-7.2 6-11.3z" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                Precipitation
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            title={satelliteCoverageAvailable ? "Satellite" : "Satellite (not available outside the continental US)"}
+                            aria-label="Show satellite imagery (swaps out precipitation)"
+                            aria-pressed={satelliteVisible}
+                            aria-disabled={!satelliteCoverageAvailable}
+                            onClick={toggleSatellite}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                !satelliteCoverageAvailable
+                                    ? "cursor-not-allowed border-zinc-800 text-zinc-700"
+                                    : satelliteVisible
+                                        ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <g transform="rotate(45 12 12)">
+                                    <rect x="2" y="10" width="4" height="4" rx="0.7" />
+                                    <line x1="6" y1="12" x2="9" y2="12" />
+                                    <rect x="9" y="9.5" width="6" height="5" rx="1" />
+                                    <line x1="15" y1="12" x2="18" y2="12" />
+                                    <rect x="18" y="10" width="4" height="4" rx="0.7" />
+                                    <line x1="15" y1="9.5" x2="17.5" y2="6" />
+                                    <circle cx="18.2" cy="5" r="0.9" fill="currentColor" stroke="none" />
+                                </g>
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                {satelliteCoverageAvailable ? "Satellite" : "Satellite unavailable here"}
+                            </span>
+                        </button>
+                    </div>
+                </div>
+
+                <div className="absolute right-2 top-2 z-20 sm:hidden">
+                    {mobileControlsOpen && (
+                        <div
+                            className="fixed inset-0 z-10"
+                            onClick={() => setMobileControlsOpen(false)}
+                        />
+                    )}
+                    <button
+                        type="button"
+                        aria-label="Open map layer controls"
+                        aria-expanded={mobileControlsOpen}
+                        onClick={() => setMobileControlsOpen((current) => !current)}
+                        className={`relative z-20 flex h-9 w-9 items-center justify-center rounded-xl border backdrop-blur-sm transition ${
+                            mobileControlsOpen
+                                ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                : "border-zinc-700 bg-black/70 text-zinc-300"
+                        }`}
+                    >
+                        <svg
+                            viewBox="0 0 24 24"
+                            className="h-5 w-5"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                            strokeLinecap="round"
+                        >
+                            <line x1="4" y1="7" x2="20" y2="7" />
+                            <line x1="4" y1="12" x2="20" y2="12" />
+                            <line x1="4" y1="17" x2="20" y2="17" />
+                        </svg>
+                    </button>
+
+                    {mobileControlsOpen && (
+                        <div className="absolute right-0 top-11 z-20 flex w-48 flex-col gap-1 rounded-xl border border-zinc-700 bg-black/90 p-2 shadow-xl backdrop-blur-sm">
+                            <button
+                                type="button"
+                                onClick={() => void toggleRadarFullscreen()}
+                                className="flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold text-zinc-300 transition hover:bg-zinc-800"
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    {isRadarFullscreen ? (
+                                        <>
+                                            <path d="M4 14h6v6" />
+                                            <path d="M20 10h-6V4" />
+                                            <path d="M14 10l7-7" />
+                                            <path d="M3 21l7-7" />
+                                        </>
+                                    ) : (
+                                        <>
+                                            <path d="M15 3h6v6" />
+                                            <path d="M9 21H3v-6" />
+                                            <path d="M21 3l-7 7" />
+                                            <path d="M3 21l7-7" />
+                                        </>
+                                    )}
+                                </svg>
+                                <span>{isRadarFullscreen ? "Exit fullscreen" : "Fullscreen"}</span>
+                            </button>
+
+                            <div className="my-1 h-px w-full bg-zinc-700" />
+
+                            <button
+                                type="button"
+                                onClick={() => setAirspaceVisible((current) => !current)}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    airspaceVisible
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                >
+                                    <path d="M12 3l7 4v10l-7 4-7-4V7z" />
+                                    <circle cx="12" cy="12" r="2.2" fill="currentColor" stroke="none" />
+                                </svg>
+                                <span>Airspace</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => setBoundaryVisible((current) => !current)}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    boundaryVisible
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                >
+                                    <rect x="4" y="4" width="16" height="16" rx="1" strokeDasharray="3 2.5" />
+                                </svg>
+                                <span>Borders</span>
+                            </button>
+
+                            <div className="my-1 h-px w-full bg-zinc-700" />
+
+                            <button
+                                type="button"
+                                onClick={() => setTfrVisible((current) => !current)}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    tfrVisible
+                                        ? "bg-red-400/20 text-red-300"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                                    <line x1="12" y1="9" x2="12" y2="13" />
+                                    <line x1="12" y1="17" x2="12.01" y2="17" />
+                                </svg>
+                                <span>TFRs</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => setGairmetVisible((current) => !current)}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    gairmetVisible
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <path d="M12 3.7 L21.3 20.3 L2.7 20.3 Z" />
+                                    <line x1="12" y1="9.3" x2="12" y2="14.3" />
+                                    <circle cx="12" cy="17.4" r="0.6" fill="currentColor" stroke="none" />
+                                </svg>
+                                <span>G-AIRMET</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => setSigmetVisible((current) => !current)}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    sigmetVisible
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <path d="M12 3.7 L21.3 20.3 L2.7 20.3 Z" />
+                                    <path
+                                        d="M13.1 8.6l-3.4 5.3h2.6l-1.3 4.3 4.5-5.9h-2.7z"
+                                        fill="currentColor"
+                                        stroke="none"
+                                    />
+                                </svg>
+                                <span>SIGMETs</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => setPirepVisible((current) => !current)}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    pirepVisible
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="currentColor" stroke="none">
+                                    <path d="M12 2 L14 9 L21 13 L21 15 L14 13 L14 18 L17 20 L17 21.5 L12 20.5 L7 21.5 L7 20 L10 18 L10 13 L3 15 L3 13 L10 9 Z" />
+                                </svg>
+                                <span>PIREPs</span>
+                            </button>
+
+                            <div className="my-1 h-px w-full bg-zinc-700" />
+
+                            <button
+                                type="button"
+                                onClick={togglePrecipitation}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    radarVisible
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <path d="M12 3.2c3 4.1 6 8.1 6 11.3a6 6 0 1 1-12 0c0-3.2 3-7.2 6-11.3z" />
+                                </svg>
+                                <span>Precipitation</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={toggleSatellite}
+                                aria-disabled={!satelliteCoverageAvailable}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    !satelliteCoverageAvailable
+                                        ? "cursor-not-allowed text-zinc-600"
+                                        : satelliteVisible
+                                            ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                            : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <g transform="rotate(45 12 12)">
+                                        <rect x="2" y="10" width="4" height="4" rx="0.7" />
+                                        <line x1="6" y1="12" x2="9" y2="12" />
+                                        <rect x="9" y="9.5" width="6" height="5" rx="1" />
+                                        <line x1="15" y1="12" x2="18" y2="12" />
+                                        <rect x="18" y="10" width="4" height="4" rx="0.7" />
+                                        <line x1="15" y1="9.5" x2="17.5" y2="6" />
+                                        <circle cx="18.2" cy="5" r="0.9" fill="currentColor" stroke="none" />
+                                    </g>
+                                </svg>
+                                <span>{satelliteCoverageAvailable ? "Satellite" : "Satellite (CONUS only)"}</span>
+                            </button>
+                        </div>
+                    )}
+                </div>
+
+                <div className="absolute bottom-2 right-2 z-10 flex flex-col overflow-hidden rounded-lg border border-zinc-700 bg-black/70 shadow-lg backdrop-blur-sm">
+                    <button
+                        type="button"
+                        aria-label="Zoom in"
+                        onClick={() => handleZoomButtonClick(1)}
+                        className="flex h-9 w-9 items-center justify-center text-lg font-bold text-[#e6c76f] transition hover:bg-zinc-800"
+                    >
+                        +
+                    </button>
+                    <div className="h-px w-full bg-zinc-700" />
+                    <button
+                        type="button"
+                        title="Reset to default zoom and center on airport"
+                        aria-label="Reset zoom to the default level and center on the airport"
+                        onClick={handleZoomPercentClick}
+                        className="flex h-7 w-9 items-center justify-center text-[10px] font-semibold text-zinc-300 transition hover:bg-zinc-800"
+                    >
+                        {displayZoomPercent !== null ? `${displayZoomPercent}%` : "—"}
+                    </button>
+                    <div className="h-px w-full bg-zinc-700" />
+                    <button
+                        type="button"
+                        aria-label="Zoom out"
+                        onClick={() => handleZoomButtonClick(-1)}
+                        className="flex h-9 w-9 items-center justify-center text-lg font-bold text-[#e6c76f] transition hover:bg-zinc-800"
+                    >
+                        −
+                    </button>
+                </div>
+
+                {(radarVisible || gairmetVisible || sigmetVisible) && (
+                    <div className="pointer-events-none absolute left-2 top-28 bottom-3 z-10 hidden flex-col justify-center gap-2 overflow-y-auto sm:flex">
+                        {legendCards}
+                    </div>
+                )}
+
+                {(radarVisible || gairmetVisible || sigmetVisible) && (
+                    <div className="absolute left-0 top-28 z-20 sm:hidden">
+                        {mobileLegendOpen && (
+                            <div
+                                className="fixed inset-0 z-10"
+                                onClick={() => setMobileLegendOpen(false)}
+                            />
+                        )}
+                        <button
+                            type="button"
+                            aria-label={mobileLegendOpen ? "Hide legend" : "Show legend"}
+                            aria-expanded={mobileLegendOpen}
+                            onClick={() => setMobileLegendOpen((current) => !current)}
+                            className={`relative z-20 flex h-14 w-6 items-center justify-center rounded-r-lg border border-l-0 backdrop-blur-sm transition ${
+                                mobileLegendOpen
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 bg-black/70 text-zinc-400"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className={`h-4 w-4 transition-transform ${mobileLegendOpen ? "rotate-180" : ""}`}
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M9 6l6 6-6 6" />
+                            </svg>
+                        </button>
+
+                        {mobileLegendOpen && (
+                            <div className="pointer-events-none absolute left-6 top-0 z-20 flex max-h-[70vh] flex-col gap-2 overflow-y-auto">
+                                {legendCards}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {displayScale && (
+                    <div className="pointer-events-none absolute bottom-4 left-1/2 z-10 flex -translate-x-1/2 flex-col items-center gap-1.5">
+                        <p className="text-sm font-bold tracking-wide text-zinc-100 [text-shadow:0_1px_4px_rgba(0,0,0,0.95)]">
+                            {displayScale.nm} nm
+                        </p>
+                        <div className="relative" style={{ width: displayScale.px, height: 6 }}>
+                            <div className="flex h-full overflow-hidden rounded-[1.5px] border border-[#e6c76f]">
+                                {Array.from({ length: RADAR_SCALE_STEP_COUNT }).map((_, i) => (
+                                    <div
+                                        key={i}
+                                        className={i % 2 === 0 ? "bg-[#e6c76f]" : "bg-black/60"}
+                                        style={{ flex: 1, height: "100%" }}
+                                    />
+                                ))}
+                            </div>
+                            {Array.from({ length: RADAR_SCALE_STEP_COUNT + 1 }).map((_, i) => (
+                                <div
+                                    key={i}
+                                    className="absolute w-px bg-[#e6c76f]"
+                                    style={{
+                                        left: `calc(${(i / RADAR_SCALE_STEP_COUNT) * 100}% - 0.5px)`,
+                                        top: -2,
+                                        height: 10,
+                                    }}
+                                />
+                            ))}
+                        </div>
+                    </div>
+                )}
+
+                {zoneInfo &&
+                    (zoneInfo.tfrs.length > 0 || zoneInfo.gairmets.length > 0 || zoneInfo.pireps.length > 0) &&
+                    (() => {
+                        const containerWidth = containerRef.current?.clientWidth ?? 800;
+                        const containerHeight = containerRef.current?.clientHeight ?? 600;
+                        const flipX = zoneInfo.x + 280 > containerWidth;
+                        const flipY = zoneInfo.y + 260 > containerHeight;
+                        return (
+                            <div
+                                className={`absolute z-20 w-64 rounded-xl border border-zinc-700 bg-black/90 p-3 text-xs shadow-2xl backdrop-blur-sm ${
+                                    zoneInfo.pinned ? "" : "pointer-events-none"
+                                }`}
+                                style={{
+                                    left: flipX ? undefined : zoneInfo.x + 14,
+                                    right: flipX ? containerWidth - zoneInfo.x + 14 : undefined,
+                                    top: flipY ? undefined : zoneInfo.y + 14,
+                                    bottom: flipY ? containerHeight - zoneInfo.y + 14 : undefined,
+                                }}
+                            >
+                                {zoneInfo.pinned && (
+                                    <button
+                                        type="button"
+                                        aria-label="Close"
+                                        onClick={() => {
+                                            zoneInfoPinnedRef.current = false;
+                                            setZoneInfo(null);
+                                        }}
+                                        className="absolute right-2 top-2 text-zinc-500 transition hover:text-zinc-200"
+                                    >
+                                        ✕
+                                    </button>
+                                )}
+                                <div className="max-h-64 space-y-3 overflow-y-auto pr-4">
+                                    {zoneInfo.gairmets.length > 1 && (
+                                        <p className="text-[10px] font-semibold uppercase tracking-wide text-[#e6c76f]">
+                                            {zoneInfo.gairmets.length} compounding hazards
+                                        </p>
+                                    )}
+                                    {zoneInfo.gairmets.map((zone, index) => {
+                                        const style = GAIRMET_HAZARD_STYLES[zone.hazard];
+                                        return (
+                                            <div key={`gairmet-${index}`}>
+                                                <div className="flex items-center gap-1.5">
+                                                    <span
+                                                        className="h-2 w-2 shrink-0 rounded-full"
+                                                        style={{ background: style?.stroke ?? "#999" }}
+                                                    />
+                                                    <p className="font-semibold text-zinc-100">
+                                                        {GAIRMET_HAZARD_LABELS[zone.hazard] ?? zone.hazard}
+                                                    </p>
+                                                    {zone.severity && (
+                                                        <span className="text-[10px] text-zinc-400">
+                                                            {zone.severity}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                {zone.dueTo && (
+                                                    <p className="mt-0.5 text-[11px] text-zinc-400">
+                                                        {zone.dueTo}
+                                                    </p>
+                                                )}
+                                                {(zone.base || zone.top) && (
+                                                    <p className="mt-0.5 text-[11px] text-zinc-500">
+                                                        {zone.base ? `${Number(zone.base) * 100} ft` : "SFC"}
+                                                        {" – "}
+                                                        {zone.top ? `${Number(zone.top) * 100} ft` : "—"}
+                                                    </p>
+                                                )}
+                                                {zone.validTime && (
+                                                    <p className="mt-0.5 text-[10px] text-zinc-500">
+                                                        Valid {formatFinePrintTime(new Date(zone.validTime))}
+                                                    </p>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                    {zoneInfo.tfrs.map((tfr, index) => (
+                                        <div key={`tfr-${index}`}>
+                                            <div className="flex items-center gap-1.5">
+                                                <span className="h-2 w-2 shrink-0 rounded-full bg-red-400" />
+                                                <p className="font-semibold text-zinc-100">TFR — {tfr.type}</p>
+                                            </div>
+                                            <p className="mt-0.5 text-[11px] text-zinc-400">{tfr.title}</p>
+                                        </div>
+                                    ))}
+                                    {zoneInfo.pireps.map((pirep, index) => (
+                                        <div key={`pirep-${index}`}>
+                                            <div className="flex items-center gap-1.5">
+                                                <span
+                                                    className="h-2 w-2 shrink-0 rounded-full"
+                                                    style={{ background: PIREP_SEVERITY_COLORS[pirep.severity] }}
+                                                />
+                                                <p className="font-semibold text-zinc-100">
+                                                    {pirep.isUrgent ? "URGENT PIREP" : "PIREP"}
+                                                    {pirep.aircraftType ? ` — ${pirep.aircraftType}` : ""}
+                                                </p>
+                                            </div>
+                                            {pirep.flightLevel !== null && (
+                                                <p className="mt-0.5 text-[11px] text-zinc-400">
+                                                    {(pirep.flightLevel * 100).toLocaleString()} ft
+                                                </p>
+                                            )}
+                                            {pirep.turbulenceIntensity && (
+                                                <p className="mt-0.5 text-[11px] text-zinc-400">
+                                                    Turbulence: {pirep.turbulenceIntensity}
+                                                    {pirep.turbulenceType ? ` ${pirep.turbulenceType}` : ""}
+                                                </p>
+                                            )}
+                                            {pirep.icingIntensity && (
+                                                <p className="mt-0.5 text-[11px] text-zinc-400">
+                                                    Icing: {pirep.icingIntensity}
+                                                    {pirep.icingType ? ` ${pirep.icingType}` : ""}
+                                                </p>
+                                            )}
+                                            {pirep.skyCover && (
+                                                <p className="mt-0.5 text-[11px] text-zinc-500">
+                                                    Sky: {pirep.skyCover}
+                                                </p>
+                                            )}
+                                            {pirep.wxString && (
+                                                <p className="mt-0.5 text-[11px] text-zinc-500">
+                                                    {pirep.wxString}
+                                                </p>
+                                            )}
+                                            {pirep.obsTime && (
+                                                <p className="mt-0.5 text-[10px] text-zinc-500">
+                                                    {formatFinePrintTime(new Date(pirep.obsTime))}
+                                                </p>
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        );
+                    })()}
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-[11px] text-zinc-500">
+                <p>
+                    Scroll or pinch to zoom, drag to pan anywhere. Aviation data covers a{" "}
+                    {RADAR_MAX_RADIUS_NM} nm radius around the station.
+                </p>
+                <p className="whitespace-nowrap text-[10px] text-zinc-500">
+                    Geospatial data by{" "}
+                    <a
+                        href="https://www.esri.com"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline"
+                    >
+                        Esri
+                    </a>{" "}
+                    · Radar by{" "}
+                    <a
+                        href="https://www.weather.gov/"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline"
+                    >
+                        NOAA/NWS
+                    </a>
+                </p>
+            </div>
+        </div>
+    );
+}
+
 function AirportInfoDashboardTab({
     stationInfo,
     airportDiagram,
@@ -2970,6 +6826,13 @@ function formatFinePrintTime(date: Date): string {
         hour: "numeric",
         minute: "2-digit",
         second: "2-digit",
+    }).format(date);
+}
+
+function formatRadarTickTime(date: Date): string {
+    return new Intl.DateTimeFormat("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
     }).format(date);
 }
 
