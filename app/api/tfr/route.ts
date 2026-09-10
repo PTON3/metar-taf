@@ -99,7 +99,7 @@ export async function GET(request: Request) {
 
             const ringSets: number[][][] = geometryType === "MultiPolygon" ? coordinates.flat() : coordinates;
             const rings: LatLon[][] = ringSets.map((ring) =>
-                ring.map(([lon, lat]: [number, number]) => ({ lat, lon }))
+                ring.map(([lon, lat]) => ({ lat, lon }))
             );
 
             const intersects = rings.some((ring) => boundsOverlap(ringBounds(ring), bounds));
