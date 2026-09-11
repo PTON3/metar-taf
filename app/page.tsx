@@ -242,6 +242,11 @@ type AirportPoint = {
     lat: number;
     lon: number;
     flightCategory?: FlightCategory;
+    // True when flightCategory was never actually reported by this airport (it has no ASOS/AWOS
+    // of its own) and is instead borrowed from the nearest real METAR station as a last-resort
+    // estimate — see estimateFlightCategoriesFromNearestStation. Lets rendering mark these as
+    // visually distinct from a real observation instead of presenting them as equally authoritative.
+    categoryEstimated?: boolean;
     // FAA FAR91 flag — empirically this is exactly the ~30 largest US hub airports (ATL, LAX,
     // ORD, JFK, DFW, ...), not just "has an instrument approach" (IAPEXISTS, which is true for
     // ~3000 airports — way too many to read as "major"). Used to declutter zoomed-out views:
@@ -645,7 +650,9 @@ type MetarStationPoint = {
 // station-id -> category map, so callers can add an entry for any station that doesn't already
 // have a matching FAA airport record (an ICAO/ident mismatch, or one dropped by ArcGIS's transfer
 // cap) instead of only ever coloring pre-existing airport entries and leaving the rest gray.
-async function fetchMetarStations(bounds: GeoBounds): Promise<MetarStationPoint[]> {
+async function fetchMetarStationsPage(
+    bounds: GeoBounds
+): Promise<{ items: MetarStationPoint[]; exceededLimit: boolean }> {
     const params = new URLSearchParams({
         south: String(bounds.south),
         west: String(bounds.west),
@@ -679,7 +686,19 @@ async function fetchMetarStations(bounds: GeoBounds): Promise<MetarStationPoint[
             });
         }
     }
-    return points;
+    return { items: points, exceededLimit: data?.exceededLimit === true };
+}
+
+// aviationweather.gov's bbox METAR query silently truncates at exactly 400 records for a large
+// enough box, with no explicit truncation flag the way the FAA's ArcGIS services provide one (see
+// the exceededLimit derivation in /api/metar/bbox) — confirmed by hand: the app's own 30deg x
+// 15deg nationwide tiles were consistently capped at exactly 400 stations and consistently
+// missing real, currently-reporting airports (e.g. KMIC and KSTP a few miles from KMSP, both
+// dropped every time while KMSP itself was kept). Routing through the same recursive
+// fetchAdaptive already used for the airports/airspace ArcGIS cap fixes this the same way: split
+// and re-fetch only the quadrants that actually needed it.
+async function fetchMetarStations(bounds: GeoBounds): Promise<MetarStationPoint[]> {
+    return fetchAdaptive(bounds, fetchMetarStationsPage);
 }
 
 function metarStationCategoryMap(stations: readonly MetarStationPoint[]): Map<string, FlightCategory> {
@@ -713,6 +732,72 @@ function addOrphanMetarStations(
         });
     }
     return orphans.length > 0 ? [...airports, ...orphans] : (airports as AirportPoint[]);
+}
+
+// Confirmed directly against aviationweather.gov's raw feed (not an artifact of how this app
+// fetches data): most small public airports still left without a flightCategory after
+// addOrphanMetarStations have no ASOS/AWOS of their own and have *never* published a METAR —
+// querying them by ident returns HTTP 204, no data, indefinitely. There is nowhere for a real
+// category to come from for those, so as an explicit last resort this borrows the nearest actual
+// METAR station's category as an estimate, capped to a radius past which "nearest" stops being a
+// meaningful proxy for local conditions. Bucketed into a coarse lat/lon grid (rather than a
+// brute-force scan against every station) so this stays fast against a nationwide station list.
+const CATEGORY_ESTIMATE_MAX_KM = 110; // ~60nm
+const CATEGORY_ESTIMATE_GRID_DEG = 1;
+
+function estimateFlightCategoriesFromNearestStation(
+    airports: readonly AirportPoint[],
+    stations: readonly MetarStationPoint[]
+): AirportPoint[] {
+    if (stations.length === 0) return airports as AirportPoint[];
+
+    const grid = new Map<string, MetarStationPoint[]>();
+    for (const station of stations) {
+        const key = `${Math.floor(station.lat / CATEGORY_ESTIMATE_GRID_DEG)},${Math.floor(station.lon / CATEGORY_ESTIMATE_GRID_DEG)}`;
+        const bucket = grid.get(key);
+        if (bucket) bucket.push(station);
+        else grid.set(key, [station]);
+    }
+
+    let estimatedAny = false;
+    const result = airports.map((airport) => {
+        if (airport.flightCategory !== undefined) return airport;
+
+        const cellLat = Math.floor(airport.lat / CATEGORY_ESTIMATE_GRID_DEG);
+        const cellLon = Math.floor(airport.lon / CATEGORY_ESTIMATE_GRID_DEG);
+        const kmPerDegLat = 111;
+        const kmPerDegLon = 111 * Math.max(0.15, Math.cos((airport.lat * Math.PI) / 180));
+        const cellSizeKm = CATEGORY_ESTIMATE_GRID_DEG * Math.min(kmPerDegLat, kmPerDegLon);
+        const maxRing = Math.ceil(CATEGORY_ESTIMATE_MAX_KM / cellSizeKm) + 1;
+
+        let nearest: MetarStationPoint | null = null;
+        let nearestDistKm = Infinity;
+        for (let ring = 0; ring <= maxRing; ring++) {
+            if (nearest && (ring - 1) * cellSizeKm > nearestDistKm) break;
+            for (let dLat = -ring; dLat <= ring; dLat++) {
+                for (let dLon = -ring; dLon <= ring; dLon++) {
+                    if (Math.max(Math.abs(dLat), Math.abs(dLon)) !== ring) continue;
+                    const bucket = grid.get(`${cellLat + dLat},${cellLon + dLon}`);
+                    if (!bucket) continue;
+                    for (const station of bucket) {
+                        const dLatKm = (station.lat - airport.lat) * kmPerDegLat;
+                        const dLonKm = (station.lon - airport.lon) * kmPerDegLon;
+                        const distKm = Math.hypot(dLatKm, dLonKm);
+                        if (distKm < nearestDistKm) {
+                            nearestDistKm = distKm;
+                            nearest = station;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!nearest || nearestDistKm > CATEGORY_ESTIMATE_MAX_KM) return airport;
+        estimatedAny = true;
+        return { ...airport, flightCategory: nearest.flightCategory, categoryEstimated: true };
+    });
+
+    return estimatedAny ? result : (airports as AirportPoint[]);
 }
 
 // ---- Minimal Web Mercator slippy-map math (replaces the Leaflet dependency) ----
@@ -787,25 +872,16 @@ function computeVisibleAirports(
     selectedIdent: string | null,
     tier: AirportDetailTier
 ): AirportPoint[] {
-    // The FAA airport dataset includes thousands of small fields that have never had a METAR
-    // (tiny private/public airstrips, heliports) — at the "all" tier that swamps the map with
-    // uncolored gray dots that can never resolve a category. aviationweather.gov's own map never
-    // plots a non-METAR airport at all; matched here by only ever showing an airport if it has a
-    // real category or is a major hub (kept even without a category since that's more likely a
-    // temporary METAR-fetch gap than a structurally METAR-less field). The selected airport is
-    // always shown regardless, since it can be reached via search even if it has neither.
-    const selected = selectedIdent ? airports.find((airport) => airport.ident === selectedIdent) ?? null : null;
-    const eligible = airports.filter(
-        (airport) => airport.ident !== selectedIdent && (airport.flightCategory !== undefined || airport.isMajor)
-    );
-
-    if (tier === "all") {
-        return selected ? [...eligible, selected] : eligible;
-    }
+    if (tier === "all") return airports as AirportPoint[];
 
     const cellSize = AIRPORT_DECLUTTER_CELL_PX;
     const bestByCell = new Map<string, { airport: AirportPoint; score: number }>();
-    for (const airport of eligible) {
+    let selected: AirportPoint | null = null;
+    for (const airport of airports) {
+        if (airport.ident === selectedIdent) {
+            selected = airport;
+            continue;
+        }
         const world = projectToWorldPixel(airport.lat, wrapLonNear(airport.lon, view.lon), tileZoom);
         const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
         const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
@@ -1028,15 +1104,29 @@ async function loadNationwideAirportsAndAirspace(
         allMetarStations.push(...result.metarStations);
     }
 
+    // The tile fetches above return bare FAA airport records with no flightCategory of their own
+    // yet — this attaches the real one for every airport whose identifier matches a station in
+    // allMetarStations, *before* the orphan/estimate passes below, so a station that reports
+    // under its own airport's exact identifier is always treated as a real observation rather
+    // than accidentally falling through to the nearest-station estimate just because this
+    // function hadn't attached it yet.
+    const flightCategories = metarStationCategoryMap(allMetarStations);
+    const withRealCategories = Array.from(airportMap.values(), (airport) => {
+        const key = resolveMetarStationKey(airport);
+        const flightCategory = key ? flightCategories.get(key) : undefined;
+        return flightCategory ? { ...airport, flightCategory } : airport;
+    });
+
     // Every station in allMetarStations has a real flight category by construction — any one of
     // them not already matching an airport pulled from the FAA database (a dropped record, an
     // ICAO/ident mismatch) gets added as its own point here instead of just staying invisible.
-    const airports = addOrphanMetarStations(Array.from(airportMap.values()), allMetarStations);
+    const withOrphans = addOrphanMetarStations(withRealCategories, allMetarStations);
+    const airports = estimateFlightCategoriesFromNearestStation(withOrphans, allMetarStations);
 
     return {
         airports,
         polygons: Array.from(polygonMap.values()),
-        flightCategories: metarStationCategoryMap(allMetarStations),
+        flightCategories,
     };
 }
 
@@ -3956,28 +4046,34 @@ function RadarDashboardTab({
                     for (const airport of airports) {
                         if (resolveMetarStationKey(airport) === stationInfo?.station) continue;
                         // A fresh fetch has no flightCategory of its own — carry over whatever the
-                        // existing entry already had so re-fetching an area (e.g. a small pan)
-                        // doesn't strip color that was already resolved for it.
+                        // existing entry already had (including whether it was a borrowed estimate)
+                        // so re-fetching an area (e.g. a small pan) doesn't strip color that was
+                        // already resolved for it.
                         const previous = mergedAirports.get(airport.ident);
                         mergedAirports.set(airport.ident, {
                             ...airport,
                             flightCategory: previous?.flightCategory,
+                            categoryEstimated: previous?.categoryEstimated,
                         });
                     }
                     // One more pass applies (or refreshes) categories from this fetch's own bbox
-                    // METAR query across every airport now in range, new or previously loaded.
+                    // METAR query across every airport now in range, new or previously loaded. A
+                    // real reported category here always supersedes a previously-borrowed estimate.
                     if (flightCategories) {
                         for (const [ident, airport] of mergedAirports) {
                             const key = resolveMetarStationKey(airport);
                             const flightCategory = key ? flightCategories.get(key) : undefined;
                             if (flightCategory && airport.flightCategory !== flightCategory) {
-                                mergedAirports.set(ident, { ...airport, flightCategory });
+                                mergedAirports.set(ident, { ...airport, flightCategory, categoryEstimated: false });
                             }
                         }
                     }
-                    airportsRef.current = metarStations
+                    const withOrphans = metarStations
                         ? addOrphanMetarStations(Array.from(mergedAirports.values()), metarStations)
                         : Array.from(mergedAirports.values());
+                    airportsRef.current = metarStations
+                        ? estimateFlightCategoriesFromNearestStation(withOrphans, metarStations)
+                        : withOrphans;
                 }
 
                 localDetailCoverageBoundsRef.current = requestBounds;
@@ -4650,20 +4746,34 @@ function RadarDashboardTab({
                 // (no METAR/no computable category) airport is only ever a minor supporting
                 // detail, so it stays small regardless of major/minor status.
                 const hasCategory = airport.flightCategory !== undefined;
+                const isEstimated = !isSelected && airport.categoryEstimated === true;
                 const radius = isSelected ? 7.5 : hasCategory ? (airport.isMajor ? 6.5 : 5) : 3.5;
                 ctx.beginPath();
                 ctx.arc(x, y, radius, 0, Math.PI * 2);
                 ctx.fillStyle = isSelected
                     ? "#d6b35a"
                     : FLIGHT_CATEGORY_MARKER_COLORS[airport.flightCategory ?? "UNKNOWN"];
+                // A borrowed/estimated category (no METAR of the airport's own — see
+                // estimateFlightCategoriesFromNearestStation) is never drawn identically to a real
+                // observation: a lighter fill plus a dashed same-color ring instead of the solid
+                // dark edge marks it as "probably this, not confirmed this" at a glance.
+                ctx.globalAlpha = isEstimated ? 0.5 : 1;
                 ctx.fill();
+                ctx.globalAlpha = 1;
                 // Flat filled circle with a thin dark edge for definition, closer to
                 // aviationweather.gov's own METAR station styling — the white ring gave every
                 // dot a "halo" that read as busier/heavier than their plain colored-dot look.
                 // The selected airport keeps its own distinct white ring as a highlight.
-                ctx.lineWidth = isSelected ? 2.5 : 1;
-                ctx.strokeStyle = isSelected ? "#ffffff" : "rgba(0, 0, 0, 0.55)";
+                if (isEstimated) {
+                    ctx.setLineDash([2, 2]);
+                    ctx.lineWidth = 1.25;
+                    ctx.strokeStyle = FLIGHT_CATEGORY_MARKER_COLORS[airport.flightCategory ?? "UNKNOWN"];
+                } else {
+                    ctx.lineWidth = isSelected ? 2.5 : 1;
+                    ctx.strokeStyle = isSelected ? "#ffffff" : "rgba(0, 0, 0, 0.55)";
+                }
                 ctx.stroke();
+                if (isEstimated) ctx.setLineDash([]);
 
                 const showLabel = hoveredAirportIdentRef.current === airport.ident || isSelected;
                 if (showLabel) {
@@ -5071,7 +5181,8 @@ function RadarDashboardTab({
                         const flightCategory = key ? flightCategories.get(key) : undefined;
                         return flightCategory ? { ...airport, flightCategory } : airport;
                     });
-                airportsRef.current = addOrphanMetarStations(categorized, metarStations);
+                const withOrphans = addOrphanMetarStations(categorized, metarStations);
+                airportsRef.current = estimateFlightCategoriesFromNearestStation(withOrphans, metarStations);
                 // The station's own local fetch already covers this radius — seed coverage with
                 // it so the reactive fetcher doesn't immediately redo the same request on the
                 // first frame.
@@ -5562,8 +5673,14 @@ function RadarDashboardTab({
                                             color: FLIGHT_CATEGORY_MARKER_COLORS[category],
                                             backgroundColor: `${FLIGHT_CATEGORY_MARKER_COLORS[category]}22`,
                                         }}
+                                        title={
+                                            selectedAirport.categoryEstimated
+                                                ? "No METAR of its own — estimated from the nearest reporting station."
+                                                : undefined
+                                        }
                                     >
                                         {categoryLabel}
+                                        {selectedAirport.categoryEstimated ? "*" : ""}
                                     </span>
                                     <button
                                         type="button"
@@ -5598,6 +5715,12 @@ function RadarDashboardTab({
                                     </p>
                                 </div>
                             </div>
+                            {selectedAirport.categoryEstimated && (
+                                <p className="mt-2 text-[9px] leading-tight text-zinc-500">
+                                    * No METAR of its own — estimated from the nearest reporting
+                                    station.
+                                </p>
+                            )}
                         </div>
                     );
                 })() : (

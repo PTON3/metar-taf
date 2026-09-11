@@ -44,6 +44,16 @@ export async function GET(request: Request) {
         const data = await response.json();
         const records = Array.isArray(data) ? data : [];
 
+        // aviationweather.gov's bbox METAR query silently truncates at exactly 400 records for a
+        // large-enough box (confirmed empirically — repeated identical queries against a dense
+        // tile consistently return exactly 400 and are consistently missing real, currently-
+        // reporting stations), with no explicit "truncated" flag in the response the way the FAA's
+        // ArcGIS airport/airspace services provide one. Surfacing that as our own exceededLimit
+        // flag lets callers reuse the same fetchAdaptive recursive-tiling fix already used for
+        // those services, splitting the bbox further instead of silently dropping stations.
+        const METAR_BBOX_TRUNCATION_CAP = 400;
+        const exceededLimit = records.length >= METAR_BBOX_TRUNCATION_CAP;
+
         // lat/lon/name come straight from the METAR record itself — every station this returns
         // is, by definition, one with a current observation, so building markers directly from
         // this response (rather than cross-referencing a separate airport database and hoping
@@ -65,7 +75,7 @@ export async function GET(request: Request) {
                     entry !== null
             );
 
-        return Response.json({ stations });
+        return Response.json({ stations, exceededLimit });
     } catch (error) {
         return Response.json(
             {
