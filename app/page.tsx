@@ -77,22 +77,21 @@ const RADAR_ANIMATION_LAST_FRAME_HOLD_MS = 3000;
 // picks up newly published scans, even with no pan/zoom/station change.
 const RADAR_RESYNC_INTERVAL_MS = 60_000;
 
-// Iowa Environmental Mesonet's public GOES CONUS IR composite — already rendered in
-// an enhanced IR color curve server-side, so unlike the reflectivity radar above this
-// needs no client-side recoloring: just fetch and draw the PNG as-is.
-const SATELLITE_WMS_BASE_URL = "https://mesonet.agron.iastate.edu/cgi-bin/wms/goes/conus_ir.cgi";
-const SATELLITE_WMS_LAYER = "conus_ir_4km";
-// The source layer's own advertised extent — outside this box it doesn't return blank/
-// transparent, it returns a solid white rectangle, so this must be checked before ever
-// requesting the layer (see isWithinSatelliteCoverage below).
-const SATELLITE_CONUS_BOUNDS: RadarWmsBounds = { west: -126, south: 24, east: -66, north: 50 };
-// New GOES scans land roughly every 5-10 minutes; no point resyncing faster than that.
-const SATELLITE_RESYNC_INTERVAL_MS = 5 * 60_000;
-// A rough approximation of the source's enhanced-IR curve (dark/warm surface up
-// through white cloud tops into the blue/green/yellow/red coldest convective tops),
-// used only for the legend swatch — the actual overlay pixels come straight from IEM.
-const SATELLITE_LEGEND_GRADIENT =
-    "linear-gradient(to top, #050505, #4b4b4b, #b8b8b8, #ffffff, #4fd6ff, #33cc55, #f5e642, #ff4d2e)";
+// aviationweather.gov's own global IR mosaic — the "Infrared" layer on their Observations map
+// (genuinely global, a composite of every operational GEO satellite, not just GOES/CONUS like the
+// old IEM source this replaces). Found by enabling that layer live and inspecting the resulting
+// Leaflet tile layer: a plain grayscale IR XYZ/TMS tile pyramid, not a single stretched image, so
+// it's drawn the same tiled way as the basemap below rather than as one ImageOverlay-style rect.
+const SATELLITE_TILE_URL_TEMPLATE =
+    "https://aviationweather.gov/data/tilecache/sat_ir/{date}/{time}/{z}/sat_{x}_{y}.png";
+// Tiles only exist natively up to this zoom — same idea as RADAR_BASEMAP_MAX_ZOOM, but far lower,
+// so past it the highest-zoom tiles are just scaled up rather than fetched at a zoom that 404s.
+const SATELLITE_MAX_NATIVE_ZOOM = 6;
+// New scans land every 10-15 minutes; no point resyncing faster than that.
+const SATELLITE_RESYNC_INTERVAL_MS = 10 * 60_000;
+// Plain grayscale IR (dark = warm surface/low cloud, white = cold high cloud tops) — no color
+// enhancement, unlike the old IEM source this replaces.
+const SATELLITE_LEGEND_GRADIENT = "linear-gradient(to top, #050505, #808080, #ffffff)";
 
 // NOAA's default render style ("conus_bref_qcd") sampled from its own published
 // legend (~-20 to 70+ dBZ), paired 1:1 with our own custom output colors so the
@@ -168,8 +167,7 @@ const PAN_CLAMP_BOUNDS: RadarWmsBounds = { west: -Infinity, south: -85, east: In
 // A broad North America box (CONUS, Alaska's mainland, Hawaii, Puerto Rico/Caribbean) used to
 // fetch the lightweight vector layers (TFRs, hazards, PIREPs, majors) and the radar mosaic up
 // front, so panning anywhere in the country actually shows data instead of bare basemap.
-// Satellite uses its own, narrower SATELLITE_CONUS_BOUNDS instead — the source layer's real
-// extent, which doesn't reach Alaska/Hawaii/the Caribbean at all.
+// Satellite is a genuinely global tile source, so it isn't bounded to this box at all.
 const AMERICAS_BOUNDS: RadarWmsBounds = { west: -170, south: 15, east: -50, north: 75 };
 
 function buildRadarWmsUrl(
@@ -195,20 +193,12 @@ function buildRadarWmsUrl(
     return `${RADAR_WMS_BASE_URL}?${params.toString()}`;
 }
 
-function buildSatelliteWmsUrl(bounds: RadarWmsBounds, width: number, height: number): string {
-    const params = new URLSearchParams({
-        service: "WMS",
-        version: "1.1.1",
-        request: "GetMap",
-        layers: SATELLITE_WMS_LAYER,
-        bbox: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
-        width: String(width),
-        height: String(height),
-        srs: "EPSG:4326",
-        format: "image/png",
-        transparent: "true",
-    });
-    return `${SATELLITE_WMS_BASE_URL}?${params.toString()}`;
+function buildSatelliteTileUrl(z: number, x: number, y: number, cycle: { date: string; time: string }): string {
+    return SATELLITE_TILE_URL_TEMPLATE.replace("{date}", cycle.date)
+        .replace("{time}", cycle.time)
+        .replace("{z}", String(z))
+        .replace("{x}", String(x))
+        .replace("{y}", String(y));
 }
 
 // aviationweather.gov's own GFA (Graphical Forecast for Aviation) tool — the same one pilots use
@@ -381,15 +371,6 @@ function isWithinConusRadarCoverage(lat: number, lon: number): boolean {
         lat <= RADAR_CONUS_BOUNDS.north &&
         lon >= RADAR_CONUS_BOUNDS.west &&
         lon <= RADAR_CONUS_BOUNDS.east
-    );
-}
-
-function isWithinSatelliteCoverage(lat: number, lon: number): boolean {
-    return (
-        lat >= SATELLITE_CONUS_BOUNDS.south &&
-        lat <= SATELLITE_CONUS_BOUNDS.north &&
-        lon >= SATELLITE_CONUS_BOUNDS.west &&
-        lon <= SATELLITE_CONUS_BOUNDS.east
     );
 }
 
@@ -3633,8 +3614,8 @@ function RadarDashboardTab({
     const radarFrameImagesRef = useRef<HTMLImageElement[]>([]);
     const radarBoundsRef = useRef<GeoBounds | null>(null);
     const radarObjectUrlsRef = useRef<string[]>([]);
-    const satelliteImageRef = useRef<HTMLImageElement | null>(null);
-    const satelliteBoundsRef = useRef<GeoBounds | null>(null);
+    const satelliteTileCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+    const satelliteCycleRef = useRef<{ date: string; time: string } | null>(null);
     const gfaImagesRef = useRef<Partial<Record<GfaOverlayId, HTMLImageElement>>>({});
     const airspacePolygonsRef = useRef<AirspacePolygon[]>([]);
     const tfrPolygonsRef = useRef<TfrPolygon[]>([]);
@@ -3666,7 +3647,6 @@ function RadarDashboardTab({
     const [radarError, setRadarError] = useState<string | null>(null);
     const [radarVisible, setRadarVisible] = useState(true);
     const [satelliteVisible, setSatelliteVisible] = useState(false);
-    const [satelliteCoverageAvailable, setSatelliteCoverageAvailable] = useState(true);
     // Mutually exclusive with radar/satellite (and with each other) — only one raster image
     // overlay is ever drawn at a time, same rule that already governs radar vs. satellite.
     const [activeGfaOverlay, setActiveGfaOverlay] = useState<GfaOverlayId | null>(null);
@@ -3736,7 +3716,6 @@ function RadarDashboardTab({
     }
 
     function toggleSatellite() {
-        if (!satelliteCoverageAvailable) return;
         setSatelliteVisible((current) => {
             const next = !current;
             if (next) {
@@ -4404,31 +4383,46 @@ function RadarDashboardTab({
             ctx.drawImage(radarImg, x0, y0, x1 - x0, y1 - y0);
         }
 
-        const satelliteImg = satelliteImageRef.current;
-        const satelliteBounds = satelliteBoundsRef.current;
-        if (
-            satelliteImg &&
-            satelliteBounds &&
-            satelliteVisible &&
-            satelliteImg.complete &&
-            satelliteImg.naturalWidth > 0
-        ) {
-            const satelliteLonOffset = wrapLonNear(satelliteBounds.west, view.lon) - satelliteBounds.west;
-            const topLeftWorld = projectToWorldPixel(
-                satelliteBounds.north,
-                satelliteBounds.west + satelliteLonOffset,
-                tileZoom
-            );
-            const bottomRightWorld = projectToWorldPixel(
-                satelliteBounds.south,
-                satelliteBounds.east + satelliteLonOffset,
-                tileZoom
-            );
-            const x0 = cssWidth / 2 + (topLeftWorld.x - centerWorldPx.x) * scaleFactor;
-            const y0 = cssHeight / 2 + (topLeftWorld.y - centerWorldPx.y) * scaleFactor;
-            const x1 = cssWidth / 2 + (bottomRightWorld.x - centerWorldPx.x) * scaleFactor;
-            const y1 = cssHeight / 2 + (bottomRightWorld.y - centerWorldPx.y) * scaleFactor;
-            ctx.drawImage(satelliteImg, x0, y0, x1 - x0, y1 - y0);
+        // Satellite is a real tile pyramid (see SATELLITE_TILE_URL_TEMPLATE), not one stretched
+        // image, so it's drawn the same tiled way as the basemap above — just capped at its own,
+        // much lower, native zoom (tiles beyond that don't exist and just get scaled up).
+        if (satelliteVisible && satelliteCycleRef.current) {
+            const cycle = satelliteCycleRef.current;
+            const satTileZoom = Math.min(tileZoom, SATELLITE_MAX_NATIVE_ZOOM);
+            const satScaleFactor = Math.pow(2, view.zoom - satTileZoom);
+            const satCenterWorldPx = projectToWorldPixel(view.lat, view.lon, satTileZoom);
+            const satHalfWidthWorld = cssWidth / 2 / satScaleFactor;
+            const satHalfHeightWorld = cssHeight / 2 / satScaleFactor;
+            const satMinTileX = Math.floor((satCenterWorldPx.x - satHalfWidthWorld) / MAP_TILE_SIZE) - 1;
+            const satMaxTileX = Math.floor((satCenterWorldPx.x + satHalfWidthWorld) / MAP_TILE_SIZE) + 1;
+            const satMinTileY = Math.floor((satCenterWorldPx.y - satHalfHeightWorld) / MAP_TILE_SIZE) - 1;
+            const satMaxTileY = Math.floor((satCenterWorldPx.y + satHalfHeightWorld) / MAP_TILE_SIZE) + 1;
+            const satTileCount = Math.pow(2, satTileZoom);
+
+            for (let tx = satMinTileX; tx <= satMaxTileX; tx++) {
+                for (let ty = satMinTileY; ty <= satMaxTileY; ty++) {
+                    if (ty < 0 || ty >= satTileCount) continue;
+                    const wrappedX = ((tx % satTileCount) + satTileCount) % satTileCount;
+                    // The source serves TMS tiles (Y=0 at the south), the world-pixel math above
+                    // is standard XYZ (Y=0 at the north) — flip only for the request, not the
+                    // on-screen position, which still uses the un-flipped ty.
+                    const tmsY = satTileCount - 1 - ty;
+                    const key = `${cycle.date}${cycle.time}/${satTileZoom}/${wrappedX}/${tmsY}`;
+                    let img = satelliteTileCacheRef.current.get(key);
+                    if (!img) {
+                        img = new window.Image();
+                        img.src = buildSatelliteTileUrl(satTileZoom, wrappedX, tmsY, cycle);
+                        img.onload = () => scheduleDraw();
+                        satelliteTileCacheRef.current.set(key, img);
+                    }
+                    if (img.complete && img.naturalWidth > 0) {
+                        const screenX = cssWidth / 2 + (tx * MAP_TILE_SIZE - satCenterWorldPx.x) * satScaleFactor;
+                        const screenY = cssHeight / 2 + (ty * MAP_TILE_SIZE - satCenterWorldPx.y) * satScaleFactor;
+                        const size = MAP_TILE_SIZE * satScaleFactor;
+                        ctx.drawImage(img, screenX, screenY, size, size);
+                    }
+                }
+            }
         }
 
         const gfaImg = activeGfaOverlay ? gfaImagesRef.current[activeGfaOverlay] ?? null : null;
@@ -4764,8 +4758,8 @@ function RadarDashboardTab({
         boundaryTileCache.clear();
         radarFrameImagesRef.current = [];
         radarBoundsRef.current = null;
-        satelliteImageRef.current = null;
-        satelliteBoundsRef.current = null;
+        satelliteTileCacheRef.current.clear();
+        satelliteCycleRef.current = null;
         gfaImagesRef.current = {};
         airspacePolygonsRef.current = [];
         tfrPolygonsRef.current = [];
@@ -4830,15 +4824,14 @@ function RadarDashboardTab({
 
         const useAnimatedRadar = isWithinConusRadarCoverage(center.lat, center.lon);
         const radarLayer = useAnimatedRadar ? RADAR_WMS_LAYER : RADAR_WMS_REGIONS_LAYER;
-        const satelliteAvailable = isWithinSatelliteCoverage(center.lat, center.lon);
 
         // The loading screen is only shown for the very first load of a station — steps: radar,
-        // satellite (if this location has coverage), the hazards/local-area bundle, one per
-        // nationwide zone, and flight categories. Background refreshes (resync intervals, the
-        // periodic nationwide reload) update silently and never touch this state.
+        // satellite, the hazards/local-area bundle, one per nationwide zone, and flight
+        // categories. Background refreshes (resync intervals, the periodic nationwide reload)
+        // update silently and never touch this state.
         let radarLoadStepsCompleted = 0;
         const radarLoadTotalSteps =
-            1 + (satelliteAvailable ? 1 : 0) + 1 + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS + 1;
+            1 + 1 + 1 + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS + 1;
         setRadarLoadProgress({
             ready: false,
             completed: 0,
@@ -4917,45 +4910,29 @@ function RadarDashboardTab({
         loadRadarFrames().then(() => reportRadarLoadStep("Loading radar imagery"));
         const radarResyncId = window.setInterval(loadRadarFrames, RADAR_RESYNC_INTERVAL_MS);
 
-        // Outside the source layer's own extent it doesn't return blank — it returns a
-        // solid white rectangle that would paper over the whole map — so this is gated
-        // on real coverage rather than just always fetching like the radar/hazard layers.
-        setSatelliteCoverageAvailable(satelliteAvailable);
-        if (!satelliteAvailable) {
-            setSatelliteVisible(false);
-        }
-
-        const loadSatelliteImage = (): Promise<void> => {
-            // The source's own real extent (SATELLITE_CONUS_BOUNDS) rather than imageryBounds —
-            // it doesn't cover Alaska/Hawaii/the Caribbean, so requesting the wider box would
-            // just waste resolution on area with no data to show.
-            const bounds = SATELLITE_CONUS_BOUNDS;
-            const lonSpan = bounds.east - bounds.west;
-            const latSpan = bounds.north - bounds.south;
-            const aspect = lonSpan / latSpan;
-            const width = aspect >= 1 ? RADAR_IMAGE_MAX_PX : Math.round(RADAR_IMAGE_MAX_PX * aspect);
-            const height = aspect >= 1 ? Math.round(RADAR_IMAGE_MAX_PX / aspect) : RADAR_IMAGE_MAX_PX;
-
-            return new Promise((resolve) => {
-                const img = new window.Image();
-                img.onload = () => {
-                    if (!cancelled) {
-                        satelliteImageRef.current = img;
-                        satelliteBoundsRef.current = bounds;
-                        scheduleDraw();
-                    }
-                    resolve();
-                };
-                img.onerror = () => resolve();
-                img.src = buildSatelliteWmsUrl(bounds, width, height);
-            });
+        // Genuinely global, so no coverage gate needed — just find the latest tile cycle. The
+        // tiles themselves lazy-load in the draw loop the same way basemap tiles do; this only
+        // needs to know which cycle folder to request them from, and clears the tile cache (the
+        // old cycle's tiles are stale — same file names, different pixels) whenever it changes.
+        const loadSatelliteCycle = async (): Promise<void> => {
+            try {
+                const response = await fetch("/api/satellite/cycle");
+                if (!response.ok || cancelled) return;
+                const cycle = await response.json();
+                if (!cycle?.date || !cycle?.time) return;
+                const current = satelliteCycleRef.current;
+                if (current?.date !== cycle.date || current?.time !== cycle.time) {
+                    satelliteTileCacheRef.current.clear();
+                    satelliteCycleRef.current = { date: cycle.date, time: cycle.time };
+                    scheduleDraw();
+                }
+            } catch {
+                // Supplementary — a failed refresh just leaves the previous cycle's tiles in place.
+            }
         };
 
-        let satelliteResyncId: number | undefined;
-        if (satelliteAvailable) {
-            loadSatelliteImage().then(() => reportRadarLoadStep("Loading satellite imagery"));
-            satelliteResyncId = window.setInterval(loadSatelliteImage, SATELLITE_RESYNC_INTERVAL_MS);
-        }
+        loadSatelliteCycle().then(() => reportRadarLoadStep("Loading satellite imagery"));
+        const satelliteResyncId = window.setInterval(loadSatelliteCycle, SATELLITE_RESYNC_INTERVAL_MS);
 
         // Thunderstorms/Weather Type/Turbulence/Icing — all four are the same GFA_MOSAIC_BOUNDS
         // image, just a different product suffix, and all publish on the same model cycle. One
@@ -5153,8 +5130,8 @@ function RadarDashboardTab({
             radarObjectUrlsRef.current = [];
             radarFrameImagesRef.current = [];
             radarBoundsRef.current = null;
-            satelliteImageRef.current = null;
-            satelliteBoundsRef.current = null;
+            satelliteTileCacheRef.current.clear();
+            satelliteCycleRef.current = null;
             gfaImagesRef.current = {};
             tileCache.clear();
             boundaryTileCache.clear();
@@ -5901,17 +5878,14 @@ function RadarDashboardTab({
 
                         <button
                             type="button"
-                            title={satelliteCoverageAvailable ? "Satellite" : "Satellite (not available outside the continental US)"}
+                            title="Satellite"
                             aria-label="Show satellite imagery (swaps out precipitation)"
                             aria-pressed={satelliteVisible}
-                            aria-disabled={!satelliteCoverageAvailable}
                             onClick={toggleSatellite}
                             className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
-                                !satelliteCoverageAvailable
-                                    ? "cursor-not-allowed border-zinc-800 text-zinc-700"
-                                    : satelliteVisible
-                                        ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
-                                        : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                                satelliteVisible
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
                             }`}
                         >
                             <svg
@@ -5934,7 +5908,7 @@ function RadarDashboardTab({
                                 </g>
                             </svg>
                             <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
-                                {satelliteCoverageAvailable ? "Satellite" : "Satellite unavailable here"}
+                                Satellite
                             </span>
                         </button>
 
@@ -6299,13 +6273,10 @@ function RadarDashboardTab({
                             <button
                                 type="button"
                                 onClick={toggleSatellite}
-                                aria-disabled={!satelliteCoverageAvailable}
                                 className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
-                                    !satelliteCoverageAvailable
-                                        ? "cursor-not-allowed text-zinc-600"
-                                        : satelliteVisible
-                                            ? "bg-[#d6b35a]/20 text-[#e6c76f]"
-                                            : "text-zinc-300 hover:bg-zinc-800"
+                                    satelliteVisible
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
                                 }`}
                             >
                                 <svg
@@ -6327,7 +6298,7 @@ function RadarDashboardTab({
                                         <circle cx="18.2" cy="5" r="0.9" fill="currentColor" stroke="none" />
                                     </g>
                                 </svg>
-                                <span>{satelliteCoverageAvailable ? "Satellite" : "Satellite (CONUS only)"}</span>
+                                <span>Satellite</span>
                             </button>
 
                             <button
