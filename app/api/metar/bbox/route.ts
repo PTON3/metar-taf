@@ -34,6 +34,13 @@ export async function GET(request: Request) {
             );
         }
 
+        // A bbox with zero matching stations (e.g. open ocean) comes back 204 No Content with an
+        // empty body — .json() on that throws "Unexpected end of JSON input", so this has to be
+        // checked before parsing rather than relying on try/catch to paper over it.
+        if (response.status === 204) {
+            return Response.json({ stations: [] });
+        }
+
         const data = await response.json();
         const records = Array.isArray(data) ? data : [];
 

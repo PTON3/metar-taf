@@ -301,7 +301,14 @@ const FLIGHT_CATEGORY_MARKER_COLORS: Record<FlightCategory, string> = {
     UNKNOWN: "#71717a",
 };
 
-async function fetchAirspacePolygons(bounds: GeoBounds, signal?: AbortSignal): Promise<AirspacePolygon[]> {
+// ArcGIS caps any single query at 1000 features and silently drops the rest — exposed here as
+// exceededLimit (from the response's own exceededTransferLimit flag) so callers that need the
+// *complete* picture (see fetchAdaptive below) can detect a truncated tile and split it, rather
+// than quietly rendering whatever fraction of a dense area happened to come back first.
+async function fetchAirspacePolygonsPage(
+    bounds: GeoBounds,
+    signal?: AbortSignal
+): Promise<{ polygons: AirspacePolygon[]; exceededLimit: boolean }> {
     const params = new URLSearchParams({
         geometry: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
         geometryType: "esriGeometryEnvelope",
@@ -335,6 +342,11 @@ async function fetchAirspacePolygons(bounds: GeoBounds, signal?: AbortSignal): P
 
         polygons.push({ airspaceClass, name: feature?.properties?.NAME ?? "", rings });
     }
+    return { polygons, exceededLimit: data?.exceededTransferLimit === true };
+}
+
+async function fetchAirspacePolygons(bounds: GeoBounds, signal?: AbortSignal): Promise<AirspacePolygon[]> {
+    const { polygons } = await fetchAirspacePolygonsPage(bounds, signal);
     return polygons;
 }
 
@@ -561,11 +573,11 @@ async function fetchPirepReports(bounds: GeoBounds): Promise<PirepReport[]> {
     return Array.isArray(data?.reports) ? data.reports : [];
 }
 
-async function fetchAirports(
+async function fetchAirportsPage(
     bounds: GeoBounds,
     majorOnly = false,
     signal?: AbortSignal
-): Promise<AirportPoint[]> {
+): Promise<{ airports: AirportPoint[]; exceededLimit: boolean }> {
     const baseWhere = "PRIVATEUSE=0 AND OPERSTATUS='OPERATIONAL' AND MIL_CODE='CIVIL'";
     const params = new URLSearchParams({
         geometry: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
@@ -597,6 +609,15 @@ async function fetchAirports(
             isMajor: majorOnly || feature?.properties?.FAR91 === 1,
         });
     }
+    return { airports, exceededLimit: data?.exceededTransferLimit === true };
+}
+
+async function fetchAirports(
+    bounds: GeoBounds,
+    majorOnly = false,
+    signal?: AbortSignal
+): Promise<AirportPoint[]> {
+    const { airports } = await fetchAirportsPage(bounds, majorOnly, signal);
     return airports;
 }
 
@@ -853,6 +874,40 @@ const NATIONWIDE_FETCH_CONCURRENCY = 4;
 // interval is really about the METAR-derived colors, not the underlying geometry.
 const NATIONWIDE_REFRESH_INTERVAL_MS = 7 * 60_000;
 
+// Even a single 30deg x 15deg tile (1/16th of AMERICAS_BOUNDS) can badly exceed ArcGIS's
+// 1000-feature-per-request cap in a dense region — one such tile over the central US actually
+// holds 2,556 airports (returnCountOnly-verified) and 2,690 airspace polygons, so the plain tiled
+// fetch below was silently getting only the first ~1000 of each and dropping the rest before
+// flight categories were ever attempted, which is why a majority of airports still had no color
+// even after tiling. This recurses: on a truncated response (the ArcGIS response's own
+// exceededTransferLimit flag), split the tile into 4 quadrants and re-fetch each, so only the
+// pockets that are actually dense enough to need it get subdivided further. Capped at
+// NATIONWIDE_ADAPTIVE_MAX_DEPTH so a pathological case can't runaway into an unbounded number of
+// requests.
+const NATIONWIDE_ADAPTIVE_MAX_DEPTH = 3;
+
+async function fetchAdaptive<T>(
+    bounds: GeoBounds,
+    fetchPage: (bounds: GeoBounds) => Promise<{ items: T[]; exceededLimit: boolean }>,
+    depth = 0
+): Promise<T[]> {
+    const { items, exceededLimit } = await fetchPage(bounds);
+    if (!exceededLimit || depth >= NATIONWIDE_ADAPTIVE_MAX_DEPTH) return items;
+
+    const midLon = (bounds.west + bounds.east) / 2;
+    const midLat = (bounds.south + bounds.north) / 2;
+    const quadrants: GeoBounds[] = [
+        { west: bounds.west, east: midLon, south: bounds.south, north: midLat },
+        { west: midLon, east: bounds.east, south: bounds.south, north: midLat },
+        { west: bounds.west, east: midLon, south: midLat, north: bounds.north },
+        { west: midLon, east: bounds.east, south: midLat, north: bounds.north },
+    ];
+    const results = await Promise.all(
+        quadrants.map((quadrant) => fetchAdaptive(quadrant, fetchPage, depth + 1))
+    );
+    return results.flat();
+}
+
 // Full airport + airspace + flight-category detail for the whole AMERICAS_BOUNDS area, not just
 // near the selected station — tiled because a single request that size errors out on the ArcGIS
 // side for airports/airspace (reported as a CORS failure), and — less obviously, found by
@@ -860,10 +915,12 @@ const NATIONWIDE_REFRESH_INTERVAL_MS = 7 * 60_000;
 // flight categories too: one nationwide bbox call returned ~300 stations total against
 // aviationweather.gov's own METAR bbox endpoint, when a single tile alone returned ~150 (real
 // nationwide station count is in the thousands), so most airports were rendering with no color at
-// all. Tiling fixes both the same way. Runs once on load and again on NATIONWIDE_REFRESH_INTERVAL_MS
-// so the whole country is populated up front instead of only filling in reactively as panned to.
-// Each tile fetches all three together so onZoneDone can report one tick per tile — that's what
-// drives the "loading zone N" progress text on first load.
+// all. Tiling fixes both the same way, and fetchAdaptive above further subdivides any tile whose
+// airports or airspace alone still exceed the cap. Runs once on load and again on
+// NATIONWIDE_REFRESH_INTERVAL_MS so the whole country is populated up front instead of only
+// filling in reactively as panned to. Each top-level tile fetches all three together so
+// onZoneDone can report one tick per tile — that's what drives the "loading zone N" progress text
+// on first load, regardless of how many sub-requests a dense tile ends up needing internally.
 async function loadNationwideAirportsAndAirspace(
     signal: AbortSignal,
     onZoneDone?: (zoneIndex: number, zoneCount: number) => void
@@ -872,8 +929,18 @@ async function loadNationwideAirportsAndAirspace(
     const tileResults = await runWithConcurrency(
         tiles.map((tile, index) => async () => {
             const [airports, polygons, flightCategories] = await Promise.all([
-                fetchAirports(tile, false, signal).catch(() => [] as AirportPoint[]),
-                fetchAirspacePolygons(tile, signal).catch(() => [] as AirspacePolygon[]),
+                fetchAdaptive(tile, (b) =>
+                    fetchAirportsPage(b, false, signal).then((r) => ({
+                        items: r.airports,
+                        exceededLimit: r.exceededLimit,
+                    }))
+                ).catch(() => [] as AirportPoint[]),
+                fetchAdaptive(tile, (b) =>
+                    fetchAirspacePolygonsPage(b, signal).then((r) => ({
+                        items: r.polygons,
+                        exceededLimit: r.exceededLimit,
+                    }))
+                ).catch(() => [] as AirspacePolygon[]),
                 fetchAirportFlightCategories(tile).catch(() => new Map<string, FlightCategory>()),
             ]);
             onZoneDone?.(index, tiles.length);
