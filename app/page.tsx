@@ -24,11 +24,17 @@ const RADAR_MAX_RADIUS_NM = 250;
 const RADAR_DEFAULT_ZOOM_PERCENT = 0.6;
 // Below this zoom *percent* (the same 0-100 metric the on-screen zoom readout shows, not a raw
 // zoom level — raw levels map to a different visible scale depending on latitude and container
-// size, which the percent already normalizes for) minor (non-IAP) airports are hidden — only
-// major airports stay visible while zoomed out wide, so panning across the country doesn't flood
-// the map with every small grass strip in the FAA dataset. Full local detail (airspace shapes +
-// every airport, not just majors) uses the same threshold for the same reason.
+// size, which the percent already normalizes for) only the top airport tier (majors) stays
+// visible, so panning across the country doesn't flood the map with every small grass strip in
+// the FAA dataset. Full local detail loading (airspace shapes + every airport, not just majors)
+// uses this same threshold, since that's also when the airport tiers below start needing it.
 const LOCAL_DETAIL_MIN_ZOOM_PERCENT = 30;
+// Between LOCAL_DETAIL_MIN_ZOOM_PERCENT and this, a second airport tier — majors plus anything
+// with a real ICAO identifier (airport.icao, a reliable proxy for "significant enough to have
+// one" already returned by the airports query, no extra fetch needed) — wins the decluttering
+// grid instead of majors alone, so the view fills in with more substantial fields before jumping
+// to literally everything. At or above this, every airport shows, undecimated.
+const AIRPORT_ALL_MIN_ZOOM_PERCENT = 45;
 // Fetches cover the viewport expanded by this much — generous on purpose, so the data for
 // wherever you pan next is already loaded *before* you get there rather than popping in after
 // you arrive (still bounded by the RADAR_MAX_RADIUS_NM-based cap below, which is what actually
@@ -676,15 +682,21 @@ function unprojectFromWorldPixel(x: number, y: number, zoom: number): { lat: num
 // Screen-space pixel size of the decluttering grid used by computeVisibleAirports below.
 const AIRPORT_DECLUTTER_CELL_PX = 56;
 
-// At low zoom (majors-only mode) a hard isMajor filter is either too sparse (the FAA's FAR91
-// "major hub" flag is only ~30 airports nationwide — a near-empty map) or, with a looser
-// definition, too dense (thousands of IAP-having fields crowd the view). Grid decimation sits
-// between the two: bucket every candidate into a screen-space grid and keep only the single best
-// one per cell (majors first, then anything with a METAR-derived category, then whatever's
-// left), so the view always reads as "a reasonable, evenly-spread set of airports" regardless of
-// how dense the underlying data actually is. Shared by drawing and hit-testing so a click always
-// lands on whatever's actually visible. Returns every airport unfiltered once zoomed in enough
-// that minors are meant to show.
+// At low zoom a hard isMajor filter is either too sparse (the FAA's FAR91 "major hub" flag is
+// only ~30 airports nationwide — a near-empty map) or, with a looser definition, too dense
+// (thousands of IAP-having fields crowd the view). Grid decimation sits between the two: bucket
+// every candidate into a screen-space grid and keep only the single best one per cell, so the
+// view always reads as "a reasonable, evenly-spread set of airports" regardless of how dense the
+// underlying data actually is. Which airport wins a cell escalates through three tiers as you
+// zoom in (see LOCAL_DETAIL_MIN_ZOOM_PERCENT / AIRPORT_ALL_MIN_ZOOM_PERCENT for the thresholds):
+// majors only, then majors + anything with a real ICAO code (airport.icao — already returned by
+// the airports query, a reliable "this one's substantial" proxy with no extra fetch needed), then
+// finally every airport undecimated. A category (a resolved METAR flight color) always wins a
+// cell first regardless of tier — a colored dot is more useful than an uncolored one of higher
+// rank — with the tier's rank only breaking ties between two candidates that are otherwise equal.
+// Shared by drawing and hit-testing so a click always lands on whatever's actually visible.
+type AirportDetailTier = "major" | "semiMajor" | "all";
+
 function computeVisibleAirports(
     airports: readonly AirportPoint[],
     view: MapView,
@@ -694,9 +706,9 @@ function computeVisibleAirports(
     cssWidth: number,
     cssHeight: number,
     selectedIdent: string | null,
-    showMinorAirports: boolean
+    tier: AirportDetailTier
 ): AirportPoint[] {
-    if (showMinorAirports) return airports as AirportPoint[];
+    if (tier === "all") return airports as AirportPoint[];
 
     const cellSize = AIRPORT_DECLUTTER_CELL_PX;
     const bestByCell = new Map<string, { airport: AirportPoint; score: number }>();
@@ -710,9 +722,9 @@ function computeVisibleAirports(
         const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
         const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
         if (x < -cellSize || x > cssWidth + cellSize || y < -cellSize || y > cssHeight + cellSize) continue;
-        // Having a category wins the cell first — a colored dot is more useful than an
-        // uncategorized major — with isMajor only breaking ties between two colored candidates.
-        const score = (airport.flightCategory ? 2 : 0) + (airport.isMajor ? 1 : 0);
+        const rank =
+            tier === "semiMajor" ? airport.isMajor || airport.icao !== null : airport.isMajor;
+        const score = (airport.flightCategory ? 2 : 0) + (rank ? 1 : 0);
         // The cell key is built from world-space position (scaled by the current zoom), not
         // screen-space x/y — an airport's own lat/lon never moves, so its cell only changes when
         // the zoom does. Keying off screen position instead made every airport's cell shift as
@@ -727,6 +739,12 @@ function computeVisibleAirports(
     const result = Array.from(bestByCell.values(), (entry) => entry.airport);
     if (selected) result.push(selected);
     return result;
+}
+
+function computeAirportDetailTier(zoomPercent: number): AirportDetailTier {
+    if (zoomPercent >= AIRPORT_ALL_MIN_ZOOM_PERCENT) return "all";
+    if (zoomPercent >= LOCAL_DETAIL_MIN_ZOOM_PERCENT) return "semiMajor";
+    return "major";
 }
 
 function boundsForDiameterMeters(center: { lat: number; lon: number }, diameterMeters: number): GeoBounds {
@@ -835,40 +853,52 @@ const NATIONWIDE_FETCH_CONCURRENCY = 4;
 // interval is really about the METAR-derived colors, not the underlying geometry.
 const NATIONWIDE_REFRESH_INTERVAL_MS = 7 * 60_000;
 
-// Full airport + airspace detail for the whole AMERICAS_BOUNDS area, not just near the selected
-// station — tiled because a single request that size errors out on the ArcGIS side (reported by
-// the browser as a CORS failure). Runs once on load and again on NATIONWIDE_REFRESH_INTERVAL_MS
+// Full airport + airspace + flight-category detail for the whole AMERICAS_BOUNDS area, not just
+// near the selected station — tiled because a single request that size errors out on the ArcGIS
+// side for airports/airspace (reported as a CORS failure), and — less obviously, found by
+// comparing a full-bounds METAR query against a single tile's worth — silently truncates for
+// flight categories too: one nationwide bbox call returned ~300 stations total against
+// aviationweather.gov's own METAR bbox endpoint, when a single tile alone returned ~150 (real
+// nationwide station count is in the thousands), so most airports were rendering with no color at
+// all. Tiling fixes both the same way. Runs once on load and again on NATIONWIDE_REFRESH_INTERVAL_MS
 // so the whole country is populated up front instead of only filling in reactively as panned to.
-// Each tile fetches its airports and airspace together so onZoneDone can report one tick per
-// tile — that's what drives the "loading zone N" progress text on first load.
+// Each tile fetches all three together so onZoneDone can report one tick per tile — that's what
+// drives the "loading zone N" progress text on first load.
 async function loadNationwideAirportsAndAirspace(
     signal: AbortSignal,
     onZoneDone?: (zoneIndex: number, zoneCount: number) => void
-): Promise<{ airports: AirportPoint[]; polygons: AirspacePolygon[] }> {
+): Promise<{ airports: AirportPoint[]; polygons: AirspacePolygon[]; flightCategories: Map<string, FlightCategory> }> {
     const tiles = tileBounds(AMERICAS_BOUNDS, NATIONWIDE_TILE_COLS, NATIONWIDE_TILE_ROWS);
     const tileResults = await runWithConcurrency(
         tiles.map((tile, index) => async () => {
-            const [airports, polygons] = await Promise.all([
+            const [airports, polygons, flightCategories] = await Promise.all([
                 fetchAirports(tile, false, signal).catch(() => [] as AirportPoint[]),
                 fetchAirspacePolygons(tile, signal).catch(() => [] as AirspacePolygon[]),
+                fetchAirportFlightCategories(tile).catch(() => new Map<string, FlightCategory>()),
             ]);
             onZoneDone?.(index, tiles.length);
-            return { airports, polygons };
+            return { airports, polygons, flightCategories };
         }),
         NATIONWIDE_FETCH_CONCURRENCY
     );
 
     const airportMap = new Map<string, AirportPoint>();
     const polygonMap = new Map<string, AirspacePolygon>();
+    const flightCategoryMap = new Map<string, FlightCategory>();
     for (const result of tileResults) {
         for (const airport of result.airports) airportMap.set(airport.ident, airport);
         for (const polygon of result.polygons) {
             const key = `${polygon.airspaceClass}|${polygon.name}|${polygon.rings[0]?.[0]?.lat}|${polygon.rings[0]?.[0]?.lon}`;
             polygonMap.set(key, polygon);
         }
+        for (const [station, category] of result.flightCategories) flightCategoryMap.set(station, category);
     }
 
-    return { airports: Array.from(airportMap.values()), polygons: Array.from(polygonMap.values()) };
+    return {
+        airports: Array.from(airportMap.values()),
+        polygons: Array.from(polygonMap.values()),
+        flightCategories: flightCategoryMap,
+    };
 }
 
 function computeBoundsZoom(
@@ -3826,8 +3856,9 @@ function RadarDashboardTab({
 
         const { min: hitTestMin, max: hitTestMax } = zoomRangeRef.current;
         const hitTestEffectiveMax = computeEffectiveMaxZoom(hitTestMax, latitude ?? view.lat, cssWidth);
-        const showMinorAirports =
-            computeZoomPercent(view.zoom, hitTestMin, hitTestEffectiveMax) >= LOCAL_DETAIL_MIN_ZOOM_PERCENT;
+        const hitTestTier = computeAirportDetailTier(
+            computeZoomPercent(view.zoom, hitTestMin, hitTestEffectiveMax)
+        );
         const candidates = computeVisibleAirports(
             airportsRef.current,
             view,
@@ -3837,7 +3868,7 @@ function RadarDashboardTab({
             cssWidth,
             cssHeight,
             selectedAirportIdentRef.current,
-            showMinorAirports
+            hitTestTier
         );
         let closest: AirportPoint | null = null;
         let closestDistance = 14;
@@ -4164,7 +4195,10 @@ function RadarDashboardTab({
         // across the threshold on its own, making minor airports flicker in and out mid-pan.
         const lodEffectiveMaxZoom = computeEffectiveMaxZoom(zoomRangeMax, latitude ?? view.lat, cssWidth);
         const lodZoomPercent = computeZoomPercent(view.zoom, zoomRangeMin, lodEffectiveMaxZoom);
-        const showMinorAirports = lodZoomPercent >= LOCAL_DETAIL_MIN_ZOOM_PERCENT;
+        const airportTier = computeAirportDetailTier(lodZoomPercent);
+        // Airspace shapes come in at the same threshold as the airport tier escalating past
+        // majors-only — semiMajor or all, not just all.
+        const showMinorAirports = airportTier !== "major";
 
         const nowMs = performance.now();
         if (nowMs - lastLocalDetailCheckRef.current > 200) {
@@ -4460,7 +4494,7 @@ function RadarDashboardTab({
                 cssWidth,
                 cssHeight,
                 selectedIdent,
-                showMinorAirports
+                airportTier
             );
 
             for (const airport of visibleAirports) {
@@ -4474,7 +4508,7 @@ function RadarDashboardTab({
                 // (no METAR/no computable category) airport is only ever a minor supporting
                 // detail, so it stays small regardless of major/minor status.
                 const hasCategory = airport.flightCategory !== undefined;
-                const radius = isSelected ? 9 : hasCategory ? (airport.isMajor ? 8 : 6) : 4;
+                const radius = isSelected ? 7.5 : hasCategory ? (airport.isMajor ? 6.5 : 5) : 3.5;
                 ctx.beginPath();
                 ctx.arc(x, y, radius, 0, Math.PI * 2);
                 ctx.fillStyle = isSelected
@@ -4686,12 +4720,12 @@ function RadarDashboardTab({
         resizeObserver.observe(container);
 
         // The loading screen is only shown for the very first load of a station — steps: radar,
-        // satellite, the hazards/local-area bundle, one per nationwide zone, and flight
-        // categories. Background refreshes (resync intervals, the periodic nationwide reload)
-        // update silently and never touch this state.
+        // satellite, forecast overlays, hazards, local area, and one per nationwide zone (each
+        // zone now includes its own slice of flight categories, tiled the same way as airports —
+        // see loadNationwideAirportsAndAirspace). Background refreshes (resync intervals, the
+        // periodic nationwide reload) update silently and never touch this state.
         let radarLoadStepsCompleted = 0;
-        const radarLoadTotalSteps =
-            1 + 1 + 1 + 1 + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS + 1;
+        const radarLoadTotalSteps = 1 + 1 + 1 + 1 + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS;
         setRadarLoadProgress({
             ready: false,
             completed: 0,
@@ -4858,7 +4892,13 @@ function RadarDashboardTab({
                     // grass strip in the country. Failure here just means minor-only
                     // coverage outside the local radius, not a broken map.
                     fetchAirports(AMERICAS_BOUNDS, true).catch(() => [] as AirportPoint[]),
-                    fetchAirportFlightCategories(AMERICAS_BOUNDS).catch(
+                    // Scoped to the local radius, not AMERICAS_BOUNDS — the same nationwide bbox
+                    // that truncates for airports/airspace also truncates for METARs (~300
+                    // stations back for the whole country against thousands that actually exist),
+                    // so a nationwide call here would barely color anything. The nationwide majors
+                    // fetched above get their own colors moments later from the tiled tick in
+                    // loadNationwideAirportsAndAirspace running alongside this.
+                    fetchAirportFlightCategories(maxZoomOutBounds).catch(
                         () => new Map<string, FlightCategory>()
                     ),
                 ]);
@@ -4909,20 +4949,17 @@ function RadarDashboardTab({
 
         const loadNationwideDetail = async (isInitial: boolean) => {
             try {
-                const [{ airports: tiledAirports, polygons: tiledPolygons }, flightCategories] =
-                    await Promise.all([
-                        loadNationwideAirportsAndAirspace(
-                            nationwideController.signal,
-                            isInitial
-                                ? (zoneIndex, zoneCount) =>
-                                      reportRadarLoadStep(`Loading zone ${zoneIndex + 1} of ${zoneCount}`)
-                                : undefined
-                        ),
-                        fetchAirportFlightCategories(AMERICAS_BOUNDS).catch(
-                            () => new Map<string, FlightCategory>()
-                        ),
-                    ]);
-                if (isInitial) reportRadarLoadStep("Loading flight categories");
+                const {
+                    airports: tiledAirports,
+                    polygons: tiledPolygons,
+                    flightCategories,
+                } = await loadNationwideAirportsAndAirspace(
+                    nationwideController.signal,
+                    isInitial
+                        ? (zoneIndex, zoneCount) =>
+                              reportRadarLoadStep(`Loading zone ${zoneIndex + 1} of ${zoneCount}`)
+                        : undefined
+                );
                 if (cancelled || nationwideController.signal.aborted) return;
 
                 const mergedAirports = new Map<string, AirportPoint>();
