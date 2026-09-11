@@ -211,6 +211,54 @@ function buildSatelliteWmsUrl(bounds: RadarWmsBounds, width: number, height: num
     return `${SATELLITE_WMS_BASE_URL}?${params.toString()}`;
 }
 
+// aviationweather.gov's own GFA (Graphical Forecast for Aviation) tool — the same one pilots use
+// for thunderstorm/turbulence/icing/weather-type outlooks — renders each product as a single
+// pre-colored GIF per forecast cycle (~every 3 hours). Bounds found by inspecting the tool's own
+// network traffic and its exposed `window.gfa.layers.weather.layer.getBounds()`, which reported
+// these exact numbers identically across every product tested — one mosaic spanning the Pacific
+// to the mid-Atlantic, well past just CONUS (it covers Alaska, Hawaii, and the Caribbean too). No
+// client-side recoloring needed — unlike the NWS reflectivity radar above, these arrive already
+// styled, so they're drawn as-is, the same as the satellite overlay.
+const GFA_MOSAIC_BOUNDS: RadarWmsBounds = {
+    west: -215.69104,
+    south: -0.196746,
+    east: -39.508957,
+    north: 76.97271,
+};
+// New model cycles land roughly every 3 hours; no point resyncing faster than that.
+const GFA_RESYNC_INTERVAL_MS = 20 * 60_000;
+
+type GfaOverlayId = "thunderstorms" | "weatherType" | "turbulence" | "icing";
+
+type GfaOverlayConfig = {
+    id: GfaOverlayId;
+    label: string;
+    // The file-name product suffix aviationweather.gov uses for this layer — confirmed by
+    // watching the GFA tool's own image requests while switching between its menu items.
+    fileProduct: string;
+};
+
+const GFA_OVERLAYS: readonly GfaOverlayConfig[] = [
+    { id: "thunderstorms", label: "Thunderstorms", fileProduct: "sfc_tstm" },
+    { id: "weatherType", label: "Weather Type", fileProduct: "sfc_wx" },
+    { id: "turbulence", label: "Turbulence", fileProduct: "maxa_gtg" },
+    { id: "icing", label: "Icing", fileProduct: "max_icsevsld" },
+];
+
+function buildGfaProductUrl(fileProduct: string, cycle: { date: string; hour: string }): string {
+    return `https://aviationweather.gov/data/products/gfam/${cycle.date}/${cycle.hour}/${cycle.date}_${cycle.hour}_F00_gfaak_${fileProduct}_m.gif`;
+}
+
+// Approximate legend swatches for the intensity-scale GFA overlays — read off the GFA tool's own
+// on-screen legend, not exact hex stops (it doesn't expose those), so these are representative
+// rather than pixel-identical to the source. Weather Type is a categorical (not gradient) scale —
+// different colors mean different precip types, not more/less of one thing — so it gets no bar.
+const GFA_THUNDERSTORM_LEGEND_GRADIENT =
+    "linear-gradient(to top, transparent, #fef08a, #fb923c, #ef4444, #7f1d1d)";
+const GFA_TURBULENCE_LEGEND_GRADIENT =
+    "linear-gradient(to top, #22c55e, #eab308, #f97316, #dc2626, #7f1d1d)";
+const GFA_ICING_LEGEND_GRADIENT = "linear-gradient(to top, #bae6fd, #38bdf8, #6366f1, #a21caf)";
+
 async function fetchRecoloredRadarOverlay(
     bounds: RadarWmsBounds,
     time?: string,
@@ -3575,6 +3623,7 @@ function RadarDashboardTab({
     const radarObjectUrlsRef = useRef<string[]>([]);
     const satelliteImageRef = useRef<HTMLImageElement | null>(null);
     const satelliteBoundsRef = useRef<GeoBounds | null>(null);
+    const gfaImagesRef = useRef<Partial<Record<GfaOverlayId, HTMLImageElement>>>({});
     const airspacePolygonsRef = useRef<AirspacePolygon[]>([]);
     const tfrPolygonsRef = useRef<TfrPolygon[]>([]);
     const gairmetZonesRef = useRef<GairmetZone[]>([]);
@@ -3606,6 +3655,9 @@ function RadarDashboardTab({
     const [radarVisible, setRadarVisible] = useState(true);
     const [satelliteVisible, setSatelliteVisible] = useState(false);
     const [satelliteCoverageAvailable, setSatelliteCoverageAvailable] = useState(true);
+    // Mutually exclusive with radar/satellite (and with each other) — only one raster image
+    // overlay is ever drawn at a time, same rule that already governs radar vs. satellite.
+    const [activeGfaOverlay, setActiveGfaOverlay] = useState<GfaOverlayId | null>(null);
     const [airspaceVisible, setAirspaceVisible] = useState(true);
     const [tfrVisible, setTfrVisible] = useState(true);
     const [gairmetVisible, setGairmetVisible] = useState(true);
@@ -3646,12 +3698,27 @@ function RadarDashboardTab({
     const latitude = stationInfo?.latitude ?? null;
     const longitude = stationInfo?.longitude ?? null;
 
-    // Precipitation and satellite are two views of the same "live weather" slot —
-    // toggling one on swaps the other off, rather than layering both at once.
+    // Precipitation, satellite, and the four GFA forecast overlays are all views of the same
+    // "live weather" slot — toggling one on swaps every other one off, rather than layering
+    // multiple translucent rasters at once.
     function togglePrecipitation() {
         setRadarVisible((current) => {
             const next = !current;
-            if (next) setSatelliteVisible(false);
+            if (next) {
+                setSatelliteVisible(false);
+                setActiveGfaOverlay(null);
+            }
+            return next;
+        });
+    }
+
+    function toggleGfaOverlay(id: GfaOverlayId) {
+        setActiveGfaOverlay((current) => {
+            const next = current === id ? null : id;
+            if (next) {
+                setRadarVisible(false);
+                setSatelliteVisible(false);
+            }
             return next;
         });
     }
@@ -3660,7 +3727,10 @@ function RadarDashboardTab({
         if (!satelliteCoverageAvailable) return;
         setSatelliteVisible((current) => {
             const next = !current;
-            if (next) setRadarVisible(false);
+            if (next) {
+                setRadarVisible(false);
+                setActiveGfaOverlay(null);
+            }
             return next;
         });
     }
@@ -4349,6 +4419,26 @@ function RadarDashboardTab({
             ctx.drawImage(satelliteImg, x0, y0, x1 - x0, y1 - y0);
         }
 
+        const gfaImg = activeGfaOverlay ? gfaImagesRef.current[activeGfaOverlay] ?? null : null;
+        if (gfaImg && gfaImg.complete && gfaImg.naturalWidth > 0) {
+            const gfaLonOffset = wrapLonNear(GFA_MOSAIC_BOUNDS.west, view.lon) - GFA_MOSAIC_BOUNDS.west;
+            const topLeftWorld = projectToWorldPixel(
+                GFA_MOSAIC_BOUNDS.north,
+                GFA_MOSAIC_BOUNDS.west + gfaLonOffset,
+                tileZoom
+            );
+            const bottomRightWorld = projectToWorldPixel(
+                GFA_MOSAIC_BOUNDS.south,
+                GFA_MOSAIC_BOUNDS.east + gfaLonOffset,
+                tileZoom
+            );
+            const x0 = cssWidth / 2 + (topLeftWorld.x - centerWorldPx.x) * scaleFactor;
+            const y0 = cssHeight / 2 + (topLeftWorld.y - centerWorldPx.y) * scaleFactor;
+            const x1 = cssWidth / 2 + (bottomRightWorld.x - centerWorldPx.x) * scaleFactor;
+            const y1 = cssHeight / 2 + (bottomRightWorld.y - centerWorldPx.y) * scaleFactor;
+            ctx.drawImage(gfaImg, x0, y0, x1 - x0, y1 - y0);
+        }
+
         if (boundaryVisible) {
             for (let tx = minTileX; tx <= maxTileX; tx++) {
                 for (let ty = minTileY; ty <= maxTileY; ty++) {
@@ -4664,6 +4754,7 @@ function RadarDashboardTab({
         radarBoundsRef.current = null;
         satelliteImageRef.current = null;
         satelliteBoundsRef.current = null;
+        gfaImagesRef.current = {};
         airspacePolygonsRef.current = [];
         tfrPolygonsRef.current = [];
         gairmetZonesRef.current = [];
@@ -4735,7 +4826,7 @@ function RadarDashboardTab({
         // periodic nationwide reload) update silently and never touch this state.
         let radarLoadStepsCompleted = 0;
         const radarLoadTotalSteps =
-            1 + (satelliteAvailable ? 1 : 0) + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS + 1;
+            1 + (satelliteAvailable ? 1 : 0) + 1 + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS + 1;
         setRadarLoadProgress({
             ready: false,
             completed: 0,
@@ -4853,6 +4944,41 @@ function RadarDashboardTab({
             loadSatelliteImage().then(() => reportRadarLoadStep("Loading satellite imagery"));
             satelliteResyncId = window.setInterval(loadSatelliteImage, SATELLITE_RESYNC_INTERVAL_MS);
         }
+
+        // Thunderstorms/Weather Type/Turbulence/Icing — all four are the same GFA_MOSAIC_BOUNDS
+        // image, just a different product suffix, and all publish on the same model cycle. One
+        // cycle lookup, then one image fetch per product, all sharing the same resync interval.
+        const loadGfaOverlays = async (): Promise<void> => {
+            try {
+                const cycleResponse = await fetch("/api/gfa/cycle");
+                if (!cycleResponse.ok) return;
+                const cycle = await cycleResponse.json();
+                if (cancelled || !cycle?.date || !cycle?.hour) return;
+
+                await Promise.all(
+                    GFA_OVERLAYS.map(
+                        (overlay) =>
+                            new Promise<void>((resolve) => {
+                                const img = new window.Image();
+                                img.onload = () => {
+                                    if (!cancelled) {
+                                        gfaImagesRef.current[overlay.id] = img;
+                                        scheduleDraw();
+                                    }
+                                    resolve();
+                                };
+                                img.onerror = () => resolve();
+                                img.src = buildGfaProductUrl(overlay.fileProduct, cycle);
+                            })
+                    )
+                );
+            } catch {
+                // Supplementary — a failed load just leaves these overlays unavailable to toggle.
+            }
+        };
+
+        loadGfaOverlays().then(() => reportRadarLoadStep("Loading forecast overlays"));
+        const gfaResyncId = window.setInterval(loadGfaOverlays, GFA_RESYNC_INTERVAL_MS);
 
         (async () => {
             try {
@@ -5007,6 +5133,7 @@ function RadarDashboardTab({
             resizeObserver.disconnect();
             window.clearInterval(radarResyncId);
             window.clearInterval(satelliteResyncId);
+            window.clearInterval(gfaResyncId);
             window.clearInterval(nationwideRefreshId);
             nationwideAbortRef.current?.abort();
             nationwideAbortRef.current = null;
@@ -5016,6 +5143,7 @@ function RadarDashboardTab({
             radarBoundsRef.current = null;
             satelliteImageRef.current = null;
             satelliteBoundsRef.current = null;
+            gfaImagesRef.current = {};
             tileCache.clear();
             boundaryTileCache.clear();
             localDetailCoverageBoundsRef.current = null;
@@ -5215,6 +5343,67 @@ function RadarDashboardTab({
                     />
                     <p className="mt-1 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
                         Warm
+                    </p>
+                </div>
+            )}
+            {activeGfaOverlay === "thunderstorms" && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        T-Storm
+                    </p>
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        High
+                    </p>
+                    <div
+                        className="mx-auto mt-1 h-20 w-2 rounded-full"
+                        style={{ background: GFA_THUNDERSTORM_LEGEND_GRADIENT }}
+                    />
+                    <p className="mt-1 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Low
+                    </p>
+                </div>
+            )}
+            {activeGfaOverlay === "weatherType" && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Weather
+                    </p>
+                    <p className="mt-1 max-w-[64px] text-center text-[8px] leading-tight text-zinc-400">
+                        Color by precip type — GFA forecast
+                    </p>
+                </div>
+            )}
+            {activeGfaOverlay === "turbulence" && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Turb
+                    </p>
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Severe
+                    </p>
+                    <div
+                        className="mx-auto mt-1 h-20 w-2 rounded-full"
+                        style={{ background: GFA_TURBULENCE_LEGEND_GRADIENT }}
+                    />
+                    <p className="mt-1 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Light
+                    </p>
+                </div>
+            )}
+            {activeGfaOverlay === "icing" && (
+                <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Icing
+                    </p>
+                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Severe
+                    </p>
+                    <div
+                        className="mx-auto mt-1 h-20 w-2 rounded-full"
+                        style={{ background: GFA_ICING_LEGEND_GRADIENT }}
+                    />
+                    <p className="mt-1 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                        Trace
                     </p>
                 </div>
             )}
@@ -5728,6 +5917,130 @@ function RadarDashboardTab({
                                 {satelliteCoverageAvailable ? "Satellite" : "Satellite unavailable here"}
                             </span>
                         </button>
+
+                        <button
+                            type="button"
+                            title="Thunderstorms"
+                            aria-label="Show GFA thunderstorm forecast overlay"
+                            aria-pressed={activeGfaOverlay === "thunderstorms"}
+                            onClick={() => toggleGfaOverlay("thunderstorms")}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                activeGfaOverlay === "thunderstorms"
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M6.5 14.5a4 4 0 0 1 .6-7.96 5 5 0 0 1 9.5 1.9A3.6 3.6 0 0 1 16 15.5H7.2" />
+                                <path
+                                    d="M12.5 12.5 9.8 17h2.1l-1.4 4 3.9-5.2h-2.1l1.4-3.3z"
+                                    fill="currentColor"
+                                    stroke="none"
+                                />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                Thunderstorms
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            title="Weather Type"
+                            aria-label="Show GFA surface weather-type forecast overlay"
+                            aria-pressed={activeGfaOverlay === "weatherType"}
+                            onClick={() => toggleGfaOverlay("weatherType")}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                activeGfaOverlay === "weatherType"
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M7 14.5a4 4 0 0 1 .5-7.96 5 5 0 0 1 9.5 1.9A3.6 3.6 0 0 1 16.5 15.5H8" />
+                                <line x1="9" y1="18" x2="8.3" y2="20.5" />
+                                <line x1="13" y1="18" x2="12.3" y2="20.5" />
+                                <line x1="17" y1="18" x2="16.3" y2="20.5" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                Weather Type
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            title="Turbulence"
+                            aria-label="Show GFA turbulence forecast overlay"
+                            aria-pressed={activeGfaOverlay === "turbulence"}
+                            onClick={() => toggleGfaOverlay("turbulence")}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                activeGfaOverlay === "turbulence"
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <path d="M2 13 6 8 9.5 16 13 8 16.5 16 20 11" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                Turbulence
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            title="Icing"
+                            aria-label="Show GFA icing forecast overlay"
+                            aria-pressed={activeGfaOverlay === "icing"}
+                            onClick={() => toggleGfaOverlay("icing")}
+                            className={`group relative flex h-9 w-9 items-center justify-center rounded-lg border transition ${
+                                activeGfaOverlay === "icing"
+                                    ? "border-[#d6b35a] bg-[#d6b35a]/20 text-[#e6c76f]"
+                                    : "border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300"
+                            }`}
+                        >
+                            <svg
+                                viewBox="0 0 24 24"
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                            >
+                                <line x1="12" y1="3" x2="12" y2="21" />
+                                <line x1="4.9" y1="7.5" x2="19.1" y2="16.5" />
+                                <line x1="19.1" y1="7.5" x2="4.9" y2="16.5" />
+                                <path d="M12 3 10.5 5 M12 3 13.5 5" />
+                                <path d="M12 21 10.5 19 M12 21 13.5 19" />
+                            </svg>
+                            <span className="pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded bg-black/90 px-2 py-1 text-[10px] font-semibold text-zinc-200 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                Icing
+                            </span>
+                        </button>
                     </div>
                 </div>
 
@@ -5995,6 +6308,108 @@ function RadarDashboardTab({
                                     </g>
                                 </svg>
                                 <span>{satelliteCoverageAvailable ? "Satellite" : "Satellite (CONUS only)"}</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => toggleGfaOverlay("thunderstorms")}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    activeGfaOverlay === "thunderstorms"
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <path d="M6.5 14.5a4 4 0 0 1 .6-7.96 5 5 0 0 1 9.5 1.9A3.6 3.6 0 0 1 16 15.5H7.2" />
+                                    <path
+                                        d="M12.5 12.5 9.8 17h2.1l-1.4 4 3.9-5.2h-2.1l1.4-3.3z"
+                                        fill="currentColor"
+                                        stroke="none"
+                                    />
+                                </svg>
+                                <span>Thunderstorms</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => toggleGfaOverlay("weatherType")}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    activeGfaOverlay === "weatherType"
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <path d="M7 14.5a4 4 0 0 1 .5-7.96 5 5 0 0 1 9.5 1.9A3.6 3.6 0 0 1 16.5 15.5H8" />
+                                    <line x1="9" y1="18" x2="8.3" y2="20.5" />
+                                    <line x1="13" y1="18" x2="12.3" y2="20.5" />
+                                    <line x1="17" y1="18" x2="16.3" y2="20.5" />
+                                </svg>
+                                <span>Weather Type</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => toggleGfaOverlay("turbulence")}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    activeGfaOverlay === "turbulence"
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <path d="M2 13 6 8 9.5 16 13 8 16.5 16 20 11" />
+                                </svg>
+                                <span>Turbulence</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => toggleGfaOverlay("icing")}
+                                className={`flex items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-semibold transition ${
+                                    activeGfaOverlay === "icing"
+                                        ? "bg-[#d6b35a]/20 text-[#e6c76f]"
+                                        : "text-zinc-300 hover:bg-zinc-800"
+                                }`}
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    className="h-4 w-4 shrink-0"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                >
+                                    <line x1="12" y1="3" x2="12" y2="21" />
+                                    <line x1="4.9" y1="7.5" x2="19.1" y2="16.5" />
+                                    <line x1="19.1" y1="7.5" x2="4.9" y2="16.5" />
+                                </svg>
+                                <span>Icing</span>
                             </button>
                         </div>
                     )}
