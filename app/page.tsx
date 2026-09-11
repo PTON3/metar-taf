@@ -55,22 +55,22 @@ const RADAR_ZOOM_STEP_PERCENT = 0.1;
 // remaining gap to close each frame — higher feels snappier/more direct, lower feels smoother.
 const RADAR_WHEEL_ZOOM_EASE = 0.35;
 
-// NOAA/NCEP GeoServer (opengeo.ncep.noaa.gov) serving the MRMS quality-controlled
-// CONUS base reflectivity mosaic — a direct government data source (no API key).
-const RADAR_WMS_BASE_URL = "https://opengeo.ncep.noaa.gov/geoserver/conus/wms";
-const RADAR_WMS_LAYER = "conus_bref_qcd";
-// "conus_bref_qcd" only covers the continental US and publishes a queryable time
-// history (what powers the animation loop). "regions_bref_qcd" is the broader NOAA
-// mosaic covering CONUS + Alaska + Hawaii + Caribbean + Guam, but it's latest-frame
-// only — no time dimension — so stations outside CONUS get a static radar image.
-const RADAR_WMS_REGIONS_LAYER = "regions_bref_qcd";
-const RADAR_CONUS_BOUNDS: RadarWmsBounds = { west: -130, south: 20, east: -60, north: 55 };
-const RADAR_WMS_CAPABILITIES_URL = `${RADAR_WMS_BASE_URL}?service=WMS&version=1.1.1&request=GetCapabilities`;
-const RADAR_IMAGE_MAX_PX = 1024;
-// The layer publishes observations roughly every 2 minutes; stepping by 5 spaces
-// animation frames about 10 minutes apart so storm motion actually reads.
+// aviationweather.gov's own radar mosaic — the "Radar lowest" layer on their Observations map.
+// Same underlying NOAA MRMS data as the old opengeo.ncep.noaa.gov WMS source this replaces
+// (confirmed: the tile layer's own attribution reads "MRMS") — what's different is delivery: a
+// real XYZ/TMS tile pyramid instead of one WMS image stretched across every zoom level, so it
+// stays crisp when zoomed in instead of getting blurry, the same upgrade already made for
+// satellite. It also animates uniformly everywhere (found the same 6-frame animated tile set
+// covering both Alaska and CONUS in the same session), so unlike before there's no separate
+// "outside CONUS gets a single static frame" fallback path to maintain.
+const RADAR_TILE_URL_TEMPLATE =
+    "https://aviationweather.gov/data/tilecache/rad_rala/{date}/{time}/{z}/rad_{x}_{y}.png";
+// Tiles only exist natively up to this zoom — past it the highest-zoom tiles are scaled up
+// rather than fetched at a zoom that 404s.
+const RADAR_MAX_NATIVE_ZOOM = 7;
+// The layer publishes new frames roughly every 10 minutes; matches RADAR_ANIMATION_FRAME_COUNT
+// below so the animation loop always has exactly this many frames to play through.
 const RADAR_ANIMATION_FRAME_COUNT = 6;
-const RADAR_ANIMATION_FRAME_STEP = 5;
 const RADAR_ANIMATION_FRAME_MS = 500;
 const RADAR_ANIMATION_LAST_FRAME_HOLD_MS = 3000;
 // Refetch at least this often so a screen left open on the radar tab still
@@ -93,45 +93,10 @@ const SATELLITE_RESYNC_INTERVAL_MS = 10 * 60_000;
 // enhancement, unlike the old IEM source this replaces.
 const SATELLITE_LEGEND_GRADIENT = "linear-gradient(to top, #050505, #808080, #ffffff)";
 
-// NOAA's default render style ("conus_bref_qcd") sampled from its own published
-// legend (~-20 to 70+ dBZ), paired 1:1 with our own custom output colors so the
-// live government reflectivity data is recolored entirely in-house.
-const RADAR_SOURCE_STOPS: readonly [number, number, number][] = [
-    [141, 129, 127],
-    [189, 193, 180],
-    [98, 118, 168],
-    [94, 174, 206],
-    [67, 214, 131],
-    [14, 213, 20],
-    [10, 110, 11],
-    [250, 216, 10],
-    [243, 178, 27],
-    [197, 10, 11],
-    [174, 3, 3],
-    [239, 116, 253],
-    [140, 0, 235],
-];
-
-const RADAR_CUSTOM_STOPS: readonly [number, number, number, number][] = [
-    [45, 212, 191, 0],
-    [45, 212, 191, 60],
-    [52, 211, 153, 120],
-    [132, 204, 90, 150],
-    [214, 179, 90, 175],
-    [230, 199, 111, 195],
-    [224, 150, 43, 215],
-    [224, 110, 43, 225],
-    [214, 71, 46, 235],
-    [178, 30, 30, 245],
-    [150, 20, 90, 250],
-    [155, 47, 214, 255],
-    [110, 20, 190, 255],
-];
-
-// Legend gradient (light -> heavy), skipping the fully-transparent no-echo stop.
-const RADAR_LEGEND_GRADIENT = `linear-gradient(to top, ${RADAR_CUSTOM_STOPS.slice(1)
-    .map(([r, g, b, a]) => `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(2)})`)
-    .join(", ")})`;
+// Exact colors read off aviationweather.gov's own "Radar (dBZ)" legend popover DOM — the tiles
+// arrive already styled in this palette (no client-side recoloring, same as satellite/GFA).
+const RADAR_LEGEND_GRADIENT =
+    "linear-gradient(to top, #888, #46a, #59c, #4d7, #1b1, #191, #161, #fd0, #f90, red, #900, #fff, #f6f, #a0f)";
 
 const RADAR_SCALE_NICE_VALUES_NM = [
     1, 2, 5, 10, 20, 25, 50, 75, 100, 150, 200, 300, 400, 500, 750, 1000, 1500, 2000, 3000, 5000,
@@ -170,27 +135,12 @@ const PAN_CLAMP_BOUNDS: RadarWmsBounds = { west: -Infinity, south: -85, east: In
 // Satellite is a genuinely global tile source, so it isn't bounded to this box at all.
 const AMERICAS_BOUNDS: RadarWmsBounds = { west: -170, south: 15, east: -50, north: 75 };
 
-function buildRadarWmsUrl(
-    bounds: RadarWmsBounds,
-    width: number,
-    height: number,
-    time?: string,
-    layer: string = RADAR_WMS_LAYER
-): string {
-    const params = new URLSearchParams({
-        service: "WMS",
-        version: "1.1.1",
-        request: "GetMap",
-        layers: layer,
-        bbox: `${bounds.west},${bounds.south},${bounds.east},${bounds.north}`,
-        width: String(width),
-        height: String(height),
-        srs: "EPSG:4326",
-        format: "image/png",
-        transparent: "true",
-    });
-    if (time) params.set("time", time);
-    return `${RADAR_WMS_BASE_URL}?${params.toString()}`;
+function buildRadarTileUrl(z: number, x: number, y: number, frame: { date: string; time: string }): string {
+    return RADAR_TILE_URL_TEMPLATE.replace("{date}", frame.date)
+        .replace("{time}", frame.time)
+        .replace("{z}", String(z))
+        .replace("{x}", String(x))
+        .replace("{y}", String(y));
 }
 
 function buildSatelliteTileUrl(z: number, x: number, y: number, cycle: { date: string; time: string }): string {
@@ -260,119 +210,6 @@ const GFA_WEATHER_TYPE_SWATCHES: readonly { label: string; color: string }[] = [
     { label: "Ice", color: "#e40072" },
     { label: "T-Storm", color: "#99000d" },
 ];
-
-async function fetchRecoloredRadarOverlay(
-    bounds: RadarWmsBounds,
-    time?: string,
-    layer: string = RADAR_WMS_LAYER
-): Promise<string> {
-    const lonSpan = bounds.east - bounds.west;
-    const latSpan = bounds.north - bounds.south;
-    const aspect = lonSpan / latSpan;
-    const width = aspect >= 1 ? RADAR_IMAGE_MAX_PX : Math.round(RADAR_IMAGE_MAX_PX * aspect);
-    const height = aspect >= 1 ? Math.round(RADAR_IMAGE_MAX_PX / aspect) : RADAR_IMAGE_MAX_PX;
-
-    const response = await fetch(buildRadarWmsUrl(bounds, width, height, time, layer));
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!response.ok || !contentType.startsWith("image/")) {
-        throw new Error("Radar imagery request failed.");
-    }
-
-    const blob = await response.blob();
-    const bitmap = await createImageBitmap(blob);
-    const canvas = document.createElement("canvas");
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Canvas unavailable.");
-
-    ctx.drawImage(bitmap, 0, 0);
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const data = imageData.data;
-
-    for (let i = 0; i < data.length; i += 4) {
-        if (data[i + 3] === 0) continue;
-
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-
-        let bestIndex = 0;
-        let bestDistance = Infinity;
-        for (let s = 0; s < RADAR_SOURCE_STOPS.length; s++) {
-            const [sr, sg, sb] = RADAR_SOURCE_STOPS[s];
-            const dr = r - sr;
-            const dg = g - sg;
-            const db = b - sb;
-            const distance = dr * dr + dg * dg + db * db;
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestIndex = s;
-            }
-        }
-
-        const [cr, cg, cb, ca] = RADAR_CUSTOM_STOPS[bestIndex];
-        data[i] = cr;
-        data[i + 1] = cg;
-        data[i + 2] = cb;
-        data[i + 3] = ca;
-    }
-
-    ctx.putImageData(imageData, 0, 0);
-
-    const outputBlob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((result) => {
-            if (result) resolve(result);
-            else reject(new Error("Failed to encode radar overlay."));
-        }, "image/png");
-    });
-
-    return URL.createObjectURL(outputBlob);
-}
-
-async function fetchRadarTimeExtent(): Promise<Date[]> {
-    const response = await fetch(RADAR_WMS_CAPABILITIES_URL);
-    if (!response.ok) return [];
-
-    const text = await response.text();
-    const layerIndex = text.indexOf(`<Name>${RADAR_WMS_LAYER}</Name>`);
-    if (layerIndex === -1) return [];
-
-    const extentMatch = text
-        .slice(layerIndex, layerIndex + 8000)
-        .match(/<Extent name="time"[^>]*>([^<]+)<\/Extent>/);
-    if (!extentMatch) return [];
-
-    return extentMatch[1]
-        .split(",")
-        .map((value) => new Date(value.trim()))
-        .filter((date) => !Number.isNaN(date.getTime()))
-        .sort((a, b) => a.getTime() - b.getTime());
-}
-
-// Picks a handful of frames spaced a few steps apart, newest last, so looping
-// them shows storm motion instead of a near-static blur of near-identical scans.
-function selectRadarAnimationFrames(times: Date[]): Date[] {
-    if (times.length === 0) return [];
-    const selected: Date[] = [];
-    for (
-        let i = times.length - 1;
-        i >= 0 && selected.length < RADAR_ANIMATION_FRAME_COUNT;
-        i -= RADAR_ANIMATION_FRAME_STEP
-    ) {
-        selected.push(times[i]);
-    }
-    return selected.reverse();
-}
-
-function isWithinConusRadarCoverage(lat: number, lon: number): boolean {
-    return (
-        lat >= RADAR_CONUS_BOUNDS.south &&
-        lat <= RADAR_CONUS_BOUNDS.north &&
-        lon >= RADAR_CONUS_BOUNDS.west &&
-        lon <= RADAR_CONUS_BOUNDS.east
-    );
-}
 
 // ---- FAA aeronautical data (Aeronautical Information Services open data) ----
 // Both are official public FAA feature services, no API key required.
@@ -3611,9 +3448,8 @@ function RadarDashboardTab({
     const airportSearchContainerRef = useRef<HTMLDivElement | null>(null);
     const tileCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
     const boundaryTileCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
-    const radarFrameImagesRef = useRef<HTMLImageElement[]>([]);
-    const radarBoundsRef = useRef<GeoBounds | null>(null);
-    const radarObjectUrlsRef = useRef<string[]>([]);
+    const radarTileCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+    const radarFramesRef = useRef<{ date: string; time: string }[]>([]);
     const satelliteTileCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
     const satelliteCycleRef = useRef<{ date: string; time: string } | null>(null);
     const gfaImagesRef = useRef<Partial<Record<GfaOverlayId, HTMLImageElement>>>({});
@@ -4366,21 +4202,45 @@ function RadarDashboardTab({
             }
         }
 
-        const radarImg = radarFrameImagesRef.current[currentFrameIndex] ?? null;
-        const radarBounds = radarBoundsRef.current;
-        if (radarImg && radarBounds && radarVisible && radarImg.complete && radarImg.naturalWidth > 0) {
-            const radarLonOffset = wrapLonNear(radarBounds.west, view.lon) - radarBounds.west;
-            const topLeftWorld = projectToWorldPixel(radarBounds.north, radarBounds.west + radarLonOffset, tileZoom);
-            const bottomRightWorld = projectToWorldPixel(
-                radarBounds.south,
-                radarBounds.east + radarLonOffset,
-                tileZoom
-            );
-            const x0 = cssWidth / 2 + (topLeftWorld.x - centerWorldPx.x) * scaleFactor;
-            const y0 = cssHeight / 2 + (topLeftWorld.y - centerWorldPx.y) * scaleFactor;
-            const x1 = cssWidth / 2 + (bottomRightWorld.x - centerWorldPx.x) * scaleFactor;
-            const y1 = cssHeight / 2 + (bottomRightWorld.y - centerWorldPx.y) * scaleFactor;
-            ctx.drawImage(radarImg, x0, y0, x1 - x0, y1 - y0);
+        // Radar is a real tile pyramid too (see RADAR_TILE_URL_TEMPLATE) — same tiled draw
+        // pattern as the basemap and satellite, just addressed by animation frame as well as
+        // zoom/x/y so every frame's tiles can be cached and drawn instantly once fetched once.
+        const radarFrame = radarVisible ? radarFramesRef.current[currentFrameIndex] : undefined;
+        if (radarFrame) {
+            const radTileZoom = Math.min(tileZoom, RADAR_MAX_NATIVE_ZOOM);
+            const radScaleFactor = Math.pow(2, view.zoom - radTileZoom);
+            const radCenterWorldPx = projectToWorldPixel(view.lat, view.lon, radTileZoom);
+            const radHalfWidthWorld = cssWidth / 2 / radScaleFactor;
+            const radHalfHeightWorld = cssHeight / 2 / radScaleFactor;
+            const radMinTileX = Math.floor((radCenterWorldPx.x - radHalfWidthWorld) / MAP_TILE_SIZE) - 1;
+            const radMaxTileX = Math.floor((radCenterWorldPx.x + radHalfWidthWorld) / MAP_TILE_SIZE) + 1;
+            const radMinTileY = Math.floor((radCenterWorldPx.y - radHalfHeightWorld) / MAP_TILE_SIZE) - 1;
+            const radMaxTileY = Math.floor((radCenterWorldPx.y + radHalfHeightWorld) / MAP_TILE_SIZE) + 1;
+            const radTileCount = Math.pow(2, radTileZoom);
+
+            for (let tx = radMinTileX; tx <= radMaxTileX; tx++) {
+                for (let ty = radMinTileY; ty <= radMaxTileY; ty++) {
+                    if (ty < 0 || ty >= radTileCount) continue;
+                    const wrappedX = ((tx % radTileCount) + radTileCount) % radTileCount;
+                    // TMS Y-flip for the request only — on-screen position still uses the
+                    // un-flipped ty, same reasoning as the satellite tile loop above.
+                    const tmsY = radTileCount - 1 - ty;
+                    const key = `${radarFrame.date}${radarFrame.time}/${radTileZoom}/${wrappedX}/${tmsY}`;
+                    let img = radarTileCacheRef.current.get(key);
+                    if (!img) {
+                        img = new window.Image();
+                        img.src = buildRadarTileUrl(radTileZoom, wrappedX, tmsY, radarFrame);
+                        img.onload = () => scheduleDraw();
+                        radarTileCacheRef.current.set(key, img);
+                    }
+                    if (img.complete && img.naturalWidth > 0) {
+                        const screenX = cssWidth / 2 + (tx * MAP_TILE_SIZE - radCenterWorldPx.x) * radScaleFactor;
+                        const screenY = cssHeight / 2 + (ty * MAP_TILE_SIZE - radCenterWorldPx.y) * radScaleFactor;
+                        const size = MAP_TILE_SIZE * radScaleFactor;
+                        ctx.drawImage(img, screenX, screenY, size, size);
+                    }
+                }
+            }
         }
 
         // Satellite is a real tile pyramid (see SATELLITE_TILE_URL_TEMPLATE), not one stretched
@@ -4756,8 +4616,8 @@ function RadarDashboardTab({
         setRadarError(null);
         tileCache.clear();
         boundaryTileCache.clear();
-        radarFrameImagesRef.current = [];
-        radarBoundsRef.current = null;
+        radarTileCacheRef.current.clear();
+        radarFramesRef.current = [];
         satelliteTileCacheRef.current.clear();
         satelliteCycleRef.current = null;
         gfaImagesRef.current = {};
@@ -4799,11 +4659,9 @@ function RadarDashboardTab({
         const height = container.clientHeight;
         // Airspace/airport ArcGIS queries error out (reported as a CORS failure) past roughly
         // this size, so their initial fetch — and every later viewport-driven refetch as the
-        // user pans — stays capped at this radius. Radar/satellite imagery has no such limit
-        // (it's a single raster, not a feature query), so those use imageryBounds instead —
-        // nationwide from the start rather than clipped to the station.
+        // user pans — stays capped at this radius. Radar/satellite are tile pyramids now, with
+        // no equivalent request-size limit, so they aren't bounded by this at all.
         const maxZoomOutBounds = boundsForDiameterMeters(center, RADAR_MAX_RADIUS_NM * NM_TO_METERS * 2);
-        const imageryBounds = AMERICAS_BOUNDS;
         const minZoom =
             width > 0 && height > 0 ? computeBoundsZoom(GLOBAL_PAN_BOUNDS, width, height, "cover") : 2;
         const defaultMaxZoom =
@@ -4821,9 +4679,6 @@ function RadarDashboardTab({
 
         const resizeObserver = new ResizeObserver(() => recomputeZoomRange());
         resizeObserver.observe(container);
-
-        const useAnimatedRadar = isWithinConusRadarCoverage(center.lat, center.lon);
-        const radarLayer = useAnimatedRadar ? RADAR_WMS_LAYER : RADAR_WMS_REGIONS_LAYER;
 
         // The loading screen is only shown for the very first load of a station — steps: radar,
         // satellite, the hazards/local-area bundle, one per nationwide zone, and flight
@@ -4848,55 +4703,41 @@ function RadarDashboardTab({
             });
         }
 
+        // Every resync fetches the *current* latest N frame timestamps from aviationweather.gov
+        // fresh — never a cached list — so a screen left open always advances to newly published
+        // scans instead of looping the same frames forever. Frames are identified by their own
+        // date/time stamp, so a stale vs. current frame can never be confused with each other;
+        // any tile cache entries for stamps no longer in the current list are pruned below so the
+        // cache doesn't grow unbounded over a long session.
         const loadRadarFrames = async () => {
             try {
-                // Outside CONUS (Alaska, Hawaii, Caribbean, Guam) there's no time-series
-                // API to query — just fetch the one current mosaic frame for that layer.
-                const frameTimes = useAnimatedRadar
-                    ? selectRadarAnimationFrames(await fetchRadarTimeExtent())
-                    : [new Date()];
-                if (frameTimes.length === 0) throw new Error("No radar frames available.");
+                const response = await fetch(`/api/radar/frames?num=${RADAR_ANIMATION_FRAME_COUNT}`);
+                if (!response.ok) throw new Error("Radar frame list request failed.");
+                const data = await response.json();
+                const frames = Array.isArray(data?.frames) ? data.frames : [];
+                if (frames.length === 0) throw new Error("No radar frames available.");
+                if (cancelled) return;
 
-                const objectUrls = await Promise.all(
-                    frameTimes.map((frameTime) =>
-                        fetchRecoloredRadarOverlay(
-                            imageryBounds,
-                            useAnimatedRadar ? frameTime.toISOString() : undefined,
-                            radarLayer
+                radarFramesRef.current = frames;
+                const liveKeys = new Set(frames.map((f: { date: string; time: string }) => `${f.date}${f.time}`));
+                for (const key of radarTileCacheRef.current.keys()) {
+                    if (!liveKeys.has(key.split("/")[0])) radarTileCacheRef.current.delete(key);
+                }
+
+                setRadarFrameTimes(
+                    frames.map((f: { date: string; time: string }) =>
+                        new Date(
+                            Date.UTC(
+                                Number(f.date.slice(0, 4)),
+                                Number(f.date.slice(4, 6)) - 1,
+                                Number(f.date.slice(6, 8)),
+                                Number(f.time.slice(0, 2)),
+                                Number(f.time.slice(2, 4))
+                            )
                         )
                     )
                 );
-
-                if (cancelled) {
-                    objectUrls.forEach((url) => URL.revokeObjectURL(url));
-                    return;
-                }
-
-                const images = await Promise.all(
-                    objectUrls.map(
-                        (url) =>
-                            new Promise<HTMLImageElement>((resolve, reject) => {
-                                const img = new window.Image();
-                                img.onload = () => resolve(img);
-                                img.onerror = () => reject(new Error("Failed to load radar frame."));
-                                img.src = url;
-                            })
-                    )
-                );
-
-                if (cancelled) {
-                    objectUrls.forEach((url) => URL.revokeObjectURL(url));
-                    return;
-                }
-
-                const previousObjectUrls = radarObjectUrlsRef.current;
-                radarObjectUrlsRef.current = objectUrls;
-                radarBoundsRef.current = imageryBounds;
-                radarFrameImagesRef.current = images;
-                previousObjectUrls.forEach((url) => URL.revokeObjectURL(url));
-
-                setRadarFrameTimes(frameTimes);
-                setCurrentFrameIndex(frameTimes.length - 1);
+                setCurrentFrameIndex(frames.length - 1);
                 setRadarFrameGeneration((generation) => generation + 1);
                 setRadarError(null);
                 scheduleDraw();
@@ -5126,10 +4967,8 @@ function RadarDashboardTab({
             window.clearInterval(nationwideRefreshId);
             nationwideAbortRef.current?.abort();
             nationwideAbortRef.current = null;
-            radarObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-            radarObjectUrlsRef.current = [];
-            radarFrameImagesRef.current = [];
-            radarBoundsRef.current = null;
+            radarTileCacheRef.current.clear();
+            radarFramesRef.current = [];
             satelliteTileCacheRef.current.clear();
             satelliteCycleRef.current = null;
             gfaImagesRef.current = {};
