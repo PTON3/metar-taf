@@ -787,16 +787,25 @@ function computeVisibleAirports(
     selectedIdent: string | null,
     tier: AirportDetailTier
 ): AirportPoint[] {
-    if (tier === "all") return airports as AirportPoint[];
+    // The FAA airport dataset includes thousands of small fields that have never had a METAR
+    // (tiny private/public airstrips, heliports) — at the "all" tier that swamps the map with
+    // uncolored gray dots that can never resolve a category. aviationweather.gov's own map never
+    // plots a non-METAR airport at all; matched here by only ever showing an airport if it has a
+    // real category or is a major hub (kept even without a category since that's more likely a
+    // temporary METAR-fetch gap than a structurally METAR-less field). The selected airport is
+    // always shown regardless, since it can be reached via search even if it has neither.
+    const selected = selectedIdent ? airports.find((airport) => airport.ident === selectedIdent) ?? null : null;
+    const eligible = airports.filter(
+        (airport) => airport.ident !== selectedIdent && (airport.flightCategory !== undefined || airport.isMajor)
+    );
+
+    if (tier === "all") {
+        return selected ? [...eligible, selected] : eligible;
+    }
 
     const cellSize = AIRPORT_DECLUTTER_CELL_PX;
     const bestByCell = new Map<string, { airport: AirportPoint; score: number }>();
-    let selected: AirportPoint | null = null;
-    for (const airport of airports) {
-        if (airport.ident === selectedIdent) {
-            selected = airport;
-            continue;
-        }
+    for (const airport of eligible) {
         const world = projectToWorldPixel(airport.lat, wrapLonNear(airport.lon, view.lon), tileZoom);
         const x = cssWidth / 2 + (world.x - centerWorldPx.x) * scaleFactor;
         const y = cssHeight / 2 + (world.y - centerWorldPx.y) * scaleFactor;
