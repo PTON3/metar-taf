@@ -249,15 +249,27 @@ function buildGfaProductUrl(fileProduct: string, cycle: { date: string; hour: st
     return `https://aviationweather.gov/data/products/gfam/${cycle.date}/${cycle.hour}/${cycle.date}_${cycle.hour}_F00_gfaak_${fileProduct}_m.gif`;
 }
 
-// Approximate legend swatches for the intensity-scale GFA overlays — read off the GFA tool's own
-// on-screen legend, not exact hex stops (it doesn't expose those), so these are representative
-// rather than pixel-identical to the source. Weather Type is a categorical (not gradient) scale —
-// different colors mean different precip types, not more/less of one thing — so it gets no bar.
-const GFA_THUNDERSTORM_LEGEND_GRADIENT =
-    "linear-gradient(to top, transparent, #fef08a, #fb923c, #ef4444, #7f1d1d)";
+// Legend colors pulled directly from the GFA tool's own legend popover (read via its live DOM —
+// e.g. window.gfa's Turbulence legend renders a ~45-stop gradient table with exact hex values per
+// cell), not approximated, so these match the source exactly rather than just resembling it.
+// Thunderstorm coverage: ISOL / SCT / NUM (isolated/scattered/numerous — standard aviation
+// coverage terms), a flat 3-stop scale, not a smooth gradient.
+const GFA_THUNDERSTORM_LEGEND_GRADIENT = "linear-gradient(to top, #f99, #f33, #900)";
+// GTG turbulence (Eddy Dissipation Rate x100) — sampled down from the tool's full gradient table.
 const GFA_TURBULENCE_LEGEND_GRADIENT =
-    "linear-gradient(to top, #22c55e, #eab308, #f97316, #dc2626, #7f1d1d)";
-const GFA_ICING_LEGEND_GRADIENT = "linear-gradient(to top, #bae6fd, #38bdf8, #6366f1, #a21caf)";
+    "linear-gradient(to top, #f4ffff, #cff, #cf6, #cf0, #fc0, #f90, #f60, #f40000, #900, #3d0000)";
+// Icing severity with SLD (supercooled large droplets, the red cap) — Trace/Light/Mod/Heavy/SLD.
+const GFA_ICING_LEGEND_GRADIENT =
+    "linear-gradient(to top, #cff, #9cf, #69f, #33f, rgba(255,0,0,0.5))";
+// Weather Type categories — the "Likely" (more saturated) tier of each precip type, plus severe
+// thunderstorms. It's categorical, not an intensity scale, so these render as swatches, not a bar.
+const GFA_WEATHER_TYPE_SWATCHES: readonly { label: string; color: string }[] = [
+    { label: "Rain", color: "#065d2c" },
+    { label: "Snow", color: "#081d58" },
+    { label: "Mix", color: "#490092" },
+    { label: "Ice", color: "#e40072" },
+    { label: "T-Storm", color: "#99000d" },
+];
 
 async function fetchRecoloredRadarOverlay(
     bounds: RadarWmsBounds,
@@ -5352,25 +5364,33 @@ function RadarDashboardTab({
                         T-Storm
                     </p>
                     <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
-                        High
+                        Numerous
                     </p>
                     <div
                         className="mx-auto mt-1 h-20 w-2 rounded-full"
                         style={{ background: GFA_THUNDERSTORM_LEGEND_GRADIENT }}
                     />
                     <p className="mt-1 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
-                        Low
+                        Isolated
                     </p>
                 </div>
             )}
             {activeGfaOverlay === "weatherType" && (
                 <div className="rounded-lg border border-zinc-700 bg-black/70 px-1.5 py-1.5 backdrop-blur-sm">
-                    <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
+                    <p className="mb-0.5 text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
                         Weather
                     </p>
-                    <p className="mt-1 max-w-[64px] text-center text-[8px] leading-tight text-zinc-400">
-                        Color by precip type — GFA forecast
-                    </p>
+                    <div className="space-y-0.5">
+                        {GFA_WEATHER_TYPE_SWATCHES.map(({ label, color }) => (
+                            <div key={label} className="flex items-center gap-1">
+                                <span
+                                    className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                    style={{ background: color }}
+                                />
+                                <span className="whitespace-nowrap text-[9px] text-zinc-300">{label}</span>
+                            </div>
+                        ))}
+                    </div>
                 </div>
             )}
             {activeGfaOverlay === "turbulence" && (
@@ -5379,7 +5399,7 @@ function RadarDashboardTab({
                         Turb
                     </p>
                     <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
-                        Severe
+                        Extreme
                     </p>
                     <div
                         className="mx-auto mt-1 h-20 w-2 rounded-full"
@@ -5396,7 +5416,7 @@ function RadarDashboardTab({
                         Icing
                     </p>
                     <p className="text-center text-[8px] font-semibold uppercase tracking-wide text-zinc-400">
-                        Severe
+                        SLD
                     </p>
                     <div
                         className="mx-auto mt-1 h-20 w-2 rounded-full"
