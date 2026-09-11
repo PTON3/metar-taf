@@ -657,7 +657,10 @@ function resolveMetarStationKey(airport: AirportPoint): string | null {
 const METAR_IDS_BATCH_SIZE = 300;
 const METAR_IDS_FETCH_CONCURRENCY = 4;
 
-async function fetchFlightCategoriesByIdents(idents: readonly string[]): Promise<Map<string, FlightCategory>> {
+async function fetchFlightCategoriesByIdents(
+    idents: readonly string[],
+    signal?: AbortSignal
+): Promise<Map<string, FlightCategory>> {
     const uniqueIdents = Array.from(new Set(idents));
     const batches: string[][] = [];
     for (let i = 0; i < uniqueIdents.length; i += METAR_IDS_BATCH_SIZE) {
@@ -667,7 +670,8 @@ async function fetchFlightCategoriesByIdents(idents: readonly string[]): Promise
     const categories = new Map<string, FlightCategory>();
     await runWithConcurrency(
         batches.map((batch) => async () => {
-            const response = await fetch(`/api/metar/ids?ids=${batch.join(",")}`);
+            if (signal?.aborted) return;
+            const response = await fetch(`/api/metar/ids?ids=${batch.join(",")}`, { signal });
             if (!response.ok) return;
             const data = await response.json();
             const stations = Array.isArray(data?.stations) ? data.stations : [];
@@ -690,9 +694,12 @@ async function fetchFlightCategoriesByIdents(idents: readonly string[]): Promise
 // Looks up a real flightCategory (if any) for every airport by its own identifier and attaches
 // it — no fallback, no estimate. An airport this doesn't find a category for simply has none,
 // which is the honest, correct state for a field with no ASOS/AWOS of its own: it stays gray.
-async function attachFlightCategories(airports: readonly AirportPoint[]): Promise<AirportPoint[]> {
+async function attachFlightCategories(
+    airports: readonly AirportPoint[],
+    signal?: AbortSignal
+): Promise<AirportPoint[]> {
     const idents = airports.map((airport) => resolveMetarStationKey(airport)).filter((key): key is string => key !== null);
-    const categories = await fetchFlightCategoriesByIdents(idents);
+    const categories = await fetchFlightCategoriesByIdents(idents, signal);
     if (categories.size === 0) return airports as AirportPoint[];
     return airports.map((airport) => {
         const key = resolveMetarStationKey(airport);
@@ -930,12 +937,33 @@ const NATIONWIDE_REFRESH_INTERVAL_MS = 7 * 60_000;
 // requests.
 const NATIONWIDE_ADAPTIVE_MAX_DEPTH = 3;
 
+// A transient failure (network blip, the ArcGIS service's own request-unit quota — see the
+// runWithConcurrency comment) on just one quadrant used to sink the *entire* top-level tile: the
+// old single `.catch(() => [])` at each call site wrapped the whole recursive fetchAdaptive call,
+// so one bad sub-request discarded every sibling quadrant's already-successful results too. One
+// retry plus catching failures at the leaf itself keeps a lone bad quadrant's blast radius to just
+// that quadrant.
+async function fetchPageWithRetry<T>(
+    bounds: GeoBounds,
+    fetchPage: (bounds: GeoBounds) => Promise<{ items: T[]; exceededLimit: boolean }>
+): Promise<{ items: T[]; exceededLimit: boolean }> {
+    try {
+        return await fetchPage(bounds);
+    } catch {
+        try {
+            return await fetchPage(bounds);
+        } catch {
+            return { items: [], exceededLimit: false };
+        }
+    }
+}
+
 async function fetchAdaptive<T>(
     bounds: GeoBounds,
     fetchPage: (bounds: GeoBounds) => Promise<{ items: T[]; exceededLimit: boolean }>,
     depth = 0
 ): Promise<T[]> {
-    const { items, exceededLimit } = await fetchPage(bounds);
+    const { items, exceededLimit } = await fetchPageWithRetry(bounds, fetchPage);
     if (!exceededLimit || depth >= NATIONWIDE_ADAPTIVE_MAX_DEPTH) return items;
 
     const midLon = (bounds.west + bounds.east) / 2;
@@ -998,7 +1026,7 @@ async function loadNationwideAirportsAndAirspace(
         }
     }
 
-    const airports = await attachFlightCategories(Array.from(airportMap.values()));
+    const airports = await attachFlightCategories(Array.from(airportMap.values()), signal);
 
     return {
         airports,
@@ -3915,7 +3943,9 @@ function RadarDashboardTab({
                 }
 
                 if (airports) {
-                    const withCategories = await attachFlightCategories(airports);
+                    const withCategories = await attachFlightCategories(airports, controller.signal).catch(
+                        () => airports
+                    );
                     if (controller.signal.aborted) return;
 
                     const mergedAirports = new Map<string, AirportPoint>();
@@ -4751,12 +4781,15 @@ function RadarDashboardTab({
         satelliteTileCacheRef.current.clear();
         satelliteCycleRef.current = null;
         gfaImagesRef.current = {};
-        airspacePolygonsRef.current = [];
-        tfrPolygonsRef.current = [];
-        gairmetZonesRef.current = [];
-        sigmetZonesRef.current = [];
-        pirepsRef.current = [];
-        airportsRef.current = [];
+        // Deliberately NOT clearing airportsRef, airspacePolygonsRef, tfrPolygonsRef,
+        // gairmetZonesRef, sigmetZonesRef, or pirepsRef here. All of that data is fetched
+        // nationwide (AMERICAS_BOUNDS) and has nothing to do with which station is currently
+        // selected, so wiping it on every station switch was throwing away a fully-loaded
+        // nationwide dataset and forcing a full reload from zero — which is exactly why airports
+        // clear across the country (e.g. everything around KMSP) would visibly disappear for the
+        // ~20-30s it took to reload after looking up a different, distant airport. Their own
+        // loaders (loadHazards, loadNationwideAirportsAndAirspace, and the local-area fetch below)
+        // now merge onto whatever's already there instead of assuming an empty starting point.
         stationMarkerPositionRef.current = center;
         setStationMarkerPosition(center);
         hoveredAirportIdentRef.current = null;
@@ -4985,7 +5018,24 @@ function RadarDashboardTab({
                     fetchAirports(AMERICAS_BOUNDS, true).catch(() => [] as AirportPoint[]),
                 ]);
                 if (cancelled) return;
-                airspacePolygonsRef.current = polygons;
+                // Merged onto whatever nationwide airspace is already loaded (from a previous
+                // station's session — see the top-of-effect comment on why that's no longer
+                // cleared on a station switch) rather than replacing it outright, so switching to
+                // a new station never makes airspace polygons elsewhere in the country vanish.
+                if (polygons.length > 0) {
+                    const polygonKey = (polygon: AirspacePolygon) =>
+                        `${polygon.airspaceClass}|${polygon.name}|${polygon.rings[0]?.[0]?.lat}|${polygon.rings[0]?.[0]?.lon}`;
+                    const existingKeys = new Set(airspacePolygonsRef.current.map(polygonKey));
+                    const merged = airspacePolygonsRef.current.slice();
+                    for (const polygon of polygons) {
+                        const key = polygonKey(polygon);
+                        if (!existingKeys.has(key)) {
+                            existingKeys.add(key);
+                            merged.push(polygon);
+                        }
+                    }
+                    airspacePolygonsRef.current = merged;
+                }
 
                 const mainStationEntry = localAirports.find(
                     (airport) => resolveMetarStationKey(airport) === stationInfo?.station
@@ -5007,8 +5057,16 @@ function RadarDashboardTab({
                     (airport) => resolveMetarStationKey(airport) !== stationInfo?.station
                 );
                 if (cancelled) return;
-                airportsRef.current = await attachFlightCategories(uncategorized);
+                const categorizedLocal = await attachFlightCategories(uncategorized);
                 if (cancelled) return;
+                // Merged onto whatever's already loaded (see the top-of-effect comment) instead of
+                // replacing it, so switching stations only adds this area's detail rather than
+                // discarding every other airport in the country until the nationwide tiled loader
+                // catches back up.
+                const finalAirports = new Map<string, AirportPoint>();
+                for (const airport of airportsRef.current) finalAirports.set(airport.ident, airport);
+                for (const airport of categorizedLocal) finalAirports.set(airport.ident, airport);
+                airportsRef.current = Array.from(finalAirports.values());
                 // The station's own local fetch already covers this radius — seed coverage with
                 // it so the reactive fetcher doesn't immediately redo the same request on the
                 // first frame.
