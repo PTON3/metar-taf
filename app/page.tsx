@@ -167,6 +167,11 @@ const GFA_MOSAIC_BOUNDS: RadarWmsBounds = {
 };
 // New model cycles land roughly every 3 hours; no point resyncing faster than that.
 const GFA_RESYNC_INTERVAL_MS = 20 * 60_000;
+// TFRs/G-AIRMETs/SIGMETs/PIREPs used to be fetched once on load and never again — a real
+// staleness gap (new TFRs, amended G-AIRMETs/SIGMETs, and fresh PIREPs could all silently go
+// unseen for the rest of the session). Refetched on this interval instead, same as every other
+// live layer.
+const HAZARDS_REFRESH_INTERVAL_MS = 5 * 60_000;
 
 type GfaOverlayId = "thunderstorms" | "weatherType" | "turbulence" | "icing";
 
@@ -4686,7 +4691,7 @@ function RadarDashboardTab({
         // update silently and never touch this state.
         let radarLoadStepsCompleted = 0;
         const radarLoadTotalSteps =
-            1 + 1 + 1 + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS + 1;
+            1 + 1 + 1 + 1 + 1 + NATIONWIDE_TILE_COLS * NATIONWIDE_TILE_ROWS + 1;
         setRadarLoadProgress({
             ready: false,
             completed: 0,
@@ -4810,30 +4815,41 @@ function RadarDashboardTab({
         loadGfaOverlays().then(() => reportRadarLoadStep("Loading forecast overlays"));
         const gfaResyncId = window.setInterval(loadGfaOverlays, GFA_RESYNC_INTERVAL_MS);
 
+        // TFRs, G-AIRMETs, SIGMETs, and PIREPs, refetched on their own interval — see
+        // HAZARDS_REFRESH_INTERVAL_MS above for why this exists as a separate, repeating fetch
+        // rather than the one-shot it used to be.
+        const loadHazards = async () => {
+            try {
+                const [tfrs, gairmetZones, isigmetZones, airsigmetZones, pireps] = await Promise.all([
+                    fetchTfrPolygons(AMERICAS_BOUNDS).catch(() => [] as TfrPolygon[]),
+                    fetchGairmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
+                    fetchIsigmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
+                    fetchAirsigmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
+                    fetchPirepReports(AMERICAS_BOUNDS).catch(() => [] as PirepReport[]),
+                ]);
+                if (cancelled) return;
+                tfrPolygonsRef.current = tfrs;
+                gairmetZonesRef.current = gairmetZones;
+                sigmetZonesRef.current = [...isigmetZones, ...airsigmetZones];
+                pirepsRef.current = pireps;
+                scheduleDraw();
+            } catch {
+                // Supplementary — a failed refresh just leaves the previous data in place.
+            }
+        };
+
+        loadHazards().then(() => reportRadarLoadStep("Loading hazards"));
+        const hazardsResyncId = window.setInterval(loadHazards, HAZARDS_REFRESH_INTERVAL_MS);
+
         (async () => {
             try {
-                const [
-                    polygons,
-                    tfrs,
-                    gairmetZones,
-                    isigmetZones,
-                    airsigmetZones,
-                    pireps,
-                    localAirports,
-                    majorAirports,
-                    flightCategories,
-                ] = await Promise.all([
+                const [polygons, localAirports, majorAirports, flightCategories] = await Promise.all([
                     // Kept at the local radius, not AMERICAS_BOUNDS — a nationwide query
                     // for these polygon shapes (far more vertices than a point layer)
                     // errors out on the ArcGIS side, which the browser reports as a CORS
                     // failure. Class B/C/D airspace is also most relevant near the
                     // station anyway, so this isn't a real loss of "all the data".
                     fetchAirspacePolygons(maxZoomOutBounds).catch(() => [] as AirspacePolygon[]),
-                    fetchTfrPolygons(AMERICAS_BOUNDS).catch(() => [] as TfrPolygon[]),
-                    fetchGairmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
-                    fetchIsigmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
-                    fetchAirsigmetZones(AMERICAS_BOUNDS).catch(() => [] as GairmetZone[]),
-                    fetchPirepReports(AMERICAS_BOUNDS).catch(() => [] as PirepReport[]),
                     fetchAirports(maxZoomOutBounds).catch(() => [] as AirportPoint[]),
                     // Nationwide, but filtered to airports with a published instrument
                     // approach — keeps the result well under the ArcGIS service's 1000-
@@ -4848,10 +4864,6 @@ function RadarDashboardTab({
                 ]);
                 if (cancelled) return;
                 airspacePolygonsRef.current = polygons;
-                tfrPolygonsRef.current = tfrs;
-                gairmetZonesRef.current = gairmetZones;
-                sigmetZonesRef.current = [...isigmetZones, ...airsigmetZones];
-                pirepsRef.current = pireps;
 
                 const mainStationEntry = localAirports.find(
                     (airport) => resolveMetarStationKey(airport) === stationInfo?.station
@@ -4964,6 +4976,7 @@ function RadarDashboardTab({
             window.clearInterval(radarResyncId);
             window.clearInterval(satelliteResyncId);
             window.clearInterval(gfaResyncId);
+            window.clearInterval(hazardsResyncId);
             window.clearInterval(nationwideRefreshId);
             nationwideAbortRef.current?.abort();
             nationwideAbortRef.current = null;
