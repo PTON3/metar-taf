@@ -44,14 +44,26 @@ export async function GET(request: Request) {
         const data = await response.json();
         const records = Array.isArray(data) ? data : [];
 
+        // lat/lon/name come straight from the METAR record itself — every station this returns
+        // is, by definition, one with a current observation, so building markers directly from
+        // this response (rather than cross-referencing a separate airport database and hoping
+        // the identifiers line up) guarantees every one of them has a real flight category.
         const stations = records
             .map((record: unknown) => {
                 const report = record as Record<string, unknown>;
                 const station = typeof report.icaoId === "string" ? report.icaoId : null;
                 const flightCategory = typeof report.fltCat === "string" ? report.fltCat : null;
-                return station && flightCategory ? { station, flightCategory } : null;
+                const lat = typeof report.lat === "number" ? report.lat : null;
+                const lon = typeof report.lon === "number" ? report.lon : null;
+                const name = typeof report.name === "string" ? report.name : null;
+                return station && flightCategory && lat !== null && lon !== null
+                    ? { station, flightCategory, lat, lon, name }
+                    : null;
             })
-            .filter((entry): entry is { station: string; flightCategory: string } => entry !== null);
+            .filter(
+                (entry): entry is { station: string; flightCategory: string; lat: number; lon: number; name: string | null } =>
+                    entry !== null
+            );
 
         return Response.json({ stations });
     } catch (error) {

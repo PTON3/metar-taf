@@ -630,7 +630,22 @@ function resolveMetarStationKey(airport: AirportPoint): string | null {
     return null;
 }
 
-async function fetchAirportFlightCategories(bounds: GeoBounds): Promise<Map<string, FlightCategory>> {
+type MetarStationPoint = {
+    station: string;
+    name: string | null;
+    lat: number;
+    lon: number;
+    flightCategory: FlightCategory;
+};
+
+// aviationweather.gov's own map (the reference for how this is "supposed" to look) doesn't
+// cross-reference a separate airport database at all — every dot it draws simply *is* a METAR
+// station, plotted straight from the METAR response's own lat/lon, so every one of them has a
+// category by construction. Matching that: this returns full station points, not just a
+// station-id -> category map, so callers can add an entry for any station that doesn't already
+// have a matching FAA airport record (an ICAO/ident mismatch, or one dropped by ArcGIS's transfer
+// cap) instead of only ever coloring pre-existing airport entries and leaving the rest gray.
+async function fetchMetarStations(bounds: GeoBounds): Promise<MetarStationPoint[]> {
     const params = new URLSearchParams({
         south: String(bounds.south),
         west: String(bounds.west),
@@ -643,18 +658,61 @@ async function fetchAirportFlightCategories(bounds: GeoBounds): Promise<Map<stri
     const data = await response.json();
     const stations = Array.isArray(data?.stations) ? data.stations : [];
 
-    const map = new Map<string, FlightCategory>();
+    const points: MetarStationPoint[] = [];
     for (const entry of stations) {
         const station = entry?.station;
         const flightCategory = entry?.flightCategory;
+        const lat = entry?.lat;
+        const lon = entry?.lon;
         if (
             typeof station === "string" &&
-            VALID_FLIGHT_CATEGORIES.includes(flightCategory as FlightCategory)
+            VALID_FLIGHT_CATEGORIES.includes(flightCategory as FlightCategory) &&
+            typeof lat === "number" &&
+            typeof lon === "number"
         ) {
-            map.set(station, flightCategory as FlightCategory);
+            points.push({
+                station,
+                name: typeof entry?.name === "string" ? entry.name : null,
+                lat,
+                lon,
+                flightCategory: flightCategory as FlightCategory,
+            });
         }
     }
+    return points;
+}
+
+function metarStationCategoryMap(stations: readonly MetarStationPoint[]): Map<string, FlightCategory> {
+    const map = new Map<string, FlightCategory>();
+    for (const point of stations) map.set(point.station, point.flightCategory);
     return map;
+}
+
+// Adds an AirportPoint for any METAR station that doesn't already have a matching entry (by
+// resolveMetarStationKey) in `airports` — see fetchMetarStations above for why this matters.
+// Orphans render as minor (never a false "major" claim) with the METAR's own name if it had one.
+function addOrphanMetarStations(
+    airports: readonly AirportPoint[],
+    stations: readonly MetarStationPoint[]
+): AirportPoint[] {
+    const existingKeys = new Set(
+        airports.map((airport) => resolveMetarStationKey(airport)).filter((key): key is string => key !== null)
+    );
+    const orphans: AirportPoint[] = [];
+    for (const point of stations) {
+        if (existingKeys.has(point.station)) continue;
+        existingKeys.add(point.station);
+        orphans.push({
+            ident: point.station,
+            name: point.name ?? point.station,
+            icao: point.station,
+            lat: point.lat,
+            lon: point.lon,
+            flightCategory: point.flightCategory,
+            isMajor: false,
+        });
+    }
+    return orphans.length > 0 ? [...airports, ...orphans] : (airports as AirportPoint[]);
 }
 
 // ---- Minimal Web Mercator slippy-map math (replaces the Leaflet dependency) ----
@@ -928,7 +986,7 @@ async function loadNationwideAirportsAndAirspace(
     const tiles = tileBounds(AMERICAS_BOUNDS, NATIONWIDE_TILE_COLS, NATIONWIDE_TILE_ROWS);
     const tileResults = await runWithConcurrency(
         tiles.map((tile, index) => async () => {
-            const [airports, polygons, flightCategories] = await Promise.all([
+            const [airports, polygons, metarStations] = await Promise.all([
                 fetchAdaptive(tile, (b) =>
                     fetchAirportsPage(b, false, signal).then((r) => ({
                         items: r.airports,
@@ -941,30 +999,35 @@ async function loadNationwideAirportsAndAirspace(
                         exceededLimit: r.exceededLimit,
                     }))
                 ).catch(() => [] as AirspacePolygon[]),
-                fetchAirportFlightCategories(tile).catch(() => new Map<string, FlightCategory>()),
+                fetchMetarStations(tile).catch(() => [] as MetarStationPoint[]),
             ]);
             onZoneDone?.(index, tiles.length);
-            return { airports, polygons, flightCategories };
+            return { airports, polygons, metarStations };
         }),
         NATIONWIDE_FETCH_CONCURRENCY
     );
 
     const airportMap = new Map<string, AirportPoint>();
     const polygonMap = new Map<string, AirspacePolygon>();
-    const flightCategoryMap = new Map<string, FlightCategory>();
+    const allMetarStations: MetarStationPoint[] = [];
     for (const result of tileResults) {
         for (const airport of result.airports) airportMap.set(airport.ident, airport);
         for (const polygon of result.polygons) {
             const key = `${polygon.airspaceClass}|${polygon.name}|${polygon.rings[0]?.[0]?.lat}|${polygon.rings[0]?.[0]?.lon}`;
             polygonMap.set(key, polygon);
         }
-        for (const [station, category] of result.flightCategories) flightCategoryMap.set(station, category);
+        allMetarStations.push(...result.metarStations);
     }
 
+    // Every station in allMetarStations has a real flight category by construction — any one of
+    // them not already matching an airport pulled from the FAA database (a dropped record, an
+    // ICAO/ident mismatch) gets added as its own point here instead of just staying invisible.
+    const airports = addOrphanMetarStations(Array.from(airportMap.values()), allMetarStations);
+
     return {
-        airports: Array.from(airportMap.values()),
+        airports,
         polygons: Array.from(polygonMap.values()),
-        flightCategories: flightCategoryMap,
+        flightCategories: metarStationCategoryMap(allMetarStations),
     };
 }
 
@@ -3858,8 +3921,9 @@ function RadarDashboardTab({
             Promise.all([
                 fetchAirspacePolygons(requestBounds, controller.signal).catch(() => null),
                 fetchAirports(requestBounds, false, controller.signal).catch(() => null),
-                fetchAirportFlightCategories(requestBounds).catch(() => null),
-            ]).then(([polygons, airports, flightCategories]) => {
+                fetchMetarStations(requestBounds).catch(() => null),
+            ]).then(([polygons, airports, metarStations]) => {
+                const flightCategories = metarStations ? metarStationCategoryMap(metarStations) : null;
                 if (controller.signal.aborted) return;
 
                 if (polygons) {
@@ -3902,7 +3966,9 @@ function RadarDashboardTab({
                             }
                         }
                     }
-                    airportsRef.current = Array.from(mergedAirports.values());
+                    airportsRef.current = metarStations
+                        ? addOrphanMetarStations(Array.from(mergedAirports.values()), metarStations)
+                        : Array.from(mergedAirports.values());
                 }
 
                 localDetailCoverageBoundsRef.current = requestBounds;
@@ -4582,10 +4648,12 @@ function RadarDashboardTab({
                     ? "#d6b35a"
                     : FLIGHT_CATEGORY_MARKER_COLORS[airport.flightCategory ?? "UNKNOWN"];
                 ctx.fill();
-                // A light ring around every dot (not just the selected one) is what makes the
-                // fill color actually pop against a busy dark map instead of blending into it.
-                ctx.lineWidth = isSelected ? 2.5 : 1.5;
-                ctx.strokeStyle = isSelected ? "#ffffff" : "rgba(255, 255, 255, 0.75)";
+                // Flat filled circle with a thin dark edge for definition, closer to
+                // aviationweather.gov's own METAR station styling — the white ring gave every
+                // dot a "halo" that read as busier/heavier than their plain colored-dot look.
+                // The selected airport keeps its own distinct white ring as a highlight.
+                ctx.lineWidth = isSelected ? 2.5 : 1;
+                ctx.strokeStyle = isSelected ? "#ffffff" : "rgba(0, 0, 0, 0.55)";
                 ctx.stroke();
 
                 const showLabel = hoveredAirportIdentRef.current === airport.ident || isSelected;
@@ -4944,7 +5012,7 @@ function RadarDashboardTab({
 
         (async () => {
             try {
-                const [polygons, localAirports, majorAirports, flightCategories] = await Promise.all([
+                const [polygons, localAirports, majorAirports, metarStations] = await Promise.all([
                     // Kept at the local radius, not AMERICAS_BOUNDS — a nationwide query
                     // for these polygon shapes (far more vertices than a point layer)
                     // errors out on the ArcGIS side, which the browser reports as a CORS
@@ -4965,9 +5033,7 @@ function RadarDashboardTab({
                     // so a nationwide call here would barely color anything. The nationwide majors
                     // fetched above get their own colors moments later from the tiled tick in
                     // loadNationwideAirportsAndAirspace running alongside this.
-                    fetchAirportFlightCategories(maxZoomOutBounds).catch(
-                        () => new Map<string, FlightCategory>()
-                    ),
+                    fetchMetarStations(maxZoomOutBounds).catch(() => [] as MetarStationPoint[]),
                 ]);
                 if (cancelled) return;
                 airspacePolygonsRef.current = polygons;
@@ -4988,13 +5054,15 @@ function RadarDashboardTab({
                 for (const airport of majorAirports) merged.set(airport.ident, airport);
                 for (const airport of localAirports) merged.set(airport.ident, airport);
 
-                airportsRef.current = Array.from(merged.values())
+                const flightCategories = metarStationCategoryMap(metarStations);
+                const categorized = Array.from(merged.values())
                     .filter((airport) => resolveMetarStationKey(airport) !== stationInfo?.station)
                     .map((airport) => {
                         const key = resolveMetarStationKey(airport);
                         const flightCategory = key ? flightCategories.get(key) : undefined;
                         return flightCategory ? { ...airport, flightCategory } : airport;
                     });
+                airportsRef.current = addOrphanMetarStations(categorized, metarStations);
                 // The station's own local fetch already covers this radius — seed coverage with
                 // it so the reactive fetcher doesn't immediately redo the same request on the
                 // first frame.
