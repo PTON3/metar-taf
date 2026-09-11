@@ -1448,6 +1448,12 @@ export default function Home() {
     const [lastMetarFetchAttempt, setLastMetarFetchAttempt] = useState<Date | null>(null);
 
     const [loading, setLoading] = useState(true);
+    // Separate from `loading` (which also flips true for the silent 2-minute background
+    // refresh — see the refreshTimer effect below): this one only ever gets set for a lookup the
+    // user actually asked for (the initial page load, Go, Enter, Decode, Start Quiz, or a manual
+    // refresh), and it's what gates the full-page loading overlay below. A silent background
+    // refresh should never interrupt someone reading the page.
+    const [pageLoading, setPageLoading] = useState(true);
     const latestStationRef = useRef(station);
     const latestActiveTabRef = useRef(activeTab);
 
@@ -1459,7 +1465,7 @@ export default function Home() {
         latestActiveTabRef.current = activeTab;
     }, [activeTab]);
 
-    async function loadLiveMetar(cleanStation: string) {
+    async function loadLiveMetar(cleanStation: string, options?: { silent?: boolean }) {
         setLastMetarFetchAttempt(new Date());
 
         try {
@@ -1485,18 +1491,20 @@ export default function Home() {
             setError(err instanceof Error ? err.message : "Unexpected error.");
         } finally {
             setLoading(false);
+            if (!options?.silent) setPageLoading(false);
         }
     }
 
-    function fetchLiveMetar(stationToFetch = station) {
+    function fetchLiveMetar(stationToFetch = station, options?: { silent?: boolean }) {
         const cleanStation = stationToFetch.trim().toUpperCase();
 
         setLoading(true);
+        if (!options?.silent) setPageLoading(true);
         setError("");
         setStation(cleanStation);
         latestStationRef.current = cleanStation;
 
-        void loadLiveMetar(cleanStation);
+        void loadLiveMetar(cleanStation, options);
     }
 
     function startQuiz() {
@@ -1515,6 +1523,7 @@ export default function Home() {
 
     async function decodeRawMetar() {
         setLoading(true);
+        setPageLoading(true);
         setError("");
         setQuizMode(false);
 
@@ -1548,6 +1557,7 @@ export default function Home() {
             setError(err instanceof Error ? err.message : "Unexpected error.");
         } finally {
             setLoading(false);
+            setPageLoading(false);
         }
     }
 
@@ -1630,7 +1640,7 @@ export default function Home() {
 
         const refreshTimer = window.setInterval(() => {
             if (latestActiveTabRef.current === "lookup") {
-                void fetchLiveMetar(latestStationRef.current);
+                void fetchLiveMetar(latestStationRef.current, { silent: true });
             }
         }, LIVE_WEATHER_REFRESH_MS);
 
@@ -1789,47 +1799,67 @@ export default function Home() {
                     </div>
                 </header>
 
-                {error && (
-                    <div className="mt-6 rounded-2xl border border-red-500/40 bg-red-950/30 p-4 text-red-200">
-                        {error}
-                    </div>
-                )}
+                <div className="relative">
+                    {error && (
+                        <div className="mt-6 rounded-2xl border border-red-500/40 bg-red-950/30 p-4 text-red-200">
+                            {error}
+                        </div>
+                    )}
 
-                {metar ? (
-                    quizMode ? (
-                        <QuizPanel
-                            key={rawMetar ?? metar.raw}
-                            metar={metar}
-                            rawText={rawMetar ?? metar.raw}
-                            timeZone={stationInfo?.timeZone}
-                            onContinue={() => setQuizMode(false)}
-                        />
-                    ) : (
-                        <MetarDashboard
-                            metar={metar}
-                            rawMetar={rawMetar ?? metar.raw}
-                            station={station}
-                            stationInfo={stationInfo}
-                            airportDiagram={airportDiagram}
-                            runways={runways}
-                            isFullscreenOpen={isFullscreenOpen}
-                            setIsFullscreenOpen={setIsFullscreenOpen}
-                            isRadarFullscreen={isRadarFullscreen}
-                            setIsRadarFullscreen={setIsRadarFullscreen}
-                            lastMetarFetchAttempt={lastMetarFetchAttempt}
-                            onRefetchMetar={() => fetchLiveMetar()}
-                        />
-                    )
-                    ) : (
-                    <EmptyState />
-                )}
+                    {metar ? (
+                        quizMode ? (
+                            <QuizPanel
+                                key={rawMetar ?? metar.raw}
+                                metar={metar}
+                                rawText={rawMetar ?? metar.raw}
+                                timeZone={stationInfo?.timeZone}
+                                onContinue={() => setQuizMode(false)}
+                            />
+                        ) : (
+                            <MetarDashboard
+                                metar={metar}
+                                rawMetar={rawMetar ?? metar.raw}
+                                station={station}
+                                stationInfo={stationInfo}
+                                airportDiagram={airportDiagram}
+                                runways={runways}
+                                isFullscreenOpen={isFullscreenOpen}
+                                setIsFullscreenOpen={setIsFullscreenOpen}
+                                isRadarFullscreen={isRadarFullscreen}
+                                setIsRadarFullscreen={setIsRadarFullscreen}
+                                lastMetarFetchAttempt={lastMetarFetchAttempt}
+                                onRefetchMetar={() => fetchLiveMetar()}
+                            />
+                        )
+                        ) : (
+                        <EmptyState />
+                    )}
 
-                <footer className="mt-10 border-t border-zinc-900 pt-5 text-center">
-                    <p className="text-[11px] leading-5 text-zinc-500">
-                        Created by Preston Vaughn for Inflight Aviation. METAR and TAF data provided by
-                        AviationWeather.gov. Airport information provided by FAA.gov.
-                    </p>
-                </footer>
+                    <footer className="mt-10 border-t border-zinc-900 pt-5 text-center">
+                        <p className="text-[11px] leading-5 text-zinc-500">
+                            Created by Preston Vaughn for Inflight Aviation. METAR and TAF data provided by
+                            AviationWeather.gov. Airport information provided by FAA.gov.
+                        </p>
+                    </footer>
+
+                    {/* Covers everything below the header (still-mounted content from the
+                        previous station included) until the new station's METAR/TAF/airport data
+                        has fully loaded, matching the radar bubble's own loading gate — no tab,
+                        button, or link under here is reachable until it lifts. Gated on
+                        pageLoading rather than loading so the silent 2-minute background refresh
+                        never triggers this. */}
+                    {pageLoading && (
+                        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-4 rounded-3xl bg-[#050505]/95 px-8 text-center backdrop-blur-sm">
+                            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d6b35a]">
+                                Loading
+                            </p>
+                            <div className="h-8 w-8 animate-spin rounded-full border-2 border-zinc-700 border-t-[#e6c76f]" />
+                            <p className="text-sm font-medium text-zinc-300">
+                                {station || "Fetching weather data…"}
+                            </p>
+                        </div>
+                    )}
+                </div>
 
             </div>
 
